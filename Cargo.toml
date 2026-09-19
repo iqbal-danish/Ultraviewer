@@ -1,0 +1,29 @@
+[package]
+name = "ultraviewer"
+version = "0.1.0"
+edition = "2021"
+authors = ["UltraViewer Team"]
+description = "Blazing-fast large-file viewer and editor for multi-gigabyte files."
+default-run = "ultraviewer"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+eframe = "0.31"
+memmap2 = "0.9"
+rfd = "0.15"
+encoding_rs = "0.8"
+sysinfo = "0.33"
+memchr = "2.7"
+crossbeam-channel = "0.5"
+regex = "1.11"
+quick-xml = "0.37"
+
+[[bin]]
+name = "ultraviewer"
+path = "src/main.rs"
+
+[lib]
+name = "ultraviewer"
+path = "src/lib.rs"
+
