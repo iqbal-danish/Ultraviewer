@@ -3,6 +3,10 @@ use crate::file_engine::Encoding;
 use crate::formats::FileType;
 use std::time::Duration;
 
+pub enum StatusBarAction {
+    ResetZoom,
+}
+
 pub struct StatusBarProps<'a> {
     pub file_name: Option<&'a str>,
     pub file_size: u64,
@@ -20,11 +24,13 @@ pub struct StatusBarProps<'a> {
     pub is_dirty: bool,
     pub edit_count: usize,
     pub is_edit_mode: bool,
+    pub font_size: f32,
 }
 
-pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) {
-    let sep_color = Color32::from_rgb(45, 55, 72);
-    let muted_color = Color32::from_rgb(130, 140, 155);
+pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) -> Option<StatusBarAction> {
+    let mut action = None;
+    let sep_color = Color32::from_rgb(44, 49, 58); // #2C313A
+    let muted_color = Color32::from_rgb(171, 178, 191); // #ABB2BF
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
@@ -32,7 +38,7 @@ pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) {
         // File name & Size
         if let Some(name) = props.file_name {
             let display_name = if props.is_dirty { format!("{} ●", name) } else { name.to_string() };
-            let name_color = if props.is_dirty { Color32::from_rgb(245, 158, 11) } else { Color32::from_rgb(225, 232, 240) };
+            let name_color = if props.is_dirty { Color32::from_rgb(229, 192, 123) } else { Color32::from_rgb(220, 225, 235) };
             ui.label(RichText::new(display_name).strong().size(11.5).color(name_color));
 
             let size_str = format_bytes(props.file_size);
@@ -49,7 +55,12 @@ pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) {
 
         if let Some(ft) = props.file_type {
             render_status_sep(ui, sep_color);
-            ui.label(RichText::new(ft.name()).size(11.0).color(Color32::from_rgb(56, 189, 248)));
+            let ft_color = match ft {
+                FileType::Xml => Color32::from_rgb(224, 108, 117),
+                FileType::Json => Color32::from_rgb(229, 192, 123),
+                _ => Color32::from_rgb(97, 175, 239),
+            };
+            ui.label(RichText::new(ft.name()).size(11.0).color(ft_color));
         }
 
         if props.file_size > 0 {
@@ -86,6 +97,17 @@ pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) {
                 eframe::egui::FontId::proportional(11.0),
                 Color32::from_rgb(200, 215, 230),
             );
+
+            // Zoom indicator badge (e.g. "100%")
+            let zoom_pct = ((props.font_size / 14.0) * 100.0).round() as u32;
+            render_status_sep(ui, sep_color);
+            let zoom_resp = ui.selectable_label(
+                false,
+                RichText::new(format!("{}%", zoom_pct)).size(11.0).color(muted_color),
+            );
+            if zoom_resp.on_hover_text(format!("Zoom: {}% (Ctrl+Scroll or Ctrl+/- to adjust, click to reset)", zoom_pct)).clicked() {
+                action = Some(StatusBarAction::ResetZoom);
+            }
 
             render_status_sep(ui, sep_color);
 
@@ -126,6 +148,8 @@ pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) {
             }
         });
     });
+
+    action
 }
 
 fn render_status_sep(ui: &mut Ui, color: Color32) {

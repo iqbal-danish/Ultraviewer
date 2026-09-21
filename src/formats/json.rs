@@ -28,13 +28,13 @@ impl JsonSyntaxHighlighter {
 
         let (col_key, col_string, col_number, col_bool_null, col_bracket, col_punct, col_whitespace) = if dark_mode {
             (
-                Color32::from_rgb(156, 220, 254), // Light Blue (Keys)
-                Color32::from_rgb(206, 145, 120), // Orange (Strings)
-                Color32::from_rgb(181, 206, 168), // Light Green (Numbers)
-                Color32::from_rgb(86, 156, 214),  // Blue (Booleans / Null)
-                Color32::from_rgb(255, 215, 0),   // Gold ({ } [ ])
-                Color32::from_rgb(212, 212, 212), // Gray (: ,)
-                Color32::from_rgb(220, 225, 235), // Whitespace
+                Color32::from_rgb(224, 108, 117), // Keys in #E06C75 (Coral Red)
+                Color32::from_rgb(152, 195, 121), // Strings in #98C379 (Green)
+                Color32::from_rgb(209, 154, 102), // Numbers in #D19A66 (Orange)
+                Color32::from_rgb(86, 182, 194),  // Booleans / Null in #56B6C2 (Cyan)
+                Color32::from_rgb(171, 178, 191), // Brackets in #ABB2BF
+                Color32::from_rgb(171, 178, 191), // Punctuation in #ABB2BF
+                Color32::from_rgb(171, 178, 191), // Whitespace
             )
         } else {
             (

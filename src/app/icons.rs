@@ -3,6 +3,7 @@ use eframe::egui::{self, Color32, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
     Logo,
+    Explorer,
     Folder,
     FolderOpen,
     Search,
@@ -43,16 +44,77 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
 
     match icon {
         Icon::Logo => {
-            // Bold, sharp, electric lightning bolt with solid fill
+            // Modern VS Code-style origami ribbon logo in layered blues
+            let p_left = Pos2::new(min_x + (w * 0.12).round(), cy);
+            let p_top_right = Pos2::new(min_x + (w * 0.88).round(), min_y + (h * 0.14).round());
+            let p_bot_right = Pos2::new(min_x + (w * 0.88).round(), min_y + (h * 0.86).round());
+            let p_notch = Pos2::new(min_x + (w * 0.58).round(), cy);
+            let p_top_inner = Pos2::new(min_x + (w * 0.62).round(), min_y + (h * 0.26).round());
+            let p_bot_inner = Pos2::new(min_x + (w * 0.62).round(), min_y + (h * 0.74).round());
+
+            // Back wing (darker blue)
+            let dark_blue = Color32::from_rgb(0, 95, 160);
+            painter.add(egui::Shape::convex_polygon(
+                vec![p_left, p_top_inner, p_bot_inner],
+                dark_blue,
+                Stroke::NONE,
+            ));
+
+            // Top fold (light vibrant blue #1F9CF0)
+            let light_blue = Color32::from_rgb(31, 156, 240);
+            painter.add(egui::Shape::convex_polygon(
+                vec![p_left, p_top_inner, p_top_right, p_notch],
+                light_blue,
+                Stroke::NONE,
+            ));
+
+            // Bottom fold (signature VS Code blue #007ACC)
+            let mid_blue = Color32::from_rgb(0, 122, 204);
+            painter.add(egui::Shape::convex_polygon(
+                vec![p_left, p_notch, p_bot_right, p_bot_inner],
+                mid_blue,
+                Stroke::NONE,
+            ));
+        }
+
+        Icon::Explorer => {
+            // VS Code dual overlapping documents (back sheet + front sheet with dog-ear)
+            let b_left = min_x + 1.5;
+            let b_top = min_y + 1.5;
+            let b_w = (w * 0.66).round();
+            let b_h = (h * 0.72).round();
+            painter.rect_stroke(
+                Rect::from_min_size(Pos2::new(b_left, b_top), Vec2::new(b_w, b_h)),
+                1.5,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+
+            // Front sheet
+            let f_left = min_x + (w * 0.28).round();
+            let f_top = min_y + (h * 0.24).round();
+            let f_right = min_x + w - 1.5;
+            let f_bottom = min_y + h - 1.5;
+            let fold = 3.5_f32;
+
+            // Cutout background behind front sheet
+            let bg_clear = Color32::from_rgb(35, 39, 46);
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(f_left - 0.5, f_top - 0.5), Pos2::new(f_right + 0.5, f_bottom + 0.5)),
+                0.0,
+                bg_clear,
+            );
+
             let pts = vec![
-                Pos2::new(min_x + (w * 0.56).round(), min_y + 1.0),
-                Pos2::new(min_x + (w * 0.16).round(), min_y + (h * 0.48).round()),
-                Pos2::new(min_x + (w * 0.48).round(), min_y + (h * 0.48).round()),
-                Pos2::new(min_x + (w * 0.36).round(), min_y + h - 1.0),
-                Pos2::new(min_x + (w * 0.86).round(), min_y + (h * 0.42).round()),
-                Pos2::new(min_x + (w * 0.54).round(), min_y + (h * 0.42).round()),
+                Pos2::new(f_left, f_top),
+                Pos2::new(f_right - fold, f_top),
+                Pos2::new(f_right, f_top + fold),
+                Pos2::new(f_right, f_bottom),
+                Pos2::new(f_left, f_bottom),
             ];
-            painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+            painter.add(egui::Shape::closed_line(pts, stroke));
+            painter.line_segment([Pos2::new(f_right - fold, f_top), Pos2::new(f_right - fold, f_top + fold)], stroke);
+            painter.line_segment([Pos2::new(f_right - fold, f_top + fold), Pos2::new(f_right, f_top + fold)], stroke);
         }
 
         Icon::Folder => {

@@ -30,13 +30,13 @@ impl XmlSyntaxHighlighter {
 
         let (col_tag, col_elem, col_attr, col_val, col_comment, col_cdata, col_text) = if dark_mode {
             (
-                Color32::from_rgb(86, 156, 214),  // Blue
-                Color32::from_rgb(78, 201, 176),  // Teal
-                Color32::from_rgb(156, 220, 254), // Light Blue
-                Color32::from_rgb(206, 145, 120), // Orange
-                Color32::from_rgb(106, 153, 85),  // Green
-                Color32::from_rgb(215, 186, 125), // Gold
-                Color32::from_rgb(220, 225, 235), // Off-white
+                Color32::from_rgb(171, 178, 191), // Brackets < > / in #ABB2BF
+                Color32::from_rgb(224, 108, 117), // Element tag names in #E06C75 (Coral Red)
+                Color32::from_rgb(209, 154, 102), // Attribute names in #D19A66 (Orange)
+                Color32::from_rgb(152, 195, 121), // Attribute values in #98C379 (Green)
+                Color32::from_rgb(92, 99, 112),   // Comments in #5C6370 (Muted Slate)
+                Color32::from_rgb(152, 195, 121), // CDATA content in #98C379 (Green)
+                Color32::from_rgb(171, 178, 191), // Text content in #ABB2BF (Silver)
             )
         } else {
             (

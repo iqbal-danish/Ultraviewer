@@ -18,33 +18,24 @@ use crate::indexing::LineIndexer;
 use crate::search::{SearchQuery, SearchResultMatch, SearchStatus, SearchWorker};
 use super::activity_bar::{render_activity_bar, ActivityBarAction, ActivityBarProps, ActivityPanel};
 use super::analyzer_panel::{render_analyzer_panel, AnalyzerPanelAction, AnalyzerPanelState};
+use super::command_palette::{render_command_palette, CommandPaletteState, PaletteAction};
+use super::context_menu::ContextMenuManager;
+use super::csv_grid::{render_csv_grid, CsvGridState};
+use super::diff_viewer::{render_diff_modal, DiffViewerAction, DiffViewerState};
+use super::folder_explorer::{render_folder_explorer, FolderAction, FolderExplorerState};
 use super::format_modal::{render_format_modal, FormatModalAction};
 use super::json_tree_panel::render_json_tree_panel;
 use super::menu::{render_menu_bar, MenuAction};
 use super::overview_ruler::{render_overview_ruler, OverviewRulerProps};
 use super::search_panel::{render_search_bar, render_search_results_panel, SearchBarAction};
-use super::status_bar::{format_number, render_status_bar, StatusBarProps};
-use super::tab_bar::{render_tab_bar, TabBarAction, TabBarProps};
+use super::session::AppSession;
+use super::status_bar::{format_number, render_status_bar, StatusBarAction, StatusBarProps};
+use super::tab_bar::{render_tab_bar, TabBarAction, TabBarProps, TabInfo};
+use super::theme::ColorTheme;
 use super::xml_tree_panel::render_xml_tree_panel;
 
-fn apply_modern_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.override_text_color = Some(Color32::from_rgb(235, 240, 248));
-    visuals.panel_fill = Color32::from_rgb(10, 14, 22);      // #0A0E16 deep space navy
-    visuals.window_fill = Color32::from_rgb(13, 18, 28);     // #0D121C panel background
-    visuals.faint_bg_color = Color32::from_rgb(15, 21, 32);
-    visuals.extreme_bg_color = Color32::from_rgb(7, 10, 16); // #070A10 editor canvas
-    visuals.window_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(28, 38, 54));
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 34, 48));
-    visuals.widgets.inactive.bg_fill = Color32::from_rgb(14, 20, 30);
-    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(22, 32, 48);
-    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(0, 120, 212);
-    visuals.widgets.active.corner_radius = egui::CornerRadius::same(4);
-    visuals.selection.bg_fill = Color32::from_rgba_premultiplied(0, 120, 212, 70);
-    visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(56, 189, 248));
-    ctx.set_visuals(visuals);
+fn apply_modern_theme(ctx: &egui::Context, theme: ColorTheme) {
+    theme.apply(ctx);
 }
 
 const VISIBLE_LINE_BUFFER: usize = 60;
@@ -86,6 +77,25 @@ pub struct FullLineInspector {
     pub line_number: usize,
     pub byte_len: usize,
     pub full_text: String,
+}
+
+pub struct OpenDocState {
+    pub id: usize,
+    pub path: PathBuf,
+    pub engine: Arc<FileEngine>,
+    pub line_index: Arc<LineIndex>,
+    pub indexer_cancel: Arc<AtomicBool>,
+    pub indexer_handle: Option<JoinHandle<()>>,
+    pub viewport: Viewport,
+    pub file_type: Option<FileType>,
+    pub open_duration: Option<Duration>,
+    pub current_line: usize,
+    pub document: Option<EditorDocument>,
+    pub is_edit_mode: bool,
+    pub active_edit_line: Option<usize>,
+    pub edit_line_buffer: String,
+    pub xml_tree_root: Option<Arc<XmlTreeNode>>,
+    pub json_tree_root: Option<Arc<JsonTreeNode>>,
 }
 
 pub struct UltraViewerApp {
@@ -160,7 +170,22 @@ pub struct UltraViewerApp {
 
     pub active_activity_panel: ActivityPanel,
     pub sidebar_expanded: bool,
+    pub titlebar_applied_frames: u8,
     pub recent_files: Vec<PathBuf>,
+
+    // Multi-tab documents state
+    pub tabs: Vec<OpenDocState>,
+    pub active_tab_id: Option<usize>,
+    pub next_tab_id: usize,
+
+    // Power Pack modules state
+    pub current_theme: ColorTheme,
+    pub session: AppSession,
+    pub command_palette: CommandPaletteState,
+    pub folder_explorer: FolderExplorerState,
+    pub csv_grid: CsvGridState,
+    pub diff_viewer: DiffViewerState,
+    pub status_notification: Option<(String, Instant)>,
 
     system_info: System,
     current_pid: Option<Pid>,
@@ -180,6 +205,18 @@ impl Default for UltraViewerApp {
             }
         }
 
+        let session = AppSession::load();
+        let current_theme = match session.theme_name.as_str() {
+            "GitHub Dark" => ColorTheme::GitHubDark,
+            "Monokai Pro" => ColorTheme::MonokaiPro,
+            "Tokyo Night" => ColorTheme::TokyoNight,
+            "VS Code Light Modern" | "Light Modern" => ColorTheme::LightModern,
+            _ => ColorTheme::OneDarkProDarker,
+        };
+        let font_size = session.font_size;
+        let word_wrap = session.word_wrap;
+        let recent_files = session.recent_files.clone();
+
         Self {
             engine: None,
             line_index: None,
@@ -188,7 +225,7 @@ impl Default for UltraViewerApp {
             viewport: Viewport::new(),
             file_type: None,
             open_duration: None,
-            font_size: 14.0,
+            font_size,
             current_line: 1,
             jump_line_input: "1".to_string(),
             jump_offset_input: "0".to_string(),
@@ -206,7 +243,7 @@ impl Default for UltraViewerApp {
             active_match_idx: None,
 
             enable_syntax_highlighting: true,
-            word_wrap: false,
+            word_wrap,
             show_xml_tree: false,
             xml_tree_root: None,
             xml_tree_building: false,
@@ -244,8 +281,21 @@ impl Default for UltraViewerApp {
             full_line_inspector: None,
 
             active_activity_panel: ActivityPanel::None,
-            sidebar_expanded: true,
-            recent_files: Vec::new(),
+            sidebar_expanded: false,
+            titlebar_applied_frames: 0,
+            recent_files,
+
+            tabs: Vec::new(),
+            active_tab_id: None,
+            next_tab_id: 1,
+
+            current_theme,
+            session,
+            command_palette: CommandPaletteState::default(),
+            folder_explorer: FolderExplorerState::default(),
+            csv_grid: CsvGridState::default(),
+            diff_viewer: DiffViewerState::default(),
+            status_notification: None,
 
             system_info,
             current_pid,
@@ -257,8 +307,17 @@ impl Default for UltraViewerApp {
 
 impl UltraViewerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        apply_modern_theme(&cc.egui_ctx);
-        Self::default()
+        let mut app = Self::default();
+        apply_modern_theme(&cc.egui_ctx, app.current_theme);
+
+        // Restore open files from session if any
+        let to_open = app.session.open_files.clone();
+        for p in to_open {
+            if p.exists() {
+                app.open_file(&p);
+            }
+        }
+        app
     }
 
     /// Open a file from disk, initialize line index, and spawn background indexer.
@@ -273,6 +332,14 @@ impl UltraViewerApp {
     }
 
     pub fn do_open_file(&mut self, path: &Path) {
+        let path_buf = path.to_path_buf();
+        if let Some(existing) = self.tabs.iter().find(|t| t.path == path_buf) {
+            let id = existing.id;
+            self.switch_to_tab(id);
+            return;
+        }
+
+        self.sync_active_tab_state();
         self.cancel_active_indexer();
         self.cancel_search();
         self.cancel_tree_builders();
@@ -282,11 +349,10 @@ impl UltraViewerApp {
         let start_time = Instant::now();
         match FileEngine::open(path) {
             Ok(raw_engine) => {
-                let path_buf = path.to_path_buf();
                 if let Some(pos) = self.recent_files.iter().position(|p| p == &path_buf) {
                     self.recent_files.remove(pos);
                 }
-                self.recent_files.insert(0, path_buf);
+                self.recent_files.insert(0, path_buf.clone());
                 if self.recent_files.len() > 10 {
                     self.recent_files.truncate(10);
                 }
@@ -310,9 +376,9 @@ impl UltraViewerApp {
                 self.active_edit_line = None;
                 self.edit_line_buffer.clear();
 
-                self.engine = Some(engine);
-                self.line_index = Some(line_index);
-                self.indexer_cancel = Some(cancel);
+                self.engine = Some(Arc::clone(&engine));
+                self.line_index = Some(Arc::clone(&line_index));
+                self.indexer_cancel = Some(Arc::clone(&cancel));
                 self.indexer_handle = Some(handle);
                 self.file_type = Some(file_type);
                 self.open_duration = Some(dur);
@@ -340,16 +406,171 @@ impl UltraViewerApp {
                 self.json_validation_result = None;
                 self.is_validating_json = false;
 
+                let tab_id = self.next_tab_id;
+                self.next_tab_id += 1;
+                self.active_tab_id = Some(tab_id);
+
+                let new_tab = OpenDocState {
+                    id: tab_id,
+                    path: path_buf.clone(),
+                    engine: Arc::clone(&engine),
+                    line_index: Arc::clone(&line_index),
+                    indexer_cancel: Arc::clone(&cancel),
+                    indexer_handle: None,
+                    viewport: self.viewport.clone(),
+                    file_type: Some(file_type),
+                    open_duration: Some(dur),
+                    current_line: 1,
+                    document: self.document.clone(),
+                    is_edit_mode: false,
+                    active_edit_line: None,
+                    edit_line_buffer: String::new(),
+                    xml_tree_root: None,
+                    json_tree_root: None,
+                };
+                self.tabs.push(new_tab);
+
+                // Auto-detect CSV/TSV
+                let ext = path_buf.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                if ext == "csv" {
+                    self.csv_grid.is_enabled = true;
+                    self.csv_grid.delimiter = ',';
+                } else if ext == "tsv" {
+                    self.csv_grid.is_enabled = true;
+                    self.csv_grid.delimiter = '\t';
+                } else {
+                    self.csv_grid.is_enabled = false;
+                }
+
                 // Auto-build compact structure tree if size <= 2GB
                 if file_type == FileType::Xml {
                     self.trigger_build_xml_tree();
                 } else if file_type == FileType::Json {
                     self.trigger_build_json_tree();
                 }
+
+                self.persist_session();
             }
             Err(err) => {
                 self.error_message = Some(format!("Failed to open file: {}", err));
             }
+        }
+    }
+
+    pub fn persist_session(&mut self) {
+        self.session.open_files = self.tabs.iter().map(|t| t.path.clone()).collect();
+        self.session.recent_files = self.recent_files.clone();
+        self.session.font_size = self.font_size;
+        self.session.theme_name = self.current_theme.name().to_string();
+        self.session.word_wrap = self.word_wrap;
+        self.session.save();
+    }
+
+    pub fn set_theme(&mut self, theme: ColorTheme, ctx: &egui::Context) {
+        self.current_theme = theme;
+        apply_modern_theme(ctx, theme);
+        self.persist_session();
+    }
+
+    pub fn sync_active_tab_state(&mut self) {
+        if let Some(active_id) = self.active_tab_id {
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
+                if let Some(engine) = &self.engine {
+                    tab.engine = Arc::clone(engine);
+                }
+                if let Some(line_index) = &self.line_index {
+                    tab.line_index = Arc::clone(line_index);
+                }
+                if let Some(cancel) = &self.indexer_cancel {
+                    tab.indexer_cancel = Arc::clone(cancel);
+                }
+                tab.viewport = self.viewport.clone();
+                tab.file_type = self.file_type;
+                tab.open_duration = self.open_duration;
+                tab.current_line = self.current_line;
+                tab.document = self.document.clone();
+                tab.is_edit_mode = self.is_edit_mode;
+                tab.active_edit_line = self.active_edit_line;
+                tab.edit_line_buffer = self.edit_line_buffer.clone();
+                tab.xml_tree_root = self.xml_tree_root.clone();
+                tab.json_tree_root = self.json_tree_root.clone();
+            }
+        }
+    }
+
+    pub fn switch_to_tab(&mut self, tab_id: usize) {
+        if self.active_tab_id == Some(tab_id) {
+            return;
+        }
+        self.sync_active_tab_state();
+
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            self.active_tab_id = Some(tab_id);
+            self.engine = Some(Arc::clone(&tab.engine));
+            self.line_index = Some(Arc::clone(&tab.line_index));
+            self.indexer_cancel = Some(Arc::clone(&tab.indexer_cancel));
+            self.viewport = tab.viewport.clone();
+            self.file_type = tab.file_type;
+            self.open_duration = tab.open_duration;
+            self.current_line = tab.current_line;
+            self.document = tab.document.clone();
+            self.is_edit_mode = tab.is_edit_mode;
+            self.active_edit_line = tab.active_edit_line;
+            self.edit_line_buffer = tab.edit_line_buffer.clone();
+            self.xml_tree_root = tab.xml_tree_root.clone();
+            self.json_tree_root = tab.json_tree_root.clone();
+
+            self.search_matches.write().unwrap().clear();
+            *self.search_status.write().unwrap() = SearchStatus::Idle;
+            self.active_match_idx = None;
+
+            let ext = tab.path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+            if ext == "csv" {
+                self.csv_grid.is_enabled = true;
+                self.csv_grid.delimiter = ',';
+            } else if ext == "tsv" {
+                self.csv_grid.is_enabled = true;
+                self.csv_grid.delimiter = '\t';
+            } else {
+                self.csv_grid.is_enabled = false;
+            }
+        }
+    }
+
+    pub fn close_tab_by_id(&mut self, tab_id: usize) {
+        let pos = self.tabs.iter().position(|t| t.id == tab_id);
+        if let Some(idx) = pos {
+            let is_active = self.active_tab_id == Some(tab_id);
+            let tab = self.tabs.remove(idx);
+            tab.indexer_cancel.store(true, Ordering::Relaxed);
+
+            if is_active {
+                if let Some(next_tab) = self.tabs.get(idx.min(self.tabs.len().saturating_sub(1))) {
+                    let next_id = next_tab.id;
+                    self.active_tab_id = None;
+                    self.switch_to_tab(next_id);
+                } else {
+                    self.active_tab_id = None;
+                    self.do_close_file();
+                }
+            }
+            self.persist_session();
+        }
+    }
+
+    pub fn close_all_tabs(&mut self) {
+        for tab in self.tabs.drain(..) {
+            tab.indexer_cancel.store(true, Ordering::Relaxed);
+        }
+        self.active_tab_id = None;
+        self.do_close_file();
+        self.persist_session();
+    }
+
+    pub fn trigger_folder_dialog(&mut self) {
+        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+            self.folder_explorer.root_path = Some(folder);
+            self.active_activity_panel = ActivityPanel::Explorer;
         }
     }
 
@@ -359,7 +580,11 @@ impl UltraViewerApp {
             self.show_unsaved_dialog = true;
             return;
         }
-        self.do_close_file();
+        if let Some(active_id) = self.active_tab_id {
+            self.close_tab_by_id(active_id);
+        } else {
+            self.do_close_file();
+        }
     }
 
     pub fn do_close_file(&mut self) {
@@ -972,12 +1197,13 @@ impl UltraViewerApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (ctrl_o, ctrl_s, ctrl_shift_s, ctrl_z, ctrl_y, ctrl_e, ctrl_f, ctrl_g, ctrl_shift_f, ctrl_shift_m, ctrl_shift_a, f3, shift_f3, esc, zoom_in, zoom_out, zoom_reset, up, down, page_up, page_down, home, end, alt_z) = ctx.input(|i| {
+        let (ctrl_o, ctrl_w, ctrl_s, ctrl_shift_s, ctrl_z, ctrl_y, ctrl_e, ctrl_f, ctrl_g, ctrl_shift_e, ctrl_shift_f, ctrl_shift_t, ctrl_shift_b, ctrl_shift_m, ctrl_shift_a, ctrl_shift_p, ctrl_comma, f1, f3, shift_f3, esc, zoom_in, zoom_out, zoom_reset, up, down, page_up, page_down, home, end, alt_z) = ctx.input(|i| {
             let ctrl = i.modifiers.command;
             let shift = i.modifiers.shift;
             let alt = i.modifiers.alt;
             (
                 ctrl && !shift && i.key_pressed(Key::O),
+                ctrl && !shift && i.key_pressed(Key::W),
                 ctrl && !shift && i.key_pressed(Key::S),
                 ctrl && shift && i.key_pressed(Key::S),
                 ctrl && !shift && i.key_pressed(Key::Z),
@@ -985,9 +1211,15 @@ impl UltraViewerApp {
                 ctrl && !shift && i.key_pressed(Key::E),
                 ctrl && !shift && i.key_pressed(Key::F),
                 ctrl && !shift && i.key_pressed(Key::G),
+                ctrl && shift && i.key_pressed(Key::E),
                 ctrl && shift && i.key_pressed(Key::F),
+                ctrl && shift && i.key_pressed(Key::T),
+                ctrl && shift && i.key_pressed(Key::B),
                 ctrl && shift && i.key_pressed(Key::M),
                 ctrl && shift && i.key_pressed(Key::A),
+                ctrl && shift && i.key_pressed(Key::P),
+                ctrl && !shift && i.key_pressed(Key::Comma),
+                i.key_pressed(Key::F1),
                 i.key_pressed(Key::F3) && !shift,
                 i.key_pressed(Key::F3) && shift,
                 i.key_pressed(Key::Escape),
@@ -1006,6 +1238,13 @@ impl UltraViewerApp {
 
         if ctrl_o {
             self.trigger_file_dialog();
+        }
+        if ctrl_w {
+            self.close_file();
+        }
+        if ctrl_shift_p {
+            self.command_palette.is_open = !self.command_palette.is_open;
+            self.command_palette.query.clear();
         }
         if ctrl_s && self.engine.is_some() {
             self.start_save_in_place();
@@ -1026,10 +1265,25 @@ impl UltraViewerApp {
             }
         }
         let ctrl_b = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::B));
-        if ctrl_b {
+        if ctrl_b || ctrl_shift_e {
             self.active_activity_panel = match self.active_activity_panel {
-                ActivityPanel::None => ActivityPanel::Explorer,
-                _ => ActivityPanel::None,
+                ActivityPanel::Explorer => ActivityPanel::None,
+                _ => ActivityPanel::Explorer,
+            };
+        }
+        if ctrl_shift_t && self.engine.is_some() {
+            self.active_activity_panel = match self.active_activity_panel {
+                ActivityPanel::Structure => ActivityPanel::None,
+                _ => {
+                    let is_xml = self.file_type == Some(FileType::Xml);
+                    let is_json = self.file_type == Some(FileType::Json);
+                    if is_xml && self.xml_tree_root.is_none() {
+                        self.trigger_build_xml_tree();
+                    } else if is_json && self.json_tree_root.is_none() {
+                        self.trigger_build_json_tree();
+                    }
+                    ActivityPanel::Structure
+                }
             };
         }
         if alt_z {
@@ -1039,17 +1293,35 @@ impl UltraViewerApp {
             self.show_search_bar = true;
             self.focus_search_input = true;
         }
+        if ctrl_shift_f && self.engine.is_some() {
+            self.active_activity_panel = match self.active_activity_panel {
+                ActivityPanel::Search => ActivityPanel::None,
+                _ => ActivityPanel::Search,
+            };
+        }
         if ctrl_g && self.engine.is_some() {
             self.show_goto_line_dialog = true;
         }
-        if ctrl_shift_f && self.engine.is_some() {
+        if ctrl_shift_b && self.engine.is_some() {
             self.start_formatting(FormatAction::Beautify { indent_size: 2, use_tabs: false }, true, None);
         }
         if ctrl_shift_m && self.engine.is_some() {
             self.start_formatting(FormatAction::Minify, true, None);
         }
         if ctrl_shift_a && self.engine.is_some() {
-            self.start_analysis();
+            self.active_activity_panel = match self.active_activity_panel {
+                ActivityPanel::Analyzer => ActivityPanel::None,
+                _ => {
+                    self.start_analysis();
+                    ActivityPanel::Analyzer
+                }
+            };
+        }
+        if ctrl_comma {
+            self.show_about_dialog = !self.show_about_dialog;
+        }
+        if f1 {
+            self.show_about_dialog = !self.show_about_dialog;
         }
         if f3 && self.engine.is_some() {
             self.find_next();
@@ -1106,8 +1378,14 @@ impl UltraViewerApp {
             }
         }
 
-        let scroll_y = ctx.input(|i| i.raw_scroll_delta.y);
-        if scroll_y.abs() > 0.1 {
+        let (scroll_y, is_ctrl) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.command || i.modifiers.ctrl));
+        if is_ctrl && scroll_y.abs() > 0.1 {
+            if scroll_y > 0.0 {
+                self.font_size = (self.font_size + 1.0).min(36.0);
+            } else {
+                self.font_size = (self.font_size - 1.0).max(8.0);
+            }
+        } else if scroll_y.abs() > 0.1 {
             let lines_to_scroll = (-(scroll_y / 15.0)).round() as isize;
             if lines_to_scroll != 0 {
                 self.scroll_lines(lines_to_scroll);
@@ -1125,6 +1403,51 @@ impl UltraViewerApp {
         }
     }
 
+    fn handle_window_resizing(&self, ctx: &egui::Context) {
+        let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        if is_maximized {
+            return;
+        }
+
+        let screen_rect = ctx.screen_rect();
+        let border = 6.0;
+        let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
+        let mouse_down = ctx.input(|i| i.pointer.primary_down());
+
+        if let Some(pos) = pointer_pos {
+            let on_left = pos.x <= screen_rect.left() + border;
+            let on_right = pos.x >= screen_rect.right() - border;
+            let on_top = pos.y <= screen_rect.top() + border;
+            let on_bottom = pos.y >= screen_rect.bottom() - border;
+
+            let direction = match (on_top, on_bottom, on_left, on_right) {
+                (true, false, true, false) => Some(egui::ResizeDirection::NorthWest),
+                (true, false, false, true) => Some(egui::ResizeDirection::NorthEast),
+                (false, true, true, false) => Some(egui::ResizeDirection::SouthWest),
+                (false, true, false, true) => Some(egui::ResizeDirection::SouthEast),
+                (true, false, false, false) => Some(egui::ResizeDirection::North),
+                (false, true, false, false) => Some(egui::ResizeDirection::South),
+                (false, false, true, false) => Some(egui::ResizeDirection::West),
+                (false, false, false, true) => Some(egui::ResizeDirection::East),
+                _ => None,
+            };
+
+            if let Some(dir) = direction {
+                let cursor = match dir {
+                    egui::ResizeDirection::North | egui::ResizeDirection::South => egui::CursorIcon::ResizeVertical,
+                    egui::ResizeDirection::East | egui::ResizeDirection::West => egui::CursorIcon::ResizeHorizontal,
+                    egui::ResizeDirection::NorthWest | egui::ResizeDirection::SouthEast => egui::CursorIcon::ResizeNwSe,
+                    egui::ResizeDirection::NorthEast | egui::ResizeDirection::SouthWest => egui::CursorIcon::ResizeNeSw,
+                };
+                ctx.set_cursor_icon(cursor);
+
+                if mouse_down && ctx.input(|i| i.pointer.primary_pressed()) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+                }
+            }
+        }
+    }
+
     fn trigger_file_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Open Large File - UltraViewer")
@@ -1137,8 +1460,13 @@ impl UltraViewerApp {
 
 impl eframe::App for UltraViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.style().visuals.panel_fill != Color32::from_rgb(10, 14, 22) {
-            apply_modern_theme(ctx);
+        if ctx.style().visuals.panel_fill != self.current_theme.bg_color() {
+            apply_modern_theme(ctx, self.current_theme);
+        }
+
+        if self.titlebar_applied_frames < 5 {
+            super::win32_titlebar::apply_dark_title_bar();
+            self.titlebar_applied_frames += 1;
         }
 
         let is_searching = matches!(*self.search_status.read().unwrap(), SearchStatus::Searching { .. });
@@ -1288,9 +1616,9 @@ impl eframe::App for UltraViewerApp {
         self.update_memory_metrics();
         self.handle_shortcuts(ctx);
         self.handle_drag_and_drop(ctx);
+        self.handle_window_resizing(ctx);
 
         let has_file = self.engine.is_some();
-        let total_lines = self.line_index.as_ref().map(|i| i.total_lines()).unwrap_or(0);
         let is_xml = self.file_type == Some(FileType::Xml);
         let is_json = self.file_type == Some(FileType::Json);
         let is_dirty = self.document.as_ref().map_or(false, |d| d.is_dirty());
@@ -1298,12 +1626,171 @@ impl eframe::App for UltraViewerApp {
         let can_redo = self.document.as_ref().map_or(false, |d| d.can_redo());
         let is_edit_mode = self.is_edit_mode;
 
-        // Left Navigation Sidebar (Full height from top to bottom, matching mockup media_1789811265859.jpg)
-        let sidebar_width = if self.sidebar_expanded { 210.0 } else { 44.0 };
+        let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+
+        // 1. Top Menu Bar (Full width across the window, starting with Logo followed by menus)
+        let menu_action = egui::TopBottomPanel::top("menu_bar")
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(30, 34, 39))
+                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 26, 31)))
+                    .inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 0 }),
+            )
+            .show(ctx, |ui| {
+                render_menu_bar(
+                    ui,
+                    has_file,
+                    is_xml,
+                    is_json,
+                    is_dirty,
+                    can_undo,
+                    can_redo,
+                    is_edit_mode,
+                    self.font_size,
+                    is_maximized,
+                )
+            })
+            .inner;
+
+        if let Some(action) = menu_action {
+            match action {
+                MenuAction::OpenFile => self.trigger_file_dialog(),
+                MenuAction::CloseFile => self.close_file(),
+                MenuAction::SaveFile => self.start_save_in_place(),
+                MenuAction::SaveFileAs => self.start_save_as(),
+                MenuAction::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                MenuAction::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                MenuAction::ToggleMaximize => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized)),
+                MenuAction::Undo => self.undo(),
+                MenuAction::Redo => self.redo(),
+                MenuAction::ToggleEditMode => {
+                    self.is_edit_mode = !self.is_edit_mode;
+                    if !self.is_edit_mode {
+                        self.active_edit_line = None;
+                    }
+                }
+                MenuAction::Find => {
+                    self.show_search_bar = true;
+                    self.focus_search_input = true;
+                }
+                MenuAction::GoToLine => self.show_goto_line_dialog = true,
+                MenuAction::ZoomIn => self.font_size = (self.font_size + 1.0).min(36.0),
+                MenuAction::ZoomOut => self.font_size = (self.font_size - 1.0).max(8.0),
+                MenuAction::ZoomReset => self.font_size = 14.0,
+                MenuAction::ToggleTheme => {
+                    let dark = !ctx.style().visuals.dark_mode;
+                    if dark {
+                        ctx.set_visuals(egui::Visuals::dark());
+                    } else {
+                        ctx.set_visuals(egui::Visuals::light());
+                    }
+                }
+                MenuAction::XmlValidate => self.validate_xml_document(),
+                MenuAction::XmlToggleTree => {
+                    self.show_xml_tree = !self.show_xml_tree;
+                    if self.show_xml_tree && self.xml_tree_root.is_none() {
+                        self.trigger_build_xml_tree();
+                    }
+                }
+                MenuAction::XmlToggleHighlight => self.enable_syntax_highlighting = !self.enable_syntax_highlighting,
+                MenuAction::JsonValidate => self.validate_json_document(),
+                MenuAction::JsonToggleTree => {
+                    self.show_json_tree = !self.show_json_tree;
+                    if self.show_json_tree && self.json_tree_root.is_none() {
+                        self.trigger_build_json_tree();
+                    }
+                }
+                MenuAction::JsonToggleHighlight => self.enable_syntax_highlighting = !self.enable_syntax_highlighting,
+                MenuAction::FormatBeautify2 => {
+                    self.start_formatting(FormatAction::Beautify { indent_size: 2, use_tabs: false }, true, None);
+                }
+                MenuAction::FormatBeautify4 => {
+                    self.start_formatting(FormatAction::Beautify { indent_size: 4, use_tabs: false }, true, None);
+                }
+                MenuAction::FormatMinify => {
+                    self.start_formatting(FormatAction::Minify, true, None);
+                }
+                MenuAction::FormatSaveAs => {
+                    self.trigger_format_save_as();
+                }
+                MenuAction::AnalyzeFields => {
+                    self.start_analysis();
+                }
+                MenuAction::OpenFolder => self.trigger_folder_dialog(),
+                MenuAction::CommandPalette => {
+                    self.command_palette.is_open = true;
+                    self.command_palette.query.clear();
+                }
+                MenuAction::ToggleCsvGrid => self.csv_grid.is_enabled = !self.csv_grid.is_enabled,
+                MenuAction::OpenDiffViewer => self.diff_viewer.is_open = true,
+                MenuAction::RegisterContextMenu => {
+                    match ContextMenuManager::register() {
+                        Ok(msg) => self.status_notification = Some((msg, Instant::now())),
+                        Err(err) => self.error_message = Some(err),
+                    }
+                }
+                MenuAction::UnregisterContextMenu => {
+                    match ContextMenuManager::unregister() {
+                        Ok(msg) => self.status_notification = Some((msg, Instant::now())),
+                        Err(err) => self.error_message = Some(err),
+                    }
+                }
+                MenuAction::SetTheme(t) => self.set_theme(t, ctx),
+                MenuAction::About => self.show_about_dialog = true,
+            }
+        }
+
+        // 2. Bottom Status Bar (Full width across the window)
+        let file_name = self.engine.as_ref().and_then(|e| e.path().file_name().and_then(|n| n.to_str()));
+        let file_size = self.engine.as_ref().map(|e| e.size()).unwrap_or(0);
+        let encoding = self.engine.as_ref().map(|e| e.detect_encoding());
+        let (indexing_pct, is_complete, speed, total_lines) = if let Some(ref idx) = self.line_index {
+            (Some(idx.progress_pct()), idx.is_complete(), idx.speed_mb_s(), idx.total_lines())
+        } else {
+            (None, false, 0, 0)
+        };
+        let current_byte_offset = self.viewport.lines.first().map(|l| l.byte_offset).unwrap_or(0);
+        let edit_count = self.document.as_ref().map_or(0, |d| d.edit_count());
+
+        let status_action = egui::TopBottomPanel::bottom("status_bar")
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(30, 34, 39)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 26, 31))))
+            .show(ctx, |ui| {
+                render_status_bar(
+                    ui,
+                    StatusBarProps {
+                        file_name,
+                        file_size,
+                        encoding,
+                        file_type: self.file_type,
+                        visible_lines_count: self.viewport.lines.len(),
+                        current_line: self.current_line,
+                        current_offset: current_byte_offset,
+                        memory_rss_bytes: self.cached_rss_bytes,
+                        open_latency: self.open_duration,
+                        indexing_pct,
+                        is_indexing_complete: is_complete,
+                        indexing_speed_mb: speed,
+                        total_indexed_lines: total_lines,
+                        is_dirty,
+                        edit_count,
+                        is_edit_mode,
+                        font_size: self.font_size,
+                    },
+                )
+            })
+            .inner;
+
+        if let Some(status_act) = status_action {
+            match status_act {
+                StatusBarAction::ResetZoom => self.font_size = 14.0,
+            }
+        }
+
+        // 3. Left VS Code Activity Bar (Dedicated 48px rail with vector icons)
         egui::SidePanel::left("activity_bar")
-            .exact_width(sidebar_width)
+            .exact_width(48.0)
             .resizable(false)
-            .frame(egui::Frame::NONE.fill(Color32::from_rgb(10, 14, 22)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 34, 48))))
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(30, 34, 39)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 26, 31))))
             .show(ctx, |ui| {
                 let search_matches_count = self.search_matches_count();
                 let props = ActivityBarProps {
@@ -1313,7 +1800,7 @@ impl eframe::App for UltraViewerApp {
                     is_xml,
                     is_json,
                     search_match_count: search_matches_count,
-                    is_expanded: self.sidebar_expanded,
+                    is_expanded: false,
                 };
                 if let Some(act) = render_activity_bar(ui, &props) {
                     match act {
@@ -1349,7 +1836,7 @@ impl eframe::App for UltraViewerApp {
                         }
                         ActivityBarAction::ToggleSettings => self.show_about_dialog = true,
                         ActivityBarAction::ToggleHelp => self.show_about_dialog = true,
-                        ActivityBarAction::ToggleExpanded => self.sidebar_expanded = !self.sidebar_expanded,
+                        ActivityBarAction::ToggleExpanded => {},
                     }
                 }
             });
@@ -1358,11 +1845,12 @@ impl eframe::App for UltraViewerApp {
         if self.active_activity_panel == ActivityPanel::Explorer {
             let mut close_drawer = false;
             let mut open_recent = None;
+            let mut pick_folder = false;
             egui::SidePanel::left("activity_drawer")
                 .resizable(true)
                 .default_width(240.0)
                 .width_range(200.0..=360.0)
-                .frame(egui::Frame::NONE.fill(Color32::from_rgb(13, 18, 28)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(28, 38, 54))))
+                .frame(egui::Frame::NONE.fill(Color32::from_rgb(30, 34, 39)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 26, 31))))
                 .show(ctx, |ui| {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -1379,12 +1867,16 @@ impl eframe::App for UltraViewerApp {
                         });
                     });
                     ui.separator();
-                    ui.add_space(6.0);
-
-                    if ui.button(RichText::new("Open File (Ctrl+O)").size(12.5)).clicked() {
-                        self.trigger_file_dialog();
+                    if let Some(folder_act) = render_folder_explorer(ui, &mut self.folder_explorer) {
+                        match folder_act {
+                            FolderAction::OpenFile(p) => open_recent = Some(p),
+                            FolderAction::OpenFolderDialog => pick_folder = true,
+                        }
                     }
-                    ui.add_space(10.0);
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
 
                     ui.label(RichText::new("RECENT FILES").strong().size(10.5).color(Color32::from_rgb(110, 125, 145)));
                     ui.add_space(4.0);
@@ -1405,6 +1897,9 @@ impl eframe::App for UltraViewerApp {
                     }
                 });
 
+            if pick_folder {
+                self.trigger_folder_dialog();
+            }
             if let Some(path) = open_recent {
                 self.open_file(&path);
             }
@@ -1417,11 +1912,11 @@ impl eframe::App for UltraViewerApp {
         if self.active_activity_panel == ActivityPanel::Structure && has_file {
             let mut close_drawer = false;
             let mut jump_offset = None;
-            egui::SidePanel::right("structure_panel")
+            egui::SidePanel::left("structure_panel")
                 .resizable(true)
                 .default_width(280.0)
                 .width_range(220.0..=450.0)
-                .frame(egui::Frame::NONE.fill(Color32::from_rgb(10, 14, 22)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 34, 48))))
+                .frame(egui::Frame::NONE.fill(Color32::from_rgb(30, 34, 39)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 26, 31))))
                 .show(ctx, |ui| {
                     ui.add_space(8.0);
                     if is_xml {
@@ -1451,85 +1946,7 @@ impl eframe::App for UltraViewerApp {
             }
         }
 
-        // Top Menu Bar
-        egui::TopBottomPanel::top("menu_bar")
-            .frame(egui::Frame::NONE.fill(Color32::from_rgb(10, 14, 22)).inner_margin(egui::Margin::symmetric(10, 2)))
-            .show(ctx, |ui| {
-            if let Some(action) = render_menu_bar(
-                ui,
-                self.engine.is_some(),
-                is_xml,
-                is_json,
-                is_dirty,
-                can_undo,
-                can_redo,
-                is_edit_mode,
-            ) {
-                match action {
-                    MenuAction::OpenFile => self.trigger_file_dialog(),
-                    MenuAction::CloseFile => self.close_file(),
-                    MenuAction::SaveFile => self.start_save_in_place(),
-                    MenuAction::SaveFileAs => self.start_save_as(),
-                    MenuAction::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                    MenuAction::Undo => self.undo(),
-                    MenuAction::Redo => self.redo(),
-                    MenuAction::ToggleEditMode => {
-                        self.is_edit_mode = !self.is_edit_mode;
-                        if !self.is_edit_mode {
-                            self.active_edit_line = None;
-                        }
-                    }
-                    MenuAction::Find => {
-                        self.show_search_bar = true;
-                        self.focus_search_input = true;
-                    }
-                    MenuAction::GoToLine => self.show_goto_line_dialog = true,
-                    MenuAction::ZoomIn => self.font_size = (self.font_size + 1.0).min(32.0),
-                    MenuAction::ZoomOut => self.font_size = (self.font_size - 1.0).max(8.0),
-                    MenuAction::ZoomReset => self.font_size = 14.0,
-                    MenuAction::ToggleTheme => {
-                        let dark = !ui.visuals().dark_mode;
-                        if dark {
-                            ctx.set_visuals(egui::Visuals::dark());
-                        } else {
-                            ctx.set_visuals(egui::Visuals::light());
-                        }
-                    }
-                    MenuAction::XmlValidate => self.validate_xml_document(),
-                    MenuAction::XmlToggleTree => {
-                        self.show_xml_tree = !self.show_xml_tree;
-                        if self.show_xml_tree && self.xml_tree_root.is_none() {
-                            self.trigger_build_xml_tree();
-                        }
-                    }
-                    MenuAction::XmlToggleHighlight => self.enable_syntax_highlighting = !self.enable_syntax_highlighting,
-                    MenuAction::JsonValidate => self.validate_json_document(),
-                    MenuAction::JsonToggleTree => {
-                        self.show_json_tree = !self.show_json_tree;
-                        if self.show_json_tree && self.json_tree_root.is_none() {
-                            self.trigger_build_json_tree();
-                        }
-                    }
-                    MenuAction::JsonToggleHighlight => self.enable_syntax_highlighting = !self.enable_syntax_highlighting,
-                    MenuAction::FormatBeautify2 => {
-                        self.start_formatting(FormatAction::Beautify { indent_size: 2, use_tabs: false }, true, None);
-                    }
-                    MenuAction::FormatBeautify4 => {
-                        self.start_formatting(FormatAction::Beautify { indent_size: 4, use_tabs: false }, true, None);
-                    }
-                    MenuAction::FormatMinify => {
-                        self.start_formatting(FormatAction::Minify, true, None);
-                    }
-                    MenuAction::FormatSaveAs => {
-                        self.trigger_format_save_as();
-                    }
-                    MenuAction::AnalyzeFields => {
-                        self.start_analysis();
-                    }
-                    MenuAction::About => self.show_about_dialog = true,
-                }
-            }
-        });
+
 
         // Navigation & Actions
         let mut action_open = false;
@@ -1541,16 +1958,30 @@ impl eframe::App for UltraViewerApp {
         let mut action_toggle_edit = false;
         let mut action_save = false;
 
+        let mut switch_tab_to = None;
+        let mut close_tab_with_id = None;
+
         // Modern Tab Bar & Document Header (Option B)
         egui::TopBottomPanel::top("tab_bar_panel")
-            .frame(egui::Frame::NONE.fill(Color32::from_rgb(10, 14, 22)).inner_margin(egui::Margin::symmetric(10, 4)))
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(30, 34, 39)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 26, 31))).inner_margin(egui::Margin::symmetric(10, 4)))
             .show(ctx, |ui| {
-                let file_name = self.engine.as_ref().and_then(|e| e.path().file_name().and_then(|n| n.to_str()));
                 let file_size = self.engine.as_ref().map(|e| e.size()).unwrap_or(0);
 
+                let tab_infos: Vec<TabInfo> = self.tabs.iter().map(|t| {
+                    let name = t.path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                    let is_dirty = t.document.as_ref().map_or(false, |d| d.is_dirty());
+                    let is_active = self.active_tab_id == Some(t.id);
+                    TabInfo {
+                        id: t.id,
+                        name,
+                        file_type: t.file_type,
+                        is_dirty,
+                        is_active,
+                    }
+                }).collect();
+
                 let tab_props = TabBarProps {
-                    file_name,
-                    file_type: self.file_type,
+                    tabs: tab_infos,
                     file_size,
                     is_dirty,
                     is_edit_mode: self.is_edit_mode,
@@ -1562,6 +1993,8 @@ impl eframe::App for UltraViewerApp {
 
                 if let Some(tab_action) = render_tab_bar(ui, &tab_props) {
                     match tab_action {
+                        TabBarAction::SelectTab(id) => switch_tab_to = Some(id),
+                        TabBarAction::CloseTab(id) => close_tab_with_id = Some(id),
                         TabBarAction::OpenFile => action_open = true,
                         TabBarAction::CloseFile => action_close = true,
                         TabBarAction::ToggleEditMode => action_toggle_edit = true,
@@ -1584,6 +2017,13 @@ impl eframe::App for UltraViewerApp {
                     }
                 }
             });
+
+        if let Some(id) = switch_tab_to {
+            self.switch_to_tab(id);
+        }
+        if let Some(id) = close_tab_with_id {
+            self.close_tab_by_id(id);
+        }
 
         if action_open {
             self.trigger_file_dialog();
@@ -1624,7 +2064,7 @@ impl eframe::App for UltraViewerApp {
             }
 
             egui::TopBottomPanel::top("search_bar_panel")
-                .frame(egui::Frame::NONE.fill(Color32::from_rgb(13, 18, 28)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 34, 48))))
+                .frame(egui::Frame::NONE.fill(Color32::from_rgb(30, 34, 39)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 26, 31))))
                 .show(ctx, |ui| {
                 if let Some(action) = render_search_bar(
                     ui,
@@ -1656,11 +2096,11 @@ impl eframe::App for UltraViewerApp {
                 ui.horizontal(|ui| {
                     match val_res {
                         XmlValidationResult::Valid { elements_count, max_depth, elapsed_secs } => {
-                            ui.colored_label(Color32::from_rgb(80, 220, 100), "✓ Valid XML Document");
+                            ui.colored_label(Color32::from_rgb(152, 195, 121), "✓ Valid XML Document");
                             ui.label(format!("({} elements, max depth: {}, verified in {:.2}s)", elements_count, max_depth, elapsed_secs));
                         }
                         XmlValidationResult::Invalid { line_number, byte_offset, message } => {
-                            ui.colored_label(Color32::from_rgb(230, 70, 70), "✗ XML Validation Error");
+                            ui.colored_label(Color32::from_rgb(224, 108, 117), "✗ XML Validation Error");
                             ui.label(format!("Line {}, Offset {}: {}", line_number, byte_offset, message));
                         }
                     }
@@ -1683,11 +2123,11 @@ impl eframe::App for UltraViewerApp {
                 ui.horizontal(|ui| {
                     match val_res {
                         JsonValidationResult::Valid { objects_count, arrays_count, max_depth, elapsed_secs } => {
-                            ui.colored_label(Color32::from_rgb(80, 220, 100), "✓ Valid JSON Document");
+                            ui.colored_label(Color32::from_rgb(152, 195, 121), "✓ Valid JSON Document");
                             ui.label(format!("({} objects, {} arrays, max depth: {}, verified in {:.2}s)", objects_count, arrays_count, max_depth, elapsed_secs));
                         }
                         JsonValidationResult::Invalid { line_number, byte_offset, message } => {
-                            ui.colored_label(Color32::from_rgb(230, 70, 70), "✗ JSON Validation Error");
+                            ui.colored_label(Color32::from_rgb(224, 108, 117), "✗ JSON Validation Error");
                             ui.label(format!("Line {}, Offset {}: {}", line_number, byte_offset, message));
                         }
                     }
@@ -1703,46 +2143,6 @@ impl eframe::App for UltraViewerApp {
             self.json_validation_result = None;
         }
 
-        // Bottom Status Bar
-        egui::TopBottomPanel::bottom("status_bar")
-            .frame(egui::Frame::NONE.fill(Color32::from_rgb(10, 14, 22)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 34, 48))))
-            .show(ctx, |ui| {
-            let file_name = self.engine.as_ref().and_then(|e| e.path().file_name().and_then(|n| n.to_str()));
-            let file_size = self.engine.as_ref().map(|e| e.size()).unwrap_or(0);
-            let encoding = self.engine.as_ref().map(|e| e.detect_encoding());
-
-            let (indexing_pct, is_complete, speed, total_lines) = if let Some(ref idx) = self.line_index {
-                (Some(idx.progress_pct()), idx.is_complete(), idx.speed_mb_s(), idx.total_lines())
-            } else {
-                (None, false, 0, 0)
-            };
-
-            let current_byte_offset = self.viewport.lines.first().map(|l| l.byte_offset).unwrap_or(0);
-            let edit_count = self.document.as_ref().map_or(0, |d| d.edit_count());
-
-            render_status_bar(
-                ui,
-                StatusBarProps {
-                    file_name,
-                    file_size,
-                    encoding,
-                    file_type: self.file_type,
-                    visible_lines_count: self.viewport.lines.len(),
-                    current_line: self.current_line,
-                    current_offset: current_byte_offset,
-                    memory_rss_bytes: self.cached_rss_bytes,
-                    open_latency: self.open_duration,
-                    indexing_pct,
-                    is_indexing_complete: is_complete,
-                    indexing_speed_mb: speed,
-                    total_indexed_lines: total_lines,
-                    is_dirty,
-                    edit_count,
-                    is_edit_mode,
-                },
-            );
-        });
-
         // Search Results Bottom Panel
         if self.show_search_results && has_file {
             let matches_snapshot = self.search_matches.read().unwrap().clone();
@@ -1753,7 +2153,7 @@ impl eframe::App for UltraViewerApp {
                 .resizable(true)
                 .default_height(160.0)
                 .height_range(80.0..=400.0)
-                .frame(egui::Frame::NONE.fill(Color32::from_rgb(10, 14, 22)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 34, 48))))
+                .frame(egui::Frame::NONE.fill(Color32::from_rgb(30, 34, 39)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 26, 31))))
                 .show(ctx, |ui| {
                     render_search_results_panel(
                         ui,
@@ -1775,7 +2175,7 @@ impl eframe::App for UltraViewerApp {
 
         // Central Viewport Panel
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(Color32::from_rgb(7, 10, 16)))
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(30, 34, 39)))
             .show(ctx, |ui| {
             if let Some(ref err) = self.error_message {
                 ui.colored_label(Color32::from_rgb(220, 50, 50), err);
@@ -1825,6 +2225,8 @@ impl eframe::App for UltraViewerApp {
                         ui.label(RichText::new("or drag and drop a file anywhere into this window").size(12.0).color(Color32::from_rgb(110, 120, 138)));
                     });
                 });
+            } else if self.csv_grid.is_enabled {
+                render_csv_grid(ui, &self.viewport, self.font_size, self.csv_grid.delimiter);
             } else {
                 // File Viewport: Virtualized Monospace Line Rendering + Document Scrollbar
                 self.render_editor_viewport(ui);
@@ -2098,14 +2500,145 @@ impl eframe::App for UltraViewerApp {
                 }
             }
         }
+
+        // Command Palette Modal (Ctrl+Shift+P)
+        if let Some(pal_action) = render_command_palette(ctx, &mut self.command_palette) {
+            self.handle_palette_action(pal_action, ctx);
+        }
+
+        // Side-by-Side Diff Modal
+        if self.diff_viewer.is_open {
+            let primary_lines: Vec<String> = self.viewport.lines.iter().map(|l| l.text.clone()).collect();
+            let primary_name = self.engine.as_ref()
+                .and_then(|e| e.path().file_name().and_then(|n| n.to_str()))
+                .unwrap_or("Active File");
+
+            if let Some(act) = render_diff_modal(ctx, &mut self.diff_viewer, &primary_lines, primary_name) {
+                match act {
+                    DiffViewerAction::Close => self.diff_viewer.is_open = false,
+                    DiffViewerAction::PickSecondaryFile => {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                self.diff_viewer.secondary_lines = content.lines().map(|s| s.to_string()).collect();
+                                self.diff_viewer.secondary_path = Some(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Temporary Status Notification Toast
+        if let Some((ref msg, created_at)) = self.status_notification {
+            if created_at.elapsed() < Duration::from_secs(4) {
+                egui::Window::new("NotificationToast")
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -36.0))
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(Color32::from_rgb(30, 34, 39))
+                            .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(0, 122, 204)))
+                            .inner_margin(egui::Margin::symmetric(12, 8)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("ℹ").color(Color32::from_rgb(97, 175, 239)).strong());
+                            ui.label(RichText::new(msg).size(12.0).color(Color32::WHITE));
+                        });
+                    });
+            } else {
+                self.status_notification = None;
+            }
+        }
     }
 }
 
 impl UltraViewerApp {
+    fn handle_palette_action(&mut self, action: PaletteAction, ctx: &egui::Context) {
+        match action {
+            PaletteAction::OpenFile => self.trigger_file_dialog(),
+            PaletteAction::OpenFolder => self.trigger_folder_dialog(),
+            PaletteAction::CloseActiveTab => self.close_file(),
+            PaletteAction::CloseAllTabs => self.close_all_tabs(),
+            PaletteAction::SaveFile => self.start_save_in_place(),
+            PaletteAction::SaveFileAs => self.start_save_as(),
+            PaletteAction::Find => {
+                self.show_search_bar = true;
+                self.focus_search_input = true;
+            }
+            PaletteAction::GoToLine => self.show_goto_line_dialog = true,
+            PaletteAction::ToggleEditMode => {
+                self.is_edit_mode = !self.is_edit_mode;
+                if !self.is_edit_mode {
+                    self.active_edit_line = None;
+                }
+            }
+            PaletteAction::ToggleWrap => {
+                self.word_wrap = !self.word_wrap;
+                self.persist_session();
+            }
+            PaletteAction::ZoomIn => {
+                self.font_size = (self.font_size + 1.0).min(36.0);
+                self.persist_session();
+            }
+            PaletteAction::ZoomOut => {
+                self.font_size = (self.font_size - 1.0).max(8.0);
+                self.persist_session();
+            }
+            PaletteAction::ZoomReset => {
+                self.font_size = 14.0;
+                self.persist_session();
+            }
+            PaletteAction::SetThemeOneDark => self.set_theme(ColorTheme::OneDarkProDarker, ctx),
+            PaletteAction::SetThemeGitHubDark => self.set_theme(ColorTheme::GitHubDark, ctx),
+            PaletteAction::SetThemeMonokai => self.set_theme(ColorTheme::MonokaiPro, ctx),
+            PaletteAction::SetThemeTokyoNight => self.set_theme(ColorTheme::TokyoNight, ctx),
+            PaletteAction::SetThemeLightModern => self.set_theme(ColorTheme::LightModern, ctx),
+            PaletteAction::XmlValidate => self.validate_xml_document(),
+            PaletteAction::XmlToggleTree => {
+                self.show_xml_tree = !self.show_xml_tree;
+                if self.show_xml_tree && self.xml_tree_root.is_none() {
+                    self.trigger_build_xml_tree();
+                }
+            }
+            PaletteAction::JsonValidate => self.validate_json_document(),
+            PaletteAction::JsonToggleTree => {
+                self.show_json_tree = !self.show_json_tree;
+                if self.show_json_tree && self.json_tree_root.is_none() {
+                    self.trigger_build_json_tree();
+                }
+            }
+            PaletteAction::FormatBeautify2 => {
+                self.start_formatting(FormatAction::Beautify { indent_size: 2, use_tabs: false }, true, None);
+            }
+            PaletteAction::FormatBeautify4 => {
+                self.start_formatting(FormatAction::Beautify { indent_size: 4, use_tabs: false }, true, None);
+            }
+            PaletteAction::FormatMinify => {
+                self.start_formatting(FormatAction::Minify, true, None);
+            }
+            PaletteAction::AnalyzeFields => self.start_analysis(),
+            PaletteAction::RegisterContextMenu => {
+                match ContextMenuManager::register() {
+                    Ok(msg) => self.status_notification = Some((msg, Instant::now())),
+                    Err(err) => self.error_message = Some(err),
+                }
+            }
+            PaletteAction::UnregisterContextMenu => {
+                match ContextMenuManager::unregister() {
+                    Ok(msg) => self.status_notification = Some((msg, Instant::now())),
+                    Err(err) => self.error_message = Some(err),
+                }
+            }
+            PaletteAction::About => self.show_about_dialog = true,
+        }
+    }
     fn render_editor_viewport(&mut self, ui: &mut Ui) {
         let text_font = FontId::monospace(self.font_size);
         let line_num_font = FontId::monospace((self.font_size * 0.9).max(10.0));
-        let line_num_color = Color32::from_rgb(130, 135, 145);
+        let line_num_color = Color32::from_rgb(92, 99, 112); // #5C6370 VS Code line number color
 
         let total_lines = self.line_index.as_ref().map(|i| i.total_lines()).unwrap_or(1).max(1);
         let file_type = self.file_type;
@@ -2422,7 +2955,7 @@ fn build_line_layout_job(
     job.wrap.max_width = wrap_width;
 
     let default_text_color = if dark_mode {
-        Color32::from_rgb(220, 225, 235)
+        Color32::from_rgb(171, 178, 191) // #ABB2BF One Dark foreground
     } else {
         Color32::from_rgb(30, 30, 30)
     };
