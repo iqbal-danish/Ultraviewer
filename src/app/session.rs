@@ -8,6 +8,7 @@ pub struct AppSession {
     pub font_size: f32,
     pub theme_name: String,
     pub word_wrap: bool,
+    pub auto_save: bool,
 }
 
 impl Default for AppSession {
@@ -16,9 +17,10 @@ impl Default for AppSession {
             open_files: Vec::new(),
             active_tab_idx: 0,
             recent_files: Vec::new(),
-            font_size: 14.0,
+            font_size: 16.0,
             theme_name: "One Dark Pro Darker".to_string(),
             word_wrap: false,
+            auto_save: false,
         }
     }
 }
@@ -98,6 +100,9 @@ impl AppSession {
                             "word_wrap" => {
                                 session.word_wrap = v == "true" || v == "1";
                             }
+                            "auto_save" => {
+                                session.auto_save = v == "true" || v == "1";
+                            }
                             _ => {}
                         }
                     }
@@ -121,6 +126,7 @@ impl AppSession {
         out.push_str(&format!("font_size={}\n", self.font_size));
         out.push_str(&format!("theme={}\n", self.theme_name));
         out.push_str(&format!("word_wrap={}\n", self.word_wrap));
+        out.push_str(&format!("auto_save={}\n", self.auto_save));
 
         out.push_str("\n[open_files]\n");
         for p in &self.open_files {

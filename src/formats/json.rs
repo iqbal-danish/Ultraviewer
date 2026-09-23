@@ -195,21 +195,12 @@ enum ContainerState {
 pub struct JsonValidator;
 
 impl JsonValidator {
-    /// Streaming zero-DOM validation of a JSON file using a 256 KB reusable chunk buffer.
+    /// Streaming zero-DOM validation of a JSON stream using a 256 KB reusable chunk buffer.
     /// Never loads the file or DOM into memory, maintaining a bounded working set (< 15 MB)
     /// even on files up to 50 GB.
-    pub fn validate(engine: Arc<FileEngine>, cancel: Arc<AtomicBool>) -> JsonValidationResult {
+    pub fn validate<R: Read>(reader: R, cancel: Arc<AtomicBool>) -> JsonValidationResult {
         let start = Instant::now();
-        let file = match File::open(engine.path()) {
-            Ok(f) => f,
-            Err(e) => return JsonValidationResult::Invalid {
-                line_number: 1,
-                byte_offset: 0,
-                message: format!("Cannot open file: {}", e),
-            },
-        };
-
-        let mut reader = BufReader::with_capacity(256 * 1024, file);
+        let mut reader = BufReader::with_capacity(256 * 1024, reader);
         let mut buffer = vec![0u8; 256 * 1024];
 
         let mut current_offset: u64 = 0;

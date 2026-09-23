@@ -298,6 +298,36 @@ impl JsonStreamingFormatter {
     }
 }
 
+pub fn clean_xml_decl(raw: &[u8]) -> Vec<u8> {
+    let mut s = raw;
+    while !s.is_empty() && s[0].is_ascii_whitespace() {
+        s = &s[1..];
+    }
+    // Repeatedly strip any leading "xml" or "XML" tokens and subsequent whitespace
+    while s.len() >= 3 && s[..3].eq_ignore_ascii_case(b"xml") {
+        if s.len() == 3 || s[3].is_ascii_whitespace() || s[3] == b'?' {
+            s = &s[3..];
+            while !s.is_empty() && s[0].is_ascii_whitespace() {
+                s = &s[1..];
+            }
+        } else {
+            break;
+        }
+    }
+    // Trim trailing '?' or whitespace
+    while !s.is_empty() && (s[s.len() - 1].is_ascii_whitespace() || s[s.len() - 1] == b'?') {
+        s = &s[..s.len() - 1];
+    }
+    let mut out = Vec::with_capacity(s.len() + 10);
+    out.extend_from_slice(b"<?xml");
+    if !s.is_empty() {
+        out.push(b' ');
+        out.extend_from_slice(s);
+    }
+    out.extend_from_slice(b"?>\n");
+    out
+}
+
 pub struct XmlStreamingFormatter;
 
 impl XmlStreamingFormatter {
@@ -335,13 +365,8 @@ impl XmlStreamingFormatter {
 
                     match xml_reader.read_event_into(&mut buf) {
                         Ok(Event::Decl(d)) => {
-                            writer.write_all(b"<?xml").map_err(|e| e.to_string())?;
-                            let content = d.as_ref();
-                            if !content.is_empty() {
-                                writer.write_all(b" ").map_err(|e| e.to_string())?;
-                                writer.write_all(content).map_err(|e| e.to_string())?;
-                            }
-                            writer.write_all(b"?>\n").map_err(|e| e.to_string())?;
+                            let decl = clean_xml_decl(d.as_ref());
+                            writer.write_all(&decl).map_err(|e| e.to_string())?;
                         }
                         Ok(Event::Start(e)) => {
                             writer.write_all(b"<").map_err(|e| e.to_string())?;
@@ -448,13 +473,8 @@ impl XmlStreamingFormatter {
                     match xml_reader.read_event_into(&mut buf) {
                         Ok(Event::Decl(d)) => {
                             flush_container(&mut writer, &mut pending_start, &indent_unit)?;
-                            writer.write_all(b"<?xml").map_err(|e| e.to_string())?;
-                            let content = d.as_ref();
-                            if !content.is_empty() {
-                                writer.write_all(b" ").map_err(|e| e.to_string())?;
-                                writer.write_all(content).map_err(|e| e.to_string())?;
-                            }
-                            writer.write_all(b"?>\n").map_err(|e| e.to_string())?;
+                            let decl = clean_xml_decl(d.as_ref());
+                            writer.write_all(&decl).map_err(|e| e.to_string())?;
                             prev_was_text = false;
                         }
                         Ok(Event::Start(e)) => {
@@ -616,3 +636,174 @@ impl XmlStreamingFormatter {
         res
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_json_beautify_and_minify() {
+        let input = r#"{"name":"UltraViewer","version":1,"features":["stream","search",{"enabled":true}]}"#;
+        let mut beautified = Vec::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        JsonStreamingFormatter::format(
+            Cursor::new(input.as_bytes()),
+            &mut beautified,
+            FormatAction::Beautify { indent_size: 2, use_tabs: false },
+            Arc::clone(&cancel),
+            input.len() as u64,
+            None,
+        ).unwrap();
+
+        let beautified_str = String::from_utf8(beautified).unwrap();
+        assert!(beautified_str.contains("  \"name\": \"UltraViewer\","));
+        assert!(beautified_str.contains("  \"features\": ["));
+
+        let mut minified = Vec::new();
+        JsonStreamingFormatter::format(
+            Cursor::new(beautified_str.as_bytes()),
+            &mut minified,
+            FormatAction::Minify,
+            cancel,
+            beautified_str.len() as u64,
+            None,
+        ).unwrap();
+
+        let minified_str = String::from_utf8(minified).unwrap();
+        assert_eq!(minified_str.trim(), input);
+    }
+
+    #[test]
+    fn test_xml_beautify_and_minify() {
+        let input = r#"<catalog id="cat1"><book id="b1"><title>Rust Async</title><price>39.99</price></book><book id="b2"><title>High Perf</title><price>49.99</price></book></catalog>"#;
+        let mut beautified = Vec::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        XmlStreamingFormatter::format(
+            Cursor::new(input.as_bytes()),
+            &mut beautified,
+            FormatAction::Beautify { indent_size: 2, use_tabs: false },
+            Arc::clone(&cancel),
+            input.len() as u64,
+            None,
+        ).unwrap();
+
+        let beautified_str = String::from_utf8(beautified).unwrap();
+        assert!(beautified_str.contains("<catalog id=\"cat1\">"));
+        assert!(beautified_str.contains("  <book id=\"b1\">"));
+        assert!(beautified_str.contains("    <title>Rust Async</title>"));
+
+        let mut minified = Vec::new();
+        XmlStreamingFormatter::format(
+            Cursor::new(beautified_str.as_bytes()),
+            &mut minified,
+            FormatAction::Minify,
+            cancel,
+            beautified_str.len() as u64,
+            None,
+        ).unwrap();
+
+        let minified_str = String::from_utf8(minified).unwrap();
+        assert_eq!(minified_str.trim(), input);
+    }
+
+    #[test]
+    fn test_xml_cdata_and_empty_elements() {
+        let input = r#"<root><item id="1"/><data><![CDATA[Some <b>HTML</b> content]]></data></root>"#;
+        let mut beautified = Vec::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        XmlStreamingFormatter::format(
+            Cursor::new(input.as_bytes()),
+            &mut beautified,
+            FormatAction::Beautify { indent_size: 2, use_tabs: false },
+            cancel,
+            input.len() as u64,
+            None,
+        ).unwrap();
+
+        let beautified_str = String::from_utf8(beautified).unwrap();
+        assert!(beautified_str.contains("<item id=\"1\"/>"));
+        assert!(beautified_str.contains("<![CDATA[Some <b>HTML</b> content]]>"));
+    }
+
+    #[test]
+    fn test_clean_xml_decl_edge_cases() {
+        assert_eq!(
+            clean_xml_decl(b"xml version='1.0' encoding='UTF-8'"),
+            b"<?xml version='1.0' encoding='UTF-8'?>\n"
+        );
+        // Strips multiple duplicate xml tokens (the user-reported bug)
+        assert_eq!(
+            clean_xml_decl(b"xml xml xml xml xml xml version='1.0' encoding='UTF-8'"),
+            b"<?xml version='1.0' encoding='UTF-8'?>\n"
+        );
+        assert_eq!(
+            clean_xml_decl(b"xml"),
+            b"<?xml?>\n"
+        );
+        assert_eq!(
+            clean_xml_decl(b"version='1.0'"),
+            b"<?xml version='1.0'?>\n"
+        );
+    }
+
+    #[test]
+    fn test_xml_formatting_never_duplicates_declaration() {
+        let input = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root><item>Hello</item></root>";
+        let mut first_pass = Vec::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        XmlStreamingFormatter::format(
+            Cursor::new(input.as_bytes()),
+            &mut first_pass,
+            FormatAction::Beautify { indent_size: 2, use_tabs: false },
+            Arc::clone(&cancel),
+            input.len() as u64,
+            None,
+        ).unwrap();
+
+        let first_str = String::from_utf8(first_pass).unwrap();
+        assert!(first_str.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
+        assert!(!first_str.contains("<?xml xml"));
+
+        // Second pass: format again, ensure it STILL has exactly one <?xml
+        let mut second_pass = Vec::new();
+        XmlStreamingFormatter::format(
+            Cursor::new(first_str.as_bytes()),
+            &mut second_pass,
+            FormatAction::Beautify { indent_size: 2, use_tabs: false },
+            cancel,
+            first_str.len() as u64,
+            None,
+        ).unwrap();
+
+        let second_str = String::from_utf8(second_pass).unwrap();
+        assert!(second_str.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
+        assert!(!second_str.contains("<?xml xml"));
+    }
+
+    #[test]
+    fn test_xml_formatting_repairs_multiple_xml_declaration() {
+        let input = "<?xml xml xml xml xml xml version='1.0' encoding='UTF-8'?>\n<source><job>Developer</job></source>";
+        let mut out = Vec::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        XmlStreamingFormatter::format(
+            Cursor::new(input.as_bytes()),
+            &mut out,
+            FormatAction::Beautify { indent_size: 2, use_tabs: false },
+            cancel,
+            input.len() as u64,
+            None,
+        ).unwrap();
+
+        let out_str = String::from_utf8(out).unwrap();
+        assert!(out_str.starts_with("<?xml version='1.0' encoding='UTF-8'?>\n"));
+        assert!(!out_str.contains("xml xml"));
+        assert!(out_str.contains("  <job>Developer</job>"));
+    }
+}
+

@@ -89,8 +89,11 @@ impl LineIndexer {
             let slice = &buffer[..bytes_read];
 
             for pos in memchr::memchr_iter(b'\n', slice) {
-                total_lines_found += 1;
                 let next_line_offset = current_offset + (pos as u64) + 1;
+                if next_line_offset >= file_size {
+                    break;
+                }
+                total_lines_found += 1;
 
                 if total_lines_found - last_checkpoint_line >= CHECKPOINT_INTERVAL {
                     if next_line_offset < file_size {
@@ -179,8 +182,11 @@ impl LineIndexer {
             let mut i = 0;
             while i + 1 < slice.len() {
                 if slice[i] == nl_pattern[0] && slice[i + 1] == nl_pattern[1] {
-                    total_lines_found += 1;
                     let next_line_offset = current_offset + (i as u64) + 2;
+                    if next_line_offset >= file_size {
+                        break;
+                    }
+                    total_lines_found += 1;
 
                     if total_lines_found - last_checkpoint_line >= CHECKPOINT_INTERVAL {
                         if next_line_offset < file_size {
@@ -202,5 +208,51 @@ impl LineIndexer {
         }
 
         index.mark_complete(total_lines_found);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_line_indexing_with_trailing_newline() {
+        let p = std::env::temp_dir().join(format!("test_trailing_nl_{}.csv", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        {
+            let mut f = std::fs::File::create(&p).unwrap();
+            write!(f, "Header,Count\nApple,10\nBanana,20\n").unwrap();
+            f.flush().unwrap();
+        }
+
+        let engine = Arc::new(FileEngine::open(&p).unwrap());
+        let index = Arc::new(LineIndex::new(engine.size(), engine.detect_encoding()));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let handle = LineIndexer::spawn(Arc::clone(&engine), Arc::clone(&index), cancel);
+        handle.join().unwrap();
+
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(index.total_lines(), 3);
+    }
+
+    #[test]
+    fn test_line_indexing_without_trailing_newline() {
+        let p = std::env::temp_dir().join(format!("test_no_trailing_nl_{}.csv", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        {
+            let mut f = std::fs::File::create(&p).unwrap();
+            write!(f, "Header,Count\nApple,10\nBanana,20").unwrap();
+            f.flush().unwrap();
+        }
+
+        let engine = Arc::new(FileEngine::open(&p).unwrap());
+        let index = Arc::new(LineIndex::new(engine.size(), engine.detect_encoding()));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let handle = LineIndexer::spawn(Arc::clone(&engine), Arc::clone(&index), cancel);
+        handle.join().unwrap();
+
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(index.total_lines(), 3);
     }
 }

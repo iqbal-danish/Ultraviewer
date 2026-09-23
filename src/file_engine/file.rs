@@ -39,6 +39,16 @@ impl FileEngine {
         })
     }
 
+    /// Creates an empty unmapped FileEngine instance.
+    pub fn empty() -> Self {
+        Self {
+            path: PathBuf::new(),
+            size: 0,
+            mmap: MmapHandle::Empty,
+            encoding: Encoding::Utf8,
+        }
+    }
+
     /// Closes the file and unmaps the memory.
     pub fn close(&mut self) {
         self.mmap = MmapHandle::Empty;

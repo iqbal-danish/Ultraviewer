@@ -7,7 +7,10 @@ pub enum AnalyzerPanelAction {
     Dismiss,
     Cancel,
     SearchValue(String),
-    ExportJson,
+    OpenSampleRecord,
+    ExportFieldFrequencies(usize),
+    OpenFieldFrequenciesInGrid(usize),
+    FindIncompleteRecords(String),
 }
 
 pub struct AnalyzerPanelState {
@@ -18,6 +21,7 @@ pub struct AnalyzerPanelState {
     pub selected_field_index: Option<usize>,
     pub field_filter: String,
     pub status_msg: Option<String>,
+    pub window_rect: Option<egui::Rect>,
 }
 
 impl Default for AnalyzerPanelState {
@@ -30,6 +34,7 @@ impl Default for AnalyzerPanelState {
             selected_field_index: None,
             field_filter: String::new(),
             status_msg: None,
+            window_rect: None,
         }
     }
 }
@@ -43,6 +48,7 @@ impl AnalyzerPanelState {
         self.selected_field_index = None;
         self.field_filter.clear();
         self.status_msg = None;
+        self.window_rect = None;
     }
 
     pub fn set_finished(&mut self, report: AnalysisReport) {
@@ -76,18 +82,18 @@ pub fn render_analyzer_panel(
     let mut is_open = state.is_open;
 
     let screen = ctx.screen_rect();
-    let modal_w = (screen.width() * 0.82).clamp(560.0, 940.0);
-    let modal_h = (screen.height() * 0.82).clamp(400.0, 660.0);
-    let max_w = (screen.width() * 0.94).max(400.0);
-    let max_h = (screen.height() * 0.92).max(300.0);
+    let modal_w = (screen.width() * 0.78).clamp(640.0, 960.0);
+    let modal_h = (screen.height() * 0.80).clamp(420.0, 680.0);
+    let max_w = (screen.width() * 0.90).clamp(700.0, 1020.0);
+    let max_h = (screen.height() * 0.90).clamp(460.0, 750.0);
 
-    Window::new(RichText::new("📊 Field Analyzer & Schema Profiler").strong().size(15.0))
+    let win_resp = Window::new(RichText::new("📊 Field Analyzer & Schema Profiler").strong().size(15.0))
         .open(&mut is_open)
         .collapsible(false)
         .resizable(true)
         .default_size(Vec2::new(modal_w, modal_h))
         .max_size(Vec2::new(max_w, max_h))
-        .min_size(Vec2::new(480.0, 340.0))
+        .min_size(Vec2::new(520.0, 360.0))
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             // Header summary or progress bar
@@ -159,8 +165,11 @@ pub fn render_analyzer_panel(
                 ui.label(format!("Speed: {:.1} MB/s", report.throughput_mb_s));
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("💾 Export JSON Schema").clicked() {
-                        action = Some(AnalyzerPanelAction::ExportJson);
+                    if ui.button(RichText::new("📄 Open Sample in New Tab").strong().color(Color32::from_rgb(100, 200, 255)))
+                        .on_hover_text("Extract a single formatted sample record snippet into a new tab for testing")
+                        .clicked()
+                    {
+                        action = Some(AnalyzerPanelAction::OpenSampleRecord);
                     }
                 });
             });
@@ -170,7 +179,7 @@ pub fn render_analyzer_panel(
             // Main 2-column layout: Left (Field List), Right (Deep Dive)
             let avail_h = ui.available_height();
             let total_w = ui.available_width();
-            let left_w = (total_w * 0.36).clamp(240.0, 360.0);
+            let left_w = (total_w * 0.35).clamp(220.0, 320.0);
 
             ui.horizontal(|ui| {
                 // Left column: Field selector with search
@@ -210,7 +219,7 @@ pub fn render_analyzer_panel(
                                 let is_selected = state.selected_field_index == Some(orig_idx);
                                 let mut text = RichText::new(&f.name);
                                 if is_selected {
-                                    text = text.strong().color(Color32::from_rgb(255, 215, 0));
+                                    text = text.strong().color(Color32::from_rgb(97, 175, 239));
                                 }
 
                                 ui.horizontal(|ui| {
@@ -233,10 +242,13 @@ pub fn render_analyzer_panel(
                 // Right column: Field details and Top-K frequency distribution
                 ui.vertical(|ui| {
                     ui.set_height(avail_h);
+                    let right_w = (total_w - left_w - 24.0).max(200.0);
+                    ui.set_width(right_w);
+                    ui.set_max_width(right_w);
 
                     if let Some(idx) = state.selected_field_index {
                         if let Some(field) = report.fields.get(idx) {
-                            render_field_details(ui, field, report.total_records, &mut action);
+                            render_field_details(ui, field, idx, report.total_records, &mut action);
                         }
                     } else {
                         ui.centered_and_justified(|ui| {
@@ -247,8 +259,11 @@ pub fn render_analyzer_panel(
             });
         });
 
+    state.window_rect = win_resp.map(|r| r.response.rect);
+
     if !is_open {
         state.is_open = false;
+        state.window_rect = None;
         if action.is_none() {
             action = Some(AnalyzerPanelAction::Dismiss);
         }
@@ -288,34 +303,70 @@ fn render_type_badge(ui: &mut egui::Ui, inferred_type: &InferredType) {
 fn render_field_details(
     ui: &mut egui::Ui,
     field: &FieldStats,
+    field_idx: usize,
     total_records: u64,
     action: &mut Option<AnalyzerPanelAction>,
 ) {
-    // Header
+    // Header with Field Name, Badge, and Action Buttons
     ui.horizontal(|ui| {
-        ui.heading(&field.name);
+        let display_name = truncate_str(&field.name, 30);
+        ui.heading(&display_name).on_hover_text(&field.name);
         render_type_badge(ui, &field.inferred_type);
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("💾 Export Frequencies").on_hover_text("Export this field's Value and Count frequency distribution to a CSV file").clicked() {
+                *action = Some(AnalyzerPanelAction::ExportFieldFrequencies(field_idx));
+            }
+            if ui.button("📈 Open Frequencies").on_hover_text("Open this field's Value and Count frequency distribution in the built-in CSV Grid").clicked() {
+                *action = Some(AnalyzerPanelAction::OpenFieldFrequenciesInGrid(field_idx));
+            }
+            if field.presence_pct < 100.0 || field.null_count > 0 {
+                let btn = egui::Button::new(
+                    RichText::new("🔍 Find Incomplete Jobs")
+                        .strong()
+                        .color(Color32::from_rgb(224, 108, 117))
+                );
+                if ui.add(btn).on_hover_text("Formulate query and isolate records where this field is missing or empty in Slice View").clicked() {
+                    *action = Some(AnalyzerPanelAction::FindIncompleteRecords(field.name.clone()));
+                }
+            }
+        });
     });
 
     ui.add_space(4.0);
 
-    // Summary statistics grid
+    // Summary statistics grid with truncated min/max values
     egui::Grid::new("field_stats_grid")
         .num_columns(4)
-        .spacing([16.0, 6.0])
+        .spacing([14.0, 6.0])
         .show(ui, |ui| {
             ui.label(RichText::new("Presence:").strong());
-            ui.label(format!("{} / {} ({:.1}%)", field.total_occurrences, total_records, field.presence_pct));
+            let non_null_occ = field.total_occurrences.saturating_sub(field.null_count);
+            ui.label(format!("{} / {} ({:.1}%)", non_null_occ, total_records, field.presence_pct));
 
             ui.label(RichText::new("Null Count:").strong());
             ui.label(format!("{}", field.null_count));
             ui.end_row();
 
             ui.label(RichText::new("Min Value:").strong());
-            ui.label(field.min_value.as_deref().unwrap_or("—"));
+            let min_raw = field.min_value.as_deref().unwrap_or("—");
+            let min_disp = truncate_str(min_raw, 24);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&min_disp).monospace()).on_hover_text(min_raw);
+                if field.min_value.is_some() && ui.small_button("📋").on_hover_text("Copy full min value").clicked() {
+                    ui.ctx().copy_text(min_raw.to_string());
+                }
+            });
 
             ui.label(RichText::new("Max Value:").strong());
-            ui.label(field.max_value.as_deref().unwrap_or("—"));
+            let max_raw = field.max_value.as_deref().unwrap_or("—");
+            let max_disp = truncate_str(max_raw, 24);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&max_disp).monospace()).on_hover_text(max_raw);
+                if field.max_value.is_some() && ui.small_button("📋").on_hover_text("Copy full max value").clicked() {
+                    ui.ctx().copy_text(max_raw.to_string());
+                }
+            });
             ui.end_row();
 
             if field.min_len > 0 {
@@ -336,13 +387,37 @@ fn render_field_details(
             ui.end_row();
         });
 
+    if field.presence_pct < 100.0 || field.null_count > 0 {
+        ui.add_space(4.0);
+        egui::Frame::NONE
+            .fill(Color32::from_rgb(45, 30, 35))
+            .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(120, 50, 60)))
+            .corner_radius(3.0)
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("⚠️ Field has missing or empty values (Presence: {:.1}%, Null: {})", field.presence_pct, field.null_count)).color(Color32::from_rgb(229, 192, 123)).size(12.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(RichText::new("🔍 Find Incomplete Jobs").strong().color(Color32::from_rgb(224, 108, 117))).clicked() {
+                            *action = Some(AnalyzerPanelAction::FindIncompleteRecords(field.name.clone()));
+                        }
+                    });
+                });
+            });
+    }
+
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(4.0);
 
     // Frequency Distribution Header
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("Top-{} Frequent Values (Approx. {} Distinct)", field.top_values.len(), field.cardinality_approx)).strong());
+        let title = if field.top_values.len() > 250 {
+            format!("Top-250 Frequent Values ({} Total Unique)", field.top_values.len())
+        } else {
+            format!("All {} Unique Values", field.top_values.len())
+        };
+        ui.label(RichText::new(title).strong());
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(RichText::new("Click 🔍 to search value in document").size(11.0).italics());
         });
@@ -350,22 +425,23 @@ fn render_field_details(
 
     ui.add_space(4.0);
 
-    // Top-K Frequency Table
+    // Top-K Frequency Table (preview top 250 in panel, all available via Grid/Export)
     ScrollArea::vertical()
         .id_salt(format!("freq_scroll_{}", field.name))
         .auto_shrink([true, false])
         .show(ui, |ui| {
             let max_freq_count = field.top_values.first().map(|f| f.count).unwrap_or(1);
+            let preview_limit = 250;
 
-            for val_freq in &field.top_values {
+            for val_freq in field.top_values.iter().take(preview_limit) {
                 ui.horizontal(|ui| {
                     if ui.small_button("🔍").on_hover_text("Search this exact value in viewer").clicked() {
                         *action = Some(AnalyzerPanelAction::SearchValue(val_freq.value.clone()));
                     }
 
-                    // Value label (truncated with hover tooltip)
-                    let display_val = if val_freq.value.len() > 32 {
-                        format!("{}...", &val_freq.value[..32])
+                    // Value label (truncated safely with hover tooltip)
+                    let display_val = if val_freq.value.chars().count() > 32 {
+                        truncate_str(&val_freq.value, 32)
                     } else if val_freq.value.is_empty() {
                         "\"\" (empty)".to_string()
                     } else {
@@ -393,5 +469,27 @@ fn render_field_details(
                 });
                 ui.add_space(2.0);
             }
+
+            if field.top_values.len() > preview_limit {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Showing top {} of {} unique values in preview.", preview_limit, field.top_values.len())).italics().size(12.0));
+                    if ui.button(RichText::new("📈 Open All in Grid").strong().color(Color32::from_rgb(100, 200, 255))).on_hover_text("Open all unique values in the high-performance CSV Grid").clicked() {
+                        *action = Some(AnalyzerPanelAction::OpenFieldFrequenciesInGrid(field_idx));
+                    }
+                });
+            }
         });
+}
+
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count > max_chars {
+        let mut res: String = s.chars().take(max_chars).collect();
+        res.push('…');
+        res
+    } else {
+        s.to_string()
+    }
 }

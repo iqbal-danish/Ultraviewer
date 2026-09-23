@@ -5,6 +5,8 @@ use std::time::Duration;
 
 pub enum StatusBarAction {
     ResetZoom,
+    CopyXPath(String),
+    ToggleWrap,
 }
 
 pub struct StatusBarProps<'a> {
@@ -25,6 +27,8 @@ pub struct StatusBarProps<'a> {
     pub edit_count: usize,
     pub is_edit_mode: bool,
     pub font_size: f32,
+    pub current_xpath: Option<&'a str>,
+    pub word_wrap: bool,
 }
 
 pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) -> Option<StatusBarAction> {
@@ -77,6 +81,26 @@ pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) -> Option<StatusBar
                     .size(11.0)
                     .color(Color32::from_rgb(210, 220, 235)),
             );
+
+            if let Some(xpath) = props.current_xpath {
+                if !xpath.is_empty() {
+                    render_status_sep(ui, sep_color);
+                    let display_xpath = if xpath.len() > 36 {
+                        format!("{}...", &xpath[..33])
+                    } else {
+                        xpath.to_string()
+                    };
+                    let resp = ui.selectable_label(
+                        false,
+                        RichText::new(display_xpath)
+                            .size(11.0)
+                            .color(Color32::from_rgb(152, 195, 121)),
+                    );
+                    if resp.on_hover_text(format!("{}\nClick to copy", xpath)).clicked() {
+                        action = Some(StatusBarAction::CopyXPath(xpath.to_string()));
+                    }
+                }
+            }
         }
 
         // Right-aligned status indicators: Indexing speed, RAM, and Ready status
@@ -99,7 +123,7 @@ pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) -> Option<StatusBar
             );
 
             // Zoom indicator badge (e.g. "100%")
-            let zoom_pct = ((props.font_size / 14.0) * 100.0).round() as u32;
+            let zoom_pct = ((props.font_size / 16.0) * 100.0).round() as u32;
             render_status_sep(ui, sep_color);
             let zoom_resp = ui.selectable_label(
                 false,
@@ -107,6 +131,18 @@ pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) -> Option<StatusBar
             );
             if zoom_resp.on_hover_text(format!("Zoom: {}% (Ctrl+Scroll or Ctrl+/- to adjust, click to reset)", zoom_pct)).clicked() {
                 action = Some(StatusBarAction::ResetZoom);
+            }
+
+            // Word wrap indicator & toggle
+            render_status_sep(ui, sep_color);
+            let wrap_text = if props.word_wrap { "Wrap: ON" } else { "Wrap: OFF" };
+            let wrap_color = if props.word_wrap { Color32::from_rgb(97, 175, 239) } else { muted_color };
+            let wrap_resp = ui.selectable_label(
+                props.word_wrap,
+                RichText::new(wrap_text).size(11.0).color(wrap_color),
+            );
+            if wrap_resp.on_hover_text("Toggle Word Wrap (Alt+Z)").clicked() {
+                action = Some(StatusBarAction::ToggleWrap);
             }
 
             render_status_sep(ui, sep_color);

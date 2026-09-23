@@ -2,18 +2,28 @@ use eframe::egui::{self, Color32, Key, RichText, Sense, Stroke, Vec2};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteAction {
+    NewBlankFile,
     OpenFile,
+    OpenUrl,
     CloseActiveTab,
     CloseAllTabs,
     SaveFile,
     SaveFileAs,
     Find,
+    FindAndReplace,
+    SelectNextOccurrence,
+    SelectAllOccurrences,
     GoToLine,
     ToggleEditMode,
     ToggleWrap,
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    Undo,
+    Redo,
+    TransformUppercase,
+    TransformLowercase,
+    CopyXPath,
     SetThemeOneDark,
     SetThemeGitHubDark,
     SetThemeMonokai,
@@ -21,6 +31,7 @@ pub enum PaletteAction {
     SetThemeLightModern,
     XmlValidate,
     XmlToggleTree,
+    XmlRepairDeclaration,
     JsonValidate,
     JsonToggleTree,
     FormatBeautify2,
@@ -44,13 +55,23 @@ pub struct CommandItem {
 impl CommandItem {
     pub fn all() -> Vec<CommandItem> {
         vec![
+            CommandItem { category: "File", title: "New Blank File", shortcut: "Ctrl+N", action: PaletteAction::NewBlankFile },
             CommandItem { category: "File", title: "Open File...", shortcut: "Ctrl+O", action: PaletteAction::OpenFile },
+            CommandItem { category: "File", title: "Open from URL...", shortcut: "Ctrl+U", action: PaletteAction::OpenUrl },
             CommandItem { category: "File", title: "Open Folder / Workspace...", shortcut: "", action: PaletteAction::OpenFolder },
             CommandItem { category: "File", title: "Save", shortcut: "Ctrl+S", action: PaletteAction::SaveFile },
             CommandItem { category: "File", title: "Save As...", shortcut: "Ctrl+Shift+S", action: PaletteAction::SaveFileAs },
             CommandItem { category: "File", title: "Close Tab", shortcut: "Ctrl+W", action: PaletteAction::CloseActiveTab },
             CommandItem { category: "File", title: "Close All Tabs", shortcut: "", action: PaletteAction::CloseAllTabs },
+            CommandItem { category: "Edit", title: "Undo", shortcut: "Ctrl+Z", action: PaletteAction::Undo },
+            CommandItem { category: "Edit", title: "Redo", shortcut: "Ctrl+Y", action: PaletteAction::Redo },
+            CommandItem { category: "Edit", title: "Select Next Occurrence", shortcut: "Ctrl+D", action: PaletteAction::SelectNextOccurrence },
+            CommandItem { category: "Edit", title: "Select All Occurrences", shortcut: "Ctrl+Shift+L", action: PaletteAction::SelectAllOccurrences },
             CommandItem { category: "Edit", title: "Find in File...", shortcut: "Ctrl+F", action: PaletteAction::Find },
+            CommandItem { category: "Edit", title: "Find and Replace...", shortcut: "Ctrl+H", action: PaletteAction::FindAndReplace },
+            CommandItem { category: "Edit", title: "Transform to Uppercase", shortcut: "Ctrl+Shift+U", action: PaletteAction::TransformUppercase },
+            CommandItem { category: "Edit", title: "Transform to Lowercase", shortcut: "Ctrl+U", action: PaletteAction::TransformLowercase },
+            CommandItem { category: "Edit", title: "Copy Exact XPath / JSONPath", shortcut: "Ctrl+Shift+C", action: PaletteAction::CopyXPath },
             CommandItem { category: "Edit", title: "Go to Line...", shortcut: "Ctrl+G", action: PaletteAction::GoToLine },
             CommandItem { category: "Edit", title: "Toggle In-Place Edit Mode", shortcut: "Ctrl+E", action: PaletteAction::ToggleEditMode },
             CommandItem { category: "View", title: "Toggle Word Wrap", shortcut: "Alt+Z", action: PaletteAction::ToggleWrap },
@@ -64,6 +85,7 @@ impl CommandItem {
             CommandItem { category: "Preferences", title: "Color Theme: VS Code Light Modern", shortcut: "", action: PaletteAction::SetThemeLightModern },
             CommandItem { category: "XML", title: "Validate XML Document", shortcut: "", action: PaletteAction::XmlValidate },
             CommandItem { category: "XML", title: "Toggle XML Structure Tree", shortcut: "Ctrl+Shift+T", action: PaletteAction::XmlToggleTree },
+            CommandItem { category: "XML", title: "Repair XML Declaration (Normalize <?xml ...?>)", shortcut: "", action: PaletteAction::XmlRepairDeclaration },
             CommandItem { category: "JSON", title: "Validate JSON Document", shortcut: "", action: PaletteAction::JsonValidate },
             CommandItem { category: "JSON", title: "Toggle JSON Structure Tree", shortcut: "Ctrl+Shift+T", action: PaletteAction::JsonToggleTree },
             CommandItem { category: "Format", title: "Beautify Document (2 Spaces)", shortcut: "Ctrl+Shift+B", action: PaletteAction::FormatBeautify2 },
@@ -149,29 +171,30 @@ pub fn render_command_palette(
 
     // Floating palette window centered at the top
     let screen_w = ctx.screen_rect().width();
-    let palette_w = 560.0_f32.min(screen_w - 40.0);
+    let palette_w = 640.0_f32.min(screen_w - 40.0);
 
     egui::Window::new("CommandPaletteModal")
         .title_bar(false)
         .resizable(false)
         .collapsible(false)
         .movable(false)
-        .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 36.0))
-        .fixed_size(Vec2::new(palette_w, 340.0))
+        .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 42.0))
+        .fixed_size(Vec2::new(palette_w, 400.0))
         .frame(
             egui::Frame::NONE
                 .fill(Color32::from_rgb(26, 30, 35))
                 .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0, 122, 204))) // Active VS Code blue border
-                .inner_margin(egui::Margin::same(8)),
+                .inner_margin(egui::Margin::same(10)),
         )
         .show(ctx, |ui| {
-            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.spacing_mut().item_spacing.y = 8.0;
 
             // Search input field
             ui.horizontal(|ui| {
-                ui.label(RichText::new(">").size(14.0).strong().color(Color32::from_rgb(0, 122, 204)));
+                ui.label(RichText::new(">").size(16.0).strong().color(Color32::from_rgb(0, 122, 204)));
                 let text_edit = egui::TextEdit::singleline(&mut state.query)
-                    .hint_text(RichText::new("Type a command or search...").color(Color32::from_rgb(110, 125, 145)))
+                    .font(egui::FontId::proportional(15.0))
+                    .hint_text(RichText::new("Type a command or search...").size(15.0).color(Color32::from_rgb(110, 125, 145)))
                     .desired_width(f32::INFINITY)
                     .lock_focus(true);
                 let resp = ui.add(text_edit);
@@ -182,13 +205,13 @@ pub fn render_command_palette(
 
             // Command items list
             egui::ScrollArea::vertical()
-                .max_height(280.0)
+                .max_height(330.0)
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.spacing_mut().item_spacing.y = 3.0;
 
                     if filtered.is_empty() {
-                        ui.add_space(10.0);
-                        ui.label(RichText::new("No matching commands found").weak().italics().size(12.0));
+                        ui.add_space(12.0);
+                        ui.label(RichText::new("No matching commands found").weak().italics().size(13.5));
                     } else {
                         for (idx, cmd) in filtered.iter().enumerate() {
                             let is_selected = idx == state.selected_idx;
@@ -198,11 +221,11 @@ pub fn render_command_palette(
                                 Color32::TRANSPARENT
                             };
 
-                            let (item_rect, item_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click());
+                            let (item_rect, item_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
                             if item_resp.hovered() && !is_selected {
-                                ui.painter().rect_filled(item_rect, 3.0, Color32::from_rgb(36, 42, 50));
+                                ui.painter().rect_filled(item_rect, 4.0, Color32::from_rgb(36, 42, 50));
                             } else if is_selected {
-                                ui.painter().rect_filled(item_rect, 3.0, bg_color);
+                                ui.painter().rect_filled(item_rect, 4.0, bg_color);
                             }
 
                             // Command Category & Title
@@ -210,24 +233,24 @@ pub fn render_command_palette(
                             let text_color = if is_selected {
                                 Color32::WHITE
                             } else {
-                                Color32::from_rgb(210, 220, 235)
+                                Color32::from_rgb(215, 225, 240)
                             };
                             ui.painter().text(
-                                egui::Pos2::new(item_rect.left() + 8.0, item_rect.center().y),
+                                egui::Pos2::new(item_rect.left() + 10.0, item_rect.center().y),
                                 egui::Align2::LEFT_CENTER,
                                 label_text,
-                                egui::FontId::proportional(12.0),
+                                egui::FontId::proportional(14.0),
                                 text_color,
                             );
 
                             // Shortcut label on right
                             if !cmd.shortcut.is_empty() {
                                 ui.painter().text(
-                                    egui::Pos2::new(item_rect.right() - 8.0, item_rect.center().y),
+                                    egui::Pos2::new(item_rect.right() - 10.0, item_rect.center().y),
                                     egui::Align2::RIGHT_CENTER,
                                     cmd.shortcut,
-                                    egui::FontId::proportional(11.0),
-                                    Color32::from_rgb(130, 145, 165),
+                                    egui::FontId::proportional(12.0),
+                                    Color32::from_rgb(140, 155, 175),
                                 );
                             }
 

@@ -56,7 +56,7 @@ impl ColorTheme {
 
     pub fn border_color(&self) -> Color32 {
         match self {
-            ColorTheme::OneDarkProDarker => Color32::from_rgb(24, 26, 31),
+            ColorTheme::OneDarkProDarker => Color32::from_rgb(40, 44, 52), // #282C34 subtle border
             ColorTheme::GitHubDark => Color32::from_rgb(48, 54, 61),
             ColorTheme::MonokaiPro => Color32::from_rgb(64, 60, 65),
             ColorTheme::TokyoNight => Color32::from_rgb(41, 46, 66),
@@ -66,7 +66,7 @@ impl ColorTheme {
 
     pub fn accent_color(&self) -> Color32 {
         match self {
-            ColorTheme::OneDarkProDarker => Color32::from_rgb(0, 122, 204),
+            ColorTheme::OneDarkProDarker => Color32::from_rgb(97, 175, 239), // #61AFEF Sky Blue
             ColorTheme::GitHubDark => Color32::from_rgb(31, 111, 235),
             ColorTheme::MonokaiPro => Color32::from_rgb(255, 97, 136),
             ColorTheme::TokyoNight => Color32::from_rgb(122, 162, 247),
@@ -76,7 +76,7 @@ impl ColorTheme {
 
     pub fn text_color(&self) -> Color32 {
         match self {
-            ColorTheme::OneDarkProDarker => Color32::from_rgb(171, 178, 191),
+            ColorTheme::OneDarkProDarker => Color32::from_rgb(220, 225, 232), // #DCDFE4 High clarity text
             ColorTheme::GitHubDark => Color32::from_rgb(201, 209, 217),
             ColorTheme::MonokaiPro => Color32::from_rgb(252, 252, 250),
             ColorTheme::TokyoNight => Color32::from_rgb(169, 177, 214),
@@ -114,12 +114,20 @@ impl ColorTheme {
         visuals.widgets.active.bg_fill = accent;
         visuals.widgets.active.corner_radius = egui::CornerRadius::same(3);
         visuals.selection.bg_fill = if self.is_dark() {
-            Color32::from_rgba_premultiplied(62, 68, 81, 160)
+            Color32::from_rgb(61, 69, 86)
         } else {
-            Color32::from_rgba_premultiplied(173, 214, 255, 160)
+            Color32::from_rgba_unmultiplied(180, 205, 240, 220)
         };
         visuals.selection.stroke = egui::Stroke::NONE;
 
         ctx.set_visuals(visuals);
+
+        let mut style = (*ctx.style()).clone();
+        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(15.5));
+        style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
+        style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.menu_margin = egui::Margin::symmetric(6, 6);
+        ctx.set_style(style);
     }
 }

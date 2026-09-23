@@ -29,6 +29,14 @@ pub enum Icon {
     ChevronDown,
     Copy,
     Sun,
+    ArrowUp,
+    ArrowDown,
+    SelectionLines,
+    ReplaceOne,
+    ReplaceAll,
+    Cube,
+    Sparkle,
+    Warning,
 }
 
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -409,6 +417,142 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
                 let p2 = Pos2::new((cx + cos * (r + 4.0)).round(), (cy + sin * (r + 4.0)).round());
                 painter.line_segment([p1, p2], stroke);
             }
+        }
+
+        Icon::ArrowUp => {
+            painter.line_segment([Pos2::new(cx, min_y + 3.0), Pos2::new(cx, min_y + h - 3.0)], stroke_bold);
+            painter.line_segment([Pos2::new(cx - 3.5, min_y + 6.5), Pos2::new(cx, min_y + 3.0)], stroke_bold);
+            painter.line_segment([Pos2::new(cx + 3.5, min_y + 6.5), Pos2::new(cx, min_y + 3.0)], stroke_bold);
+        }
+
+        Icon::ArrowDown => {
+            painter.line_segment([Pos2::new(cx, min_y + 3.0), Pos2::new(cx, min_y + h - 3.0)], stroke_bold);
+            painter.line_segment([Pos2::new(cx - 3.5, min_y + h - 6.5), Pos2::new(cx, min_y + h - 3.0)], stroke_bold);
+            painter.line_segment([Pos2::new(cx + 3.5, min_y + h - 6.5), Pos2::new(cx, min_y + h - 3.0)], stroke_bold);
+        }
+
+        Icon::SelectionLines => {
+            let left = min_x + 3.0;
+            let right = min_x + w - 3.0;
+            painter.line_segment([Pos2::new(left, cy - 4.0), Pos2::new(right, cy - 4.0)], stroke);
+            painter.line_segment([Pos2::new(left, cy), Pos2::new(right, cy)], stroke);
+            painter.line_segment([Pos2::new(left, cy + 4.0), Pos2::new(right, cy + 4.0)], stroke);
+        }
+
+        Icon::ReplaceOne => {
+            let thin_stroke = Stroke::new(1.3_f32, color);
+            let arr_start = Pos2::new(min_x + 1.5, min_y + 3.5);
+            let arr_turn = Pos2::new(min_x + 5.5, min_y + 3.5);
+            let arr_down = Pos2::new(min_x + 5.5, min_y + 11.5);
+            painter.line_segment([arr_start, arr_turn], thin_stroke);
+            painter.line_segment([arr_turn, arr_down], thin_stroke);
+            painter.line_segment([Pos2::new(min_x + 3.2, min_y + 9.0), arr_down], thin_stroke);
+            painter.line_segment([Pos2::new(min_x + 7.8, min_y + 9.0), arr_down], thin_stroke);
+
+            painter.text(
+                Pos2::new(min_x + 12.0, min_y + 4.0),
+                egui::Align2::CENTER_CENTER,
+                "b",
+                egui::FontId::monospace(8.0),
+                color,
+            );
+            let c_box = Rect::from_center_size(Pos2::new(min_x + 12.0, min_y + 12.0), Vec2::new(8.5, 7.5));
+            painter.rect_stroke(c_box, 1.0, Stroke::new(1.0_f32, color), egui::StrokeKind::Inside);
+            painter.text(
+                c_box.center(),
+                egui::Align2::CENTER_CENTER,
+                "c",
+                egui::FontId::monospace(7.0),
+                color,
+            );
+        }
+
+        Icon::ReplaceAll => {
+            let thin_stroke = Stroke::new(1.3_f32, color);
+            let arr_start = Pos2::new(min_x + 1.0, min_y + 3.5);
+            let arr_turn = Pos2::new(min_x + 5.0, min_y + 3.5);
+            let arr_down = Pos2::new(min_x + 5.0, min_y + 11.5);
+            painter.line_segment([arr_start, arr_turn], thin_stroke);
+            painter.line_segment([arr_turn, arr_down], thin_stroke);
+            painter.line_segment([Pos2::new(min_x + 2.8, min_y + 9.0), arr_down], thin_stroke);
+            painter.line_segment([Pos2::new(min_x + 7.2, min_y + 9.0), arr_down], thin_stroke);
+
+            painter.text(
+                Pos2::new(min_x + 12.5, min_y + 4.0),
+                egui::Align2::CENTER_CENTER,
+                "ab",
+                egui::FontId::monospace(7.0),
+                color,
+            );
+            let ac_box = Rect::from_center_size(Pos2::new(min_x + 12.5, min_y + 12.0), Vec2::new(11.0, 7.5));
+            painter.rect_stroke(ac_box, 1.0, Stroke::new(1.0_f32, color), egui::StrokeKind::Inside);
+            painter.text(
+                ac_box.center(),
+                egui::Align2::CENTER_CENTER,
+                "ac",
+                egui::FontId::monospace(6.5),
+                color,
+            );
+        }
+
+        Icon::Cube => {
+            // Isometric 3D cube matching VS Code element symbol
+            let r = (w.min(h) * 0.44).round().max(4.0);
+            let p_center = Pos2::new(cx, cy);
+            let p_top = Pos2::new(cx, cy - r);
+            let p_top_right = Pos2::new(cx + (r * 0.866).round(), cy - (r * 0.5).round());
+            let p_bot_right = Pos2::new(cx + (r * 0.866).round(), cy + (r * 0.5).round());
+            let p_bot = Pos2::new(cx, cy + r);
+            let p_bot_left = Pos2::new(cx - (r * 0.866).round(), cy + (r * 0.5).round());
+            let p_top_left = Pos2::new(cx - (r * 0.866).round(), cy - (r * 0.5).round());
+
+            // Shaded 3D isometric faces
+            let top_face = vec![p_top, p_top_right, p_center, p_top_left];
+            let left_face = vec![p_top_left, p_center, p_bot, p_bot_left];
+            let right_face = vec![p_center, p_top_right, p_bot_right, p_bot];
+
+            painter.add(egui::Shape::convex_polygon(top_face, color.gamma_multiply(0.95), Stroke::NONE));
+            painter.add(egui::Shape::convex_polygon(left_face, color.gamma_multiply(0.70), Stroke::NONE));
+            painter.add(egui::Shape::convex_polygon(right_face, color.gamma_multiply(0.48), Stroke::NONE));
+
+            // Sharp edge outlines
+            let edge_stroke = Stroke::new(1.0_f32, color);
+            painter.add(egui::Shape::closed_line(
+                vec![p_top, p_top_right, p_bot_right, p_bot, p_bot_left, p_top_left],
+                edge_stroke,
+            ));
+            painter.line_segment([p_center, p_top], edge_stroke);
+            painter.line_segment([p_center, p_bot_right], edge_stroke);
+            painter.line_segment([p_center, p_bot_left], edge_stroke);
+        }
+
+        Icon::Sparkle => {
+            // 4-pointed star / sparkle for smart suggestions
+            let r = (w.min(h) * 0.42).round().max(4.0);
+            let inner_r = (r * 0.28).round().max(1.5);
+            let pts = vec![
+                Pos2::new(cx, cy - r),
+                Pos2::new(cx + inner_r, cy - inner_r),
+                Pos2::new(cx + r, cy),
+                Pos2::new(cx + inner_r, cy + inner_r),
+                Pos2::new(cx, cy + r),
+                Pos2::new(cx - inner_r, cy + inner_r),
+                Pos2::new(cx - r, cy),
+                Pos2::new(cx - inner_r, cy - inner_r),
+            ];
+            painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+        }
+
+        Icon::Warning => {
+            // Warning triangle with exclamation mark
+            let r = (w.min(h) * 0.45).round().max(5.0);
+            let top = Pos2::new(cx, cy - r);
+            let bot_left = Pos2::new(cx - (r * 1.05).round(), cy + (r * 0.85).round());
+            let bot_right = Pos2::new(cx + (r * 1.05).round(), cy + (r * 0.85).round());
+
+            painter.add(egui::Shape::closed_line(vec![top, bot_right, bot_left], stroke_bold));
+            painter.line_segment([Pos2::new(cx, cy - (r * 0.22).round()), Pos2::new(cx, cy + (r * 0.22).round())], stroke_bold);
+            painter.circle_filled(Pos2::new(cx, cy + (r * 0.55).round()), 1.1, color);
         }
     }
 }

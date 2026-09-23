@@ -243,6 +243,14 @@ impl PieceTable {
         Ok(())
     }
 
+    /// Read the entire document content into a String (for tests and verification).
+    pub fn to_string(&self, engine: &FileEngine) -> Result<String, String> {
+        let total = self.total_length();
+        let mut buf = Vec::with_capacity(total as usize);
+        self.read_range(engine, 0, total as usize, &mut buf)?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
     /// Stream the entire document to a writer using 256 KB chunks without allocating full file in memory
     pub fn stream_write<W: Write>(
         &self,
@@ -322,5 +330,65 @@ impl PieceTable {
         }
 
         Ok(total_written)
+    }
+}
+
+/// Streaming zero-copy Read adapter for PieceTable
+pub struct PieceTableReader<'a> {
+    engine: &'a FileEngine,
+    pieces: &'a [Piece],
+    add_buffer: &'a [u8],
+    piece_idx: usize,
+    piece_offset: u64,
+}
+
+impl<'a> PieceTableReader<'a> {
+    pub fn new(piece_table: &'a PieceTable, engine: &'a FileEngine) -> Self {
+        Self {
+            engine,
+            pieces: &piece_table.pieces,
+            add_buffer: &piece_table.add_buffer,
+            piece_idx: 0,
+            piece_offset: 0,
+        }
+    }
+}
+
+impl<'a> std::io::Read for PieceTableReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.piece_idx >= self.pieces.len() {
+            return Ok(0);
+        }
+
+        let piece = &self.pieces[self.piece_idx];
+        let remaining_in_piece = piece.length.saturating_sub(self.piece_offset);
+        if remaining_in_piece == 0 {
+            self.piece_idx += 1;
+            self.piece_offset = 0;
+            return self.read(buf);
+        }
+
+        let to_read = (remaining_in_piece as usize).min(buf.len());
+
+        match piece.source {
+            PieceSource::Original { offset: orig_off, .. } => {
+                let file_off = orig_off + self.piece_offset;
+                let slice = self.engine.read_range(file_off, to_read)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                buf[..to_read].copy_from_slice(slice);
+            }
+            PieceSource::Add { offset: add_off, .. } => {
+                let add_off = (add_off + self.piece_offset) as usize;
+                buf[..to_read].copy_from_slice(&self.add_buffer[add_off..add_off + to_read]);
+            }
+        }
+
+        self.piece_offset += to_read as u64;
+        if self.piece_offset >= piece.length {
+            self.piece_idx += 1;
+            self.piece_offset = 0;
+        }
+
+        Ok(to_read)
     }
 }

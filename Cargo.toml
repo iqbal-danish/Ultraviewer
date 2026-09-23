@@ -18,10 +18,16 @@ memchr = "2.7"
 crossbeam-channel = "0.5"
 regex = "1.11"
 quick-xml = "0.37"
+ureq = { version = "2.12", features = ["tls", "gzip"] }
+flate2 = "1.0"
 
 [[bin]]
 name = "ultraviewer"
 path = "src/main.rs"
+
+[[bin]]
+name = "qa_agent"
+path = "src/bin/qa_agent.rs"
 
 [lib]
 name = "ultraviewer"

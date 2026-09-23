@@ -77,6 +77,64 @@ impl Viewport {
         if self.lines.len() > desired_line_count {
             self.lines.truncate(desired_line_count);
         }
+
+        // Safety fallback: if viewport is empty but the file has content, load the tail of the file
+        if self.lines.is_empty() && !engine.is_empty() {
+            let total = line_index.total_lines().max(1);
+            let fallback_line = total.saturating_sub(desired_line_count / 2).max(1);
+            if fallback_line < line {
+                if let Some(offset) = line_index.line_to_byte_offset(engine, fallback_line) {
+                    self.start_offset = offset;
+                    let actual = line_index.byte_offset_to_line(engine, offset);
+                    self.load_from_engine(engine, offset, max_window_bytes, actual);
+                    if self.lines.len() > desired_line_count {
+                        self.lines.truncate(desired_line_count);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Loads lines specifically from a VirtualSlice (instant virtual sub-file).
+    pub fn load_virtual_lines(
+        &mut self,
+        engine: &FileEngine,
+        line_index: &crate::file_engine::LineIndex,
+        slice: &crate::file_engine::VirtualSlice,
+        target_virtual_line: usize,
+        desired_line_count: usize,
+    ) {
+        self.total_file_size = engine.size();
+        self.encoding = engine.detect_encoding();
+        self.lines.clear();
+
+        if engine.is_empty() || slice.matching_lines.is_empty() {
+            return;
+        }
+
+        let start_idx = target_virtual_line.saturating_sub(1).min(slice.matching_lines.len() - 1);
+        let count = desired_line_count.min(slice.matching_lines.len() - start_idx);
+
+        for i in 0..count {
+            let physical_line = slice.matching_lines[start_idx + i];
+            if let Some(offset) = line_index.line_to_byte_offset(engine, physical_line) {
+                let max_len = 4096.min((engine.size() - offset) as usize);
+                if let Ok(bytes) = engine.read_range(offset, max_len) {
+                    let end_pos = memchr::memchr(b'\n', bytes).unwrap_or(bytes.len());
+                    let mut line_bytes = &bytes[..end_pos];
+                    if line_bytes.ends_with(b"\r") {
+                        line_bytes = &line_bytes[..line_bytes.len() - 1];
+                    }
+                    let text = String::from_utf8_lossy(line_bytes).into_owned();
+                    self.lines.push(ViewportLine {
+                        line_number: physical_line,
+                        byte_offset: offset,
+                        text,
+                        is_truncated: false,
+                    });
+                }
+            }
+        }
     }
 
     /// Loads an initial window of lines from the file engine.
@@ -121,6 +179,54 @@ impl Viewport {
             }
             _ => {
                 self.parse_utf8_lines(raw_chunk, effective_start, start_line_num);
+            }
+        }
+    }
+
+    /// Loads lines directly from a PieceTable instead of the disk engine.
+    /// This ensures deleted lines, inserted lines, and edits are strictly respected
+    /// and never resurrected from the unedited disk file.
+    pub fn load_from_piece_table(
+        &mut self,
+        piece_table: &crate::editor::PieceTable,
+        engine: &FileEngine,
+        start_offset: u64,
+        max_window_bytes: usize,
+        start_line_num: usize,
+    ) {
+        let total_bytes = piece_table.total_length();
+        self.total_file_size = total_bytes;
+        self.encoding = engine.detect_encoding();
+        self.start_offset = start_offset;
+        self.lines.clear();
+
+        if total_bytes == 0 || start_offset >= total_bytes {
+            return;
+        }
+
+        let bom_skip = if start_offset == 0 {
+            self.encoding.bom_length() as u64
+        } else {
+            0
+        };
+
+        let effective_start = start_offset + bom_skip;
+        if effective_start >= total_bytes {
+            return;
+        }
+
+        let read_len = max_window_bytes.min((total_bytes - effective_start) as usize);
+        let mut raw_chunk = Vec::with_capacity(read_len);
+        if piece_table.read_range(engine, effective_start, read_len, &mut raw_chunk).is_err() {
+            return;
+        }
+
+        match self.encoding {
+            Encoding::Utf16Le | Encoding::Utf16Be => {
+                self.parse_utf16_lines(&raw_chunk, effective_start, start_line_num);
+            }
+            _ => {
+                self.parse_utf8_lines(&raw_chunk, effective_start, start_line_num);
             }
         }
     }

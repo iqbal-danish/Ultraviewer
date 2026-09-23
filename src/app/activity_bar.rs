@@ -18,6 +18,7 @@ pub struct ActivityBarProps {
     pub is_json: bool,
     pub search_match_count: usize,
     pub is_expanded: bool,
+    pub is_search_open: bool,
 }
 
 pub enum ActivityBarAction {
@@ -57,7 +58,7 @@ pub fn render_activity_bar(
             ui.add_space(4.0);
 
             // 2. Search (Ctrl+Shift+F / Ctrl+F)
-            let is_search = props.active_panel == ActivityPanel::Search;
+            let is_search = props.active_panel == ActivityPanel::Search || props.is_search_open;
             let badge = if props.search_match_count > 0 {
                 Some(props.search_match_count)
             } else {
@@ -108,7 +109,16 @@ pub fn render_activity_bar(
                 ui.add_space(4.0);
             }
 
-            // 6. Bottom Pinned Section (Settings, Help)
+            // 6. Validate Document (Ctrl+Shift+V)
+            if props.has_file && props.is_xml_or_json {
+                let val_title = if props.is_json { "Validate JSON" } else { "Validate XML" };
+                if render_rail_icon_button(ui, Icon::Validate, val_title, "Ctrl+Shift+V", false, None).clicked() {
+                    action = Some(ActivityBarAction::Validate);
+                }
+                ui.add_space(4.0);
+            }
+
+            // 7. Bottom Pinned Section (Settings, Help)
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
                 if render_rail_icon_button(ui, Icon::Gear, "Settings", "Ctrl+,", false, None).clicked() {

@@ -1,13 +1,69 @@
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use eframe::egui::Color32;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
 use crate::file_engine::FileEngine;
+use crate::file_engine::line_index::LineIndex;
+
+struct LineTrackingReader<R: Read> {
+    inner: R,
+    current_byte: u64,
+    current_line: usize,
+    checkpoints: Arc<Mutex<Vec<(u64, usize)>>>,
+    last_checkpoint_byte: u64,
+}
+
+impl<R: Read> LineTrackingReader<R> {
+    fn new(inner: R, checkpoints: Arc<Mutex<Vec<(u64, usize)>>>) -> Self {
+        checkpoints.lock().unwrap().push((0, 1));
+        Self {
+            inner,
+            current_byte: 0,
+            current_line: 1,
+            checkpoints,
+            last_checkpoint_byte: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for LineTrackingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            let mut line = self.current_line;
+            let mut byte = self.current_byte;
+            let mut last_cp = self.last_checkpoint_byte;
+            let mut new_cps = Vec::new();
+
+            for &b in &buf[..n] {
+                byte += 1;
+                if b == b'\n' {
+                    line += 1;
+                    if byte - last_cp >= 65536 {
+                        new_cps.push((byte, line));
+                        last_cp = byte;
+                    }
+                }
+            }
+
+            self.current_line = line;
+            self.current_byte = byte;
+            self.last_checkpoint_byte = last_cp;
+
+            if !new_cps.is_empty() {
+                if let Ok(mut cps) = self.checkpoints.lock() {
+                    cps.extend(new_cps);
+                }
+            }
+        }
+        Ok(n)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct XmlHighlightSpan {
@@ -238,61 +294,313 @@ pub enum XmlValidationResult {
 pub struct XmlValidator;
 
 impl XmlValidator {
-    /// Stream-validates an XML file using quick-xml.
-    /// Never loads the file into RAM. Reports exact line and byte error locations.
-    pub fn validate(engine: Arc<FileEngine>, cancel: Arc<AtomicBool>) -> XmlValidationResult {
-        let file = match File::open(engine.path()) {
-            Ok(f) => f,
-            Err(e) => return XmlValidationResult::Invalid {
-                line_number: 1,
-                byte_offset: 0,
-                message: format!("Cannot open file: {}", e),
-            },
-        };
-
+    /// Stream-validates an XML stream using quick-xml and an explicit element stack.
+    /// Never loads the file or DOM into RAM. Reports exact line numbers and byte error locations.
+    pub fn validate<R: Read>(
+        reader: R,
+        line_index: Option<&LineIndex>,
+        engine: Option<&FileEngine>,
+        cancel: Arc<AtomicBool>,
+    ) -> XmlValidationResult {
         let start = Instant::now();
-        let buf_reader = BufReader::with_capacity(128 * 1024, file);
-        let mut reader = Reader::from_reader(buf_reader);
-        reader.config_mut().expand_empty_elements = false;
-        reader.config_mut().check_end_names = true;
+        let checkpoints = Arc::new(Mutex::new(Vec::with_capacity(512)));
+        let tracking_reader = LineTrackingReader::new(reader, Arc::clone(&checkpoints));
+        let buf_reader = BufReader::with_capacity(512 * 1024, tracking_reader);
+        let mut xml_reader = Reader::from_reader(buf_reader);
+        xml_reader.config_mut().expand_empty_elements = false;
+        xml_reader.config_mut().trim_text(false);
+        xml_reader.config_mut().check_end_names = true;
 
         let mut buf = Vec::with_capacity(4096);
         let mut elements_count = 0;
-        let mut current_depth: usize = 0;
         let mut max_depth = 0;
-        let line_number = 1;
-        let mut last_offset: u64 = 0;
+
+        enum TagEntry {
+            Inline([u8; 32], u8, u64),
+            Heap(Vec<u8>, u64),
+        }
+        impl TagEntry {
+            #[inline]
+            fn as_bytes(&self) -> &[u8] {
+                match self {
+                    TagEntry::Inline(buf, len, _) => &buf[..*len as usize],
+                    TagEntry::Heap(v, _) => v.as_slice(),
+                }
+            }
+            #[inline]
+            fn open_offset(&self) -> u64 {
+                match self {
+                    TagEntry::Inline(_, _, pos) => *pos,
+                    TagEntry::Heap(_, pos) => *pos,
+                }
+            }
+        }
+
+        let mut tag_stack: Vec<TagEntry> = Vec::with_capacity(64);
+        let mut root_opened = false;
+        let mut root_closed = false;
+
+        let get_line_num = |offset: u64| -> usize {
+            if let (Some(idx), Some(eng)) = (line_index, engine) {
+                return idx.byte_offset_to_line(eng, offset);
+            }
+            if let Ok(cps) = checkpoints.lock() {
+                if !cps.is_empty() {
+                    match cps.binary_search_by_key(&offset, |&(b, _)| b) {
+                        Ok(i) => return cps[i].1,
+                        Err(i) => {
+                            if i > 0 {
+                                return cps[i - 1].1;
+                            }
+                        }
+                    }
+                }
+            }
+            1
+        };
 
         loop {
             if cancel.load(Ordering::Relaxed) {
+                let pos = xml_reader.buffer_position() as u64;
                 return XmlValidationResult::Invalid {
-                    line_number,
-                    byte_offset: last_offset,
+                    line_number: get_line_num(pos),
+                    byte_offset: pos,
                     message: "Validation cancelled by user".to_string(),
                 };
             }
 
-            let pos = reader.buffer_position() as u64;
-            last_offset = pos;
+            let pos = xml_reader.buffer_position() as u64;
 
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(_)) => {
+            match xml_reader.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) => {
+                    if root_closed {
+                        return XmlValidationResult::Invalid {
+                            line_number: get_line_num(pos),
+                            byte_offset: pos,
+                            message: format!(
+                                "Multiple root elements: extra element <{}> found after root element closed",
+                                String::from_utf8_lossy(e.name().as_ref())
+                            ),
+                        };
+                    }
+                    root_opened = true;
                     elements_count += 1;
-                    current_depth += 1;
-                    max_depth = max_depth.max(current_depth);
+
+                    // Zero-allocation duplicate attribute validation for typical elements (<= 8 attributes)
+                    let mut attr_count = 0;
+                    let mut attr_keys: [([u8; 32], u8); 8] = [([0; 32], 0); 8];
+                    let mut heap_attr_keys: Option<Vec<Vec<u8>>> = None;
+                    for attr_res in e.attributes() {
+                        match attr_res {
+                            Ok(attr) => {
+                                let key = attr.key.as_ref();
+                                let key_len = key.len();
+                                if let Some(ref mut heap) = heap_attr_keys {
+                                    if heap.iter().any(|k| k.as_slice() == key) {
+                                        return XmlValidationResult::Invalid {
+                                            line_number: get_line_num(pos),
+                                            byte_offset: pos,
+                                            message: format!(
+                                                "Duplicate attribute '{}' on element <{}>",
+                                                String::from_utf8_lossy(key),
+                                                String::from_utf8_lossy(e.name().as_ref())
+                                            ),
+                                        };
+                                    }
+                                    heap.push(key.to_vec());
+                                } else if attr_count < 8 && key_len <= 32 {
+                                    for (prev_key, prev_len) in &attr_keys[..attr_count] {
+                                        if *prev_len as usize == key_len && &prev_key[..key_len] == key {
+                                            return XmlValidationResult::Invalid {
+                                                line_number: get_line_num(pos),
+                                                byte_offset: pos,
+                                                message: format!(
+                                                    "Duplicate attribute '{}' on element <{}>",
+                                                    String::from_utf8_lossy(key),
+                                                    String::from_utf8_lossy(e.name().as_ref())
+                                                ),
+                                            };
+                                        }
+                                    }
+                                    let mut k_buf = [0u8; 32];
+                                    k_buf[..key_len].copy_from_slice(key);
+                                    attr_keys[attr_count] = (k_buf, key_len as u8);
+                                    attr_count += 1;
+                                } else {
+                                    let mut heap: Vec<Vec<u8>> = attr_keys[..attr_count]
+                                        .iter()
+                                        .map(|(k, len)| k[..*len as usize].to_vec())
+                                        .collect();
+                                    if heap.iter().any(|k| k.as_slice() == key) {
+                                        return XmlValidationResult::Invalid {
+                                            line_number: get_line_num(pos),
+                                            byte_offset: pos,
+                                            message: format!(
+                                                "Duplicate attribute '{}' on element <{}>",
+                                                String::from_utf8_lossy(key),
+                                                String::from_utf8_lossy(e.name().as_ref())
+                                            ),
+                                        };
+                                    }
+                                    heap.push(key.to_vec());
+                                    heap_attr_keys = Some(heap);
+                                }
+                            }
+                            Err(attr_err) => {
+                                return XmlValidationResult::Invalid {
+                                    line_number: get_line_num(pos),
+                                    byte_offset: pos,
+                                    message: format!("Attribute syntax error: {}", attr_err),
+                                };
+                            }
+                        }
+                    }
+
+                    let name = e.name();
+                    let name_bytes = name.as_ref();
+                    if name_bytes.len() <= 32 {
+                        let mut b = [0u8; 32];
+                        b[..name_bytes.len()].copy_from_slice(name_bytes);
+                        tag_stack.push(TagEntry::Inline(b, name_bytes.len() as u8, pos));
+                    } else {
+                        tag_stack.push(TagEntry::Heap(name_bytes.to_vec(), pos));
+                    }
+                    max_depth = max_depth.max(tag_stack.len());
                 }
-                Ok(Event::Empty(_)) => {
+                Ok(Event::Empty(e)) => {
+                    if root_closed {
+                        return XmlValidationResult::Invalid {
+                            line_number: get_line_num(pos),
+                            byte_offset: pos,
+                            message: format!(
+                                "Multiple root elements: extra element <{}/> found after root element closed",
+                                String::from_utf8_lossy(e.name().as_ref())
+                            ),
+                        };
+                    }
+                    if !root_opened {
+                        root_opened = true;
+                        root_closed = true;
+                    }
                     elements_count += 1;
+
+                    let mut attr_count = 0;
+                    let mut attr_keys: [([u8; 32], u8); 8] = [([0; 32], 0); 8];
+                    let mut heap_attr_keys: Option<Vec<Vec<u8>>> = None;
+                    for attr_res in e.attributes() {
+                        match attr_res {
+                            Ok(attr) => {
+                                let key = attr.key.as_ref();
+                                let key_len = key.len();
+                                if let Some(ref mut heap) = heap_attr_keys {
+                                    if heap.iter().any(|k| k.as_slice() == key) {
+                                        return XmlValidationResult::Invalid {
+                                            line_number: get_line_num(pos),
+                                            byte_offset: pos,
+                                            message: format!(
+                                                "Duplicate attribute '{}' on element <{}>",
+                                                String::from_utf8_lossy(key),
+                                                String::from_utf8_lossy(e.name().as_ref())
+                                            ),
+                                        };
+                                    }
+                                    heap.push(key.to_vec());
+                                } else if attr_count < 8 && key_len <= 32 {
+                                    for (prev_key, prev_len) in &attr_keys[..attr_count] {
+                                        if *prev_len as usize == key_len && &prev_key[..key_len] == key {
+                                            return XmlValidationResult::Invalid {
+                                                line_number: get_line_num(pos),
+                                                byte_offset: pos,
+                                                message: format!(
+                                                    "Duplicate attribute '{}' on element <{}>",
+                                                    String::from_utf8_lossy(key),
+                                                    String::from_utf8_lossy(e.name().as_ref())
+                                                ),
+                                            };
+                                        }
+                                    }
+                                    let mut k_buf = [0u8; 32];
+                                    k_buf[..key_len].copy_from_slice(key);
+                                    attr_keys[attr_count] = (k_buf, key_len as u8);
+                                    attr_count += 1;
+                                } else {
+                                    let mut heap: Vec<Vec<u8>> = attr_keys[..attr_count]
+                                        .iter()
+                                        .map(|(k, len)| k[..*len as usize].to_vec())
+                                        .collect();
+                                    if heap.iter().any(|k| k.as_slice() == key) {
+                                        return XmlValidationResult::Invalid {
+                                            line_number: get_line_num(pos),
+                                            byte_offset: pos,
+                                            message: format!(
+                                                "Duplicate attribute '{}' on element <{}>",
+                                                String::from_utf8_lossy(key),
+                                                String::from_utf8_lossy(e.name().as_ref())
+                                            ),
+                                        };
+                                    }
+                                    heap.push(key.to_vec());
+                                    heap_attr_keys = Some(heap);
+                                }
+                            }
+                            Err(attr_err) => {
+                                return XmlValidationResult::Invalid {
+                                    line_number: get_line_num(pos),
+                                    byte_offset: pos,
+                                    message: format!("Attribute syntax error: {}", attr_err),
+                                };
+                            }
+                        }
+                    }
                 }
-                Ok(Event::End(_)) => {
-                    current_depth = current_depth.saturating_sub(1);
+                Ok(Event::End(e)) => {
+                    let name_bytes = e.name();
+                    if let Some(top) = tag_stack.pop() {
+                        if top.as_bytes() != name_bytes.as_ref() {
+                            return XmlValidationResult::Invalid {
+                                line_number: get_line_num(pos),
+                                byte_offset: pos,
+                                message: format!(
+                                    "Mismatched closing tag: expected </{}> (opened at line {}), but found </{}>",
+                                    String::from_utf8_lossy(top.as_bytes()),
+                                    get_line_num(top.open_offset()),
+                                    String::from_utf8_lossy(name_bytes.as_ref())
+                                ),
+                            };
+                        }
+                        if tag_stack.is_empty() {
+                            root_closed = true;
+                        }
+                    } else {
+                        return XmlValidationResult::Invalid {
+                            line_number: get_line_num(pos),
+                            byte_offset: pos,
+                            message: format!(
+                                "Unexpected closing tag </{}> without matching start tag",
+                                String::from_utf8_lossy(name_bytes.as_ref())
+                            ),
+                        };
+                    }
+                }
+                Ok(Event::Text(t)) => {
+                    if root_closed {
+                        let text = t.as_ref();
+                        if text.iter().any(|&b| !b.is_ascii_whitespace()) {
+                            return XmlValidationResult::Invalid {
+                                line_number: get_line_num(pos),
+                                byte_offset: pos,
+                                message: "Illegal non-whitespace content found after root element closed".to_string(),
+                            };
+                        }
+                    }
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => {
+                    let err_pos = xml_reader.buffer_position() as u64;
                     return XmlValidationResult::Invalid {
-                        line_number,
-                        byte_offset: pos,
-                        message: format!("{}", e),
+                        line_number: get_line_num(err_pos),
+                        byte_offset: err_pos,
+                        message: format!("XML syntax error: {}", e),
                     };
                 }
                 _ => {}
@@ -300,11 +608,25 @@ impl XmlValidator {
             buf.clear();
         }
 
-        if current_depth > 0 {
+        if !root_opened {
             return XmlValidationResult::Invalid {
-                line_number,
-                byte_offset: last_offset,
-                message: format!("Document ended with {} unclosed XML elements", current_depth),
+                line_number: 1,
+                byte_offset: 0,
+                message: "Empty XML document: no root element found".to_string(),
+            };
+        }
+
+        if let Some(top) = tag_stack.pop() {
+            let open_offset = top.open_offset();
+            let open_line = get_line_num(open_offset);
+            return XmlValidationResult::Invalid {
+                line_number: open_line,
+                byte_offset: open_offset,
+                message: format!(
+                    "Unclosed XML element <{}> (opened at line {})",
+                    String::from_utf8_lossy(top.as_bytes()),
+                    open_line
+                ),
             };
         }
 
@@ -426,3 +748,56 @@ impl XmlStructureIndexer {
         summary
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_xml_validator_catches_unclosed_category_tag() {
+        let invalid_xml = r#"<source>
+  <job>
+    <title><![CDATA[Estimator]]></title>
+    <category><![CDATA[General]]>
+    <CategoryID>28</CategoryID>
+    <city><![CDATA[Garden Grove]]></city>
+  </job>
+</source>"#;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let res = XmlValidator::validate(std::io::Cursor::new(invalid_xml), None, None, cancel);
+        match res {
+            XmlValidationResult::Invalid { message, .. } => {
+                assert!(message.contains("category"), "Expected error to mention 'category', got: {}", message);
+                assert!(message.contains("job") || message.contains("expected"), "Expected error to mention mismatched tag, got: {}", message);
+            }
+            XmlValidationResult::Valid { .. } => {
+                panic!("Expected XML to be invalid due to missing </category> closing tag!");
+            }
+        }
+    }
+
+    #[test]
+    fn test_xml_validator_valid_xml() {
+        let valid_xml = r#"<source>
+  <job>
+    <title><![CDATA[Estimator]]></title>
+    <category><![CDATA[General]]></category>
+    <CategoryID>28</CategoryID>
+  </job>
+</source>"#;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let res = XmlValidator::validate(std::io::Cursor::new(valid_xml), None, None, cancel);
+        match res {
+            XmlValidationResult::Valid { elements_count, max_depth, .. } => {
+                assert_eq!(elements_count, 5);
+                assert_eq!(max_depth, 3);
+            }
+            XmlValidationResult::Invalid { message, .. } => {
+                panic!("Expected XML to be valid, but got: {}", message);
+            }
+        }
+    }
+}
+

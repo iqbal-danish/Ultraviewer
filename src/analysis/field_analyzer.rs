@@ -128,6 +128,7 @@ pub struct AnalysisReport {
     pub elapsed_secs: f64,
     pub throughput_mb_s: f64,
     pub fields: Vec<FieldStats>,
+    pub record_tag: Option<String>,
 }
 
 impl AnalysisReport {
@@ -175,39 +176,61 @@ impl AnalysisReport {
 }
 
 
+#[inline]
+fn truncate_to_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        s
+    } else {
+        let mut idx = max_bytes;
+        while idx > 0 && !s.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        &s[..idx]
+    }
+}
+
 /// Bounded frequency counter for streaming high-cardinality distribution analysis
 struct BoundedFrequencyTracker {
     counts: HashMap<String, u64>,
     max_entries: usize,
+    watermark: usize,
     total_distinct_seen: u64,
 }
 
 impl BoundedFrequencyTracker {
     fn new(max_entries: usize) -> Self {
+        let max_entries = max_entries.max(150_000);
+        let watermark = max_entries + 50_000;
         Self {
-            counts: HashMap::with_capacity(max_entries + 16),
+            counts: HashMap::with_capacity(1024),
             max_entries,
+            watermark,
             total_distinct_seen: 0,
         }
     }
 
+    #[inline]
     fn insert(&mut self, val: &str) {
-        if let Some(c) = self.counts.get_mut(val) {
+        let key = truncate_to_boundary(val, 128);
+
+        if let Some(c) = self.counts.get_mut(key) {
             *c += 1;
             return;
         }
 
         self.total_distinct_seen += 1;
 
-        if self.counts.len() < self.max_entries {
-            self.counts.insert(val.to_string(), 1);
+        if self.counts.len() < self.watermark {
+            self.counts.insert(key.to_string(), 1);
         } else {
-            // Space-Saving algorithm: find entry with minimal count and replace it
-            if let Some((min_key, min_count)) = self.counts.iter().min_by_key(|(_, &c)| c).map(|(k, &c)| (k.clone(), c)) {
-                if min_count <= 2 {
-                    self.counts.remove(&min_key);
-                    self.counts.insert(val.to_string(), min_count + 1);
-                }
+            // Fast batch prune infrequent entries
+            let mut threshold = 1;
+            while self.counts.len() > self.max_entries && threshold <= 10 {
+                self.counts.retain(|_, &mut count| count > threshold);
+                threshold += 1;
+            }
+            if self.counts.len() < self.watermark {
+                self.counts.insert(key.to_string(), 1);
             }
         }
     }
@@ -258,10 +281,11 @@ impl FieldAccumulator {
             max_value: None,
             min_len: usize::MAX,
             max_len: 0,
-            tracker: BoundedFrequencyTracker::new(500),
+            tracker: BoundedFrequencyTracker::new(256),
         }
     }
 
+    #[inline]
     fn record_value(&mut self, val: &str, raw_type: InferredType) {
         self.occurrences += 1;
 
@@ -283,15 +307,17 @@ impl FieldAccumulator {
         self.min_len = self.min_len.min(len);
         self.max_len = self.max_len.max(len);
 
+        let val_bounded = truncate_to_boundary(val, 128);
+
         match self.min_value.as_ref() {
-            Some(curr) if val < curr.as_str() => self.min_value = Some(val.to_string()),
-            None => self.min_value = Some(val.to_string()),
+            Some(curr) if val_bounded < curr.as_str() => self.min_value = Some(val_bounded.to_string()),
+            None => self.min_value = Some(val_bounded.to_string()),
             _ => {}
         }
 
         match self.max_value.as_ref() {
-            Some(curr) if val > curr.as_str() => self.max_value = Some(val.to_string()),
-            None => self.max_value = Some(val.to_string()),
+            Some(curr) if val_bounded > curr.as_str() => self.max_value = Some(val_bounded.to_string()),
+            None => self.max_value = Some(val_bounded.to_string()),
             _ => {}
         }
 
@@ -299,8 +325,9 @@ impl FieldAccumulator {
     }
 
     fn to_stats(self, total_records: u64) -> FieldStats {
+        let non_null = self.occurrences.saturating_sub(self.null_count);
         let presence_pct = if total_records > 0 {
-            (self.occurrences as f32 / total_records as f32) * 100.0
+            (non_null as f32 / total_records as f32) * 100.0
         } else {
             0.0
         };
@@ -316,7 +343,7 @@ impl FieldAccumulator {
             min_len: if self.min_len == usize::MAX { 0 } else { self.min_len },
             max_len: self.max_len,
             cardinality_approx: self.tracker.total_distinct_seen,
-            top_values: self.tracker.top_values(total_records, 50),
+            top_values: self.tracker.top_values(total_records, 200_000),
         }
     }
 }
@@ -348,10 +375,14 @@ impl StreamingFieldAnalyzer {
     const BUFFER_CAPACITY: usize = 256 * 1024;
 
     /// Infer primitive type from raw string value
+    #[inline]
     fn infer_primitive_type(val: &str) -> InferredType {
         let trimmed = val.trim();
         if trimmed == "null" || trimmed.is_empty() {
             return InferredType::Null;
+        }
+        if trimmed.len() > 64 {
+            return InferredType::String;
         }
         if trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("false") {
             return InferredType::Boolean;
@@ -607,6 +638,7 @@ impl StreamingFieldAnalyzer {
             elapsed_secs: elapsed,
             throughput_mb_s: throughput,
             fields,
+            record_tag: None,
         })
     }
 
@@ -715,80 +747,308 @@ impl StreamingFieldAnalyzer {
             elapsed_secs: elapsed,
             throughput_mb_s: throughput,
             fields,
+            record_tag: None,
         })
     }
 
-    /// Profile an XML file/stream using streaming quick-xml reader
+    /// Profile an XML file/stream using streaming quick-xml reader,
+    /// capturing all fields, CDATA sections, nested structures, objects, and attributes.
     pub fn analyze_xml<R: Read>(
         reader: R,
+        total_bytes: u64,
+        cancel: Arc<AtomicBool>,
+        progress: Option<Arc<RwLock<FormattingProgress>>>,
+    ) -> Result<AnalysisReport, String> {
+        let buf_reader = BufReader::with_capacity(Self::BUFFER_CAPACITY, reader);
+        Self::analyze_xml_from_reader(Reader::from_reader(buf_reader), total_bytes, cancel, progress)
+    }
+
+    /// High-performance XML analyzer operating on any BufRead or in-memory slice (e.g. mmap)
+    pub fn analyze_xml_from_reader<B: BufRead>(
+        mut xml_reader: Reader<B>,
         _total_bytes: u64,
         cancel: Arc<AtomicBool>,
         progress: Option<Arc<RwLock<FormattingProgress>>>,
     ) -> Result<AnalysisReport, String> {
+        struct TagStackItem {
+            name_bytes: [u8; 32],
+            name_len: u8,
+            path_len_before: usize,
+            has_children: bool,
+        }
+
+        struct RecordCandidate {
+            name: String,
+            depth: usize,
+            total_count: u64,
+            with_children_count: u64,
+        }
+
         let start_time = Instant::now();
-        let buf_reader = BufReader::with_capacity(Self::BUFFER_CAPACITY, reader);
-        let mut xml_reader = Reader::from_reader(buf_reader);
         xml_reader.config_mut().expand_empty_elements = false;
         xml_reader.config_mut().trim_text(true);
 
         let mut buf = Vec::with_capacity(8192);
-        let mut total_records: u64 = 0;
-        let mut accumulators: HashMap<String, FieldAccumulator> = HashMap::new();
+        let mut accumulators: Vec<FieldAccumulator> = Vec::with_capacity(128);
+        let mut path_to_field_id: HashMap<Vec<u8>, usize> = HashMap::with_capacity(128);
+
         let mut last_progress_report = Instant::now();
-        let mut current_tag: Option<String> = None;
-        let mut depth: usize = 0;
+        let mut tag_stack: Vec<TagStackItem> = Vec::with_capacity(32);
+        let mut path_buf: Vec<u8> = Vec::with_capacity(256);
+        let mut text_buf: Vec<u8> = Vec::with_capacity(4096);
+
+        let mut record_candidates: Vec<RecordCandidate> = Vec::with_capacity(16);
+        let mut event_count: u32 = 0;
 
         loop {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("Analysis cancelled by user".to_string());
+            event_count = event_count.wrapping_add(1);
+            if (event_count & 0x1FFF) == 0 {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("Analysis cancelled by user".to_string());
+                }
+                if last_progress_report.elapsed().as_millis() >= 100 {
+                    let pos = xml_reader.buffer_position() as u64;
+                    if let Some(ref prog) = progress {
+                        prog.write().unwrap().update(pos, start_time);
+                    }
+                    last_progress_report = Instant::now();
+                }
             }
 
             match xml_reader.read_event_into(&mut buf) {
                 Ok(Event::Start(e)) => {
-                    depth += 1;
-                    if depth == 2 {
-                        total_records += 1;
+                    let raw_name = e.name();
+                    let name_bytes = raw_name.as_ref();
+
+                    if let Some(parent) = tag_stack.last_mut() {
+                        parent.has_children = true;
                     }
-                    let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+
+                    let current_depth = tag_stack.len();
+                    let path_len_before = path_buf.len();
+
+                    if current_depth >= 2 {
+                        if !path_buf.is_empty() {
+                            path_buf.push(b'/');
+                        }
+                        path_buf.extend_from_slice(name_bytes);
+                    }
 
                     // Record attributes
-                    for attr in e.attributes() {
-                        if let Ok(a) = attr {
-                            let attr_name = format!("@{}:{}", tag_name, String::from_utf8_lossy(a.key.as_ref()));
-                            let val = String::from_utf8_lossy(a.value.as_ref()).to_string();
-                            let ptype = Self::infer_primitive_type(&val);
-                            let acc = accumulators.entry(attr_name.clone()).or_insert_with(|| FieldAccumulator::new(attr_name));
-                            acc.record_value(&val, ptype);
-                        }
+                    for attr in e.attributes().flatten() {
+                        let attr_key = attr.key.as_ref();
+                        let val_bytes = attr.value.as_ref();
+                        let val = String::from_utf8_lossy(val_bytes);
+                        let ptype = Self::infer_primitive_type(&val);
+
+                        let attr_path = if current_depth >= 2 {
+                            let mut p = Vec::with_capacity(path_buf.len() + 1 + attr_key.len());
+                            p.extend_from_slice(&path_buf);
+                            p.push(b'@');
+                            p.extend_from_slice(attr_key);
+                            p
+                        } else {
+                            let mut p = Vec::with_capacity(name_bytes.len() + 2 + attr_key.len());
+                            p.push(b'@');
+                            p.extend_from_slice(name_bytes);
+                            p.push(b':');
+                            p.extend_from_slice(attr_key);
+                            p
+                        };
+
+                        let id = match path_to_field_id.get(&attr_path) {
+                            Some(&id) => id,
+                            None => {
+                                let name = String::from_utf8_lossy(&attr_path).to_string();
+                                let id = accumulators.len();
+                                accumulators.push(FieldAccumulator::new(name));
+                                path_to_field_id.insert(attr_path, id);
+                                id
+                            }
+                        };
+                        accumulators[id].record_value(&val, ptype);
                     }
 
-                    current_tag = Some(tag_name);
+                    let mut stored_name = [0u8; 32];
+                    let copy_len = name_bytes.len().min(32);
+                    stored_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+
+                    tag_stack.push(TagStackItem {
+                        name_bytes: stored_name,
+                        name_len: copy_len as u8,
+                        path_len_before,
+                        has_children: false,
+                    });
+
+                    text_buf.clear();
                 }
                 Ok(Event::Empty(e)) => {
-                    let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                    for attr in e.attributes() {
-                        if let Ok(a) = attr {
-                            let attr_name = format!("@{}:{}", tag_name, String::from_utf8_lossy(a.key.as_ref()));
-                            let val = String::from_utf8_lossy(a.value.as_ref()).to_string();
+                    let raw_name = e.name();
+                    let name_bytes = raw_name.as_ref();
+
+                    if let Some(parent) = tag_stack.last_mut() {
+                        parent.has_children = true;
+                    }
+
+                    let current_depth = tag_stack.len();
+                    if current_depth >= 2 {
+                        let mut empty_path = Vec::with_capacity(path_buf.len() + 1 + name_bytes.len());
+                        if !path_buf.is_empty() {
+                            empty_path.extend_from_slice(&path_buf);
+                            empty_path.push(b'/');
+                        }
+                        empty_path.extend_from_slice(name_bytes);
+
+                        for attr in e.attributes().flatten() {
+                            let attr_key = attr.key.as_ref();
+                            let val_bytes = attr.value.as_ref();
+                            let val = String::from_utf8_lossy(val_bytes);
                             let ptype = Self::infer_primitive_type(&val);
-                            let acc = accumulators.entry(attr_name.clone()).or_insert_with(|| FieldAccumulator::new(attr_name));
-                            acc.record_value(&val, ptype);
+
+                            let mut attr_path = Vec::with_capacity(empty_path.len() + 1 + attr_key.len());
+                            attr_path.extend_from_slice(&empty_path);
+                            attr_path.push(b'@');
+                            attr_path.extend_from_slice(attr_key);
+
+                            let id = match path_to_field_id.get(&attr_path) {
+                                Some(&id) => id,
+                                None => {
+                                    let name = String::from_utf8_lossy(&attr_path).to_string();
+                                    let id = accumulators.len();
+                                    accumulators.push(FieldAccumulator::new(name));
+                                    path_to_field_id.insert(attr_path, id);
+                                    id
+                                }
+                            };
+                            accumulators[id].record_value(&val, ptype);
+                        }
+
+                        let id = match path_to_field_id.get(&empty_path) {
+                            Some(&id) => id,
+                            None => {
+                                let name = String::from_utf8_lossy(&empty_path).to_string();
+                                let id = accumulators.len();
+                                accumulators.push(FieldAccumulator::new(name));
+                                path_to_field_id.insert(empty_path, id);
+                                id
+                            }
+                        };
+                        accumulators[id].null_count += 1;
+                        accumulators[id].occurrences += 1;
+                    } else {
+                        for attr in e.attributes().flatten() {
+                            let attr_key = attr.key.as_ref();
+                            let val_bytes = attr.value.as_ref();
+                            let val = String::from_utf8_lossy(val_bytes);
+                            let ptype = Self::infer_primitive_type(&val);
+
+                            let mut attr_path = Vec::with_capacity(name_bytes.len() + 2 + attr_key.len());
+                            attr_path.push(b'@');
+                            attr_path.extend_from_slice(name_bytes);
+                            attr_path.push(b':');
+                            attr_path.extend_from_slice(attr_key);
+
+                            let id = match path_to_field_id.get(&attr_path) {
+                                Some(&id) => id,
+                                None => {
+                                    let name = String::from_utf8_lossy(&attr_path).to_string();
+                                    let id = accumulators.len();
+                                    accumulators.push(FieldAccumulator::new(name));
+                                    path_to_field_id.insert(attr_path, id);
+                                    id
+                                }
+                            };
+                            accumulators[id].record_value(&val, ptype);
                         }
                     }
                 }
                 Ok(Event::Text(t)) => {
-                    if let Some(ref tag) = current_tag {
-                        let text = String::from_utf8_lossy(t.as_ref()).to_string();
-                        if !text.is_empty() {
-                            let ptype = Self::infer_primitive_type(&text);
-                            let acc = accumulators.entry(tag.clone()).or_insert_with(|| FieldAccumulator::new(tag.clone()));
-                            acc.record_value(&text, ptype);
-                        }
-                    }
+                    text_buf.extend_from_slice(t.as_ref());
+                }
+                Ok(Event::CData(c)) => {
+                    text_buf.extend_from_slice(c.as_ref());
                 }
                 Ok(Event::End(_)) => {
-                    depth = depth.saturating_sub(1);
-                    current_tag = None;
+                    if let Some(tag_info) = tag_stack.pop() {
+                        let depth = tag_stack.len();
+                        let tag_name_slice = &tag_info.name_bytes[..tag_info.name_len as usize];
+
+                        if (depth == 1 || depth == 2) && tag_info.name_len > 0 {
+                            if let Some(cand) = record_candidates.iter_mut().find(|c| c.depth == depth && c.name.as_bytes() == tag_name_slice) {
+                                cand.total_count += 1;
+                                if tag_info.has_children {
+                                    cand.with_children_count += 1;
+                                }
+                            } else if record_candidates.len() < 32 {
+                                let name = String::from_utf8_lossy(tag_name_slice).to_string();
+                                record_candidates.push(RecordCandidate {
+                                    name,
+                                    depth,
+                                    total_count: 1,
+                                    with_children_count: if tag_info.has_children { 1 } else { 0 },
+                                });
+                            }
+                        }
+
+                        if depth >= 1 && depth < 32 {
+                            let has_children = tag_info.has_children;
+                            let target_path: &[u8] = if depth >= 2 {
+                                &path_buf
+                            } else {
+                                tag_name_slice
+                            };
+
+                            if !target_path.is_empty() {
+                                let trimmed = std::str::from_utf8(&text_buf)
+                                    .map(|s| s.trim())
+                                    .unwrap_or("");
+
+                                if !trimmed.is_empty() {
+                                    let ptype = Self::infer_primitive_type(trimmed);
+                                    let id = match path_to_field_id.get(target_path) {
+                                        Some(&id) => id,
+                                        None => {
+                                            let name = String::from_utf8_lossy(target_path).to_string();
+                                            let id = accumulators.len();
+                                            accumulators.push(FieldAccumulator::new(name));
+                                            path_to_field_id.insert(target_path.to_vec(), id);
+                                            id
+                                        }
+                                    };
+                                    accumulators[id].record_value(trimmed, ptype);
+                                } else if has_children {
+                                    let id = match path_to_field_id.get(target_path) {
+                                        Some(&id) => id,
+                                        None => {
+                                            let name = String::from_utf8_lossy(target_path).to_string();
+                                            let id = accumulators.len();
+                                            accumulators.push(FieldAccumulator::new(name));
+                                            path_to_field_id.insert(target_path.to_vec(), id);
+                                            id
+                                        }
+                                    };
+                                    accumulators[id].occurrences += 1;
+                                    accumulators[id].inferred_type = Some(InferredType::Object);
+                                } else if depth >= 2 {
+                                    let id = match path_to_field_id.get(target_path) {
+                                        Some(&id) => id,
+                                        None => {
+                                            let name = String::from_utf8_lossy(target_path).to_string();
+                                            let id = accumulators.len();
+                                            accumulators.push(FieldAccumulator::new(name));
+                                            path_to_field_id.insert(target_path.to_vec(), id);
+                                            id
+                                        }
+                                    };
+                                    accumulators[id].null_count += 1;
+                                    accumulators[id].occurrences += 1;
+                                }
+                            }
+                        }
+
+                        path_buf.truncate(tag_info.path_len_before);
+                        text_buf.clear();
+                    }
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(format!("XML error: {}", e)),
@@ -796,14 +1056,6 @@ impl StreamingFieldAnalyzer {
             }
 
             buf.clear();
-
-            if last_progress_report.elapsed().as_millis() >= 100 {
-                let pos = xml_reader.buffer_position() as u64;
-                if let Some(ref prog) = progress {
-                    prog.write().unwrap().update(pos, start_time);
-                }
-                last_progress_report = Instant::now();
-            }
         }
 
         let elapsed = start_time.elapsed().as_secs_f64();
@@ -814,12 +1066,35 @@ impl StreamingFieldAnalyzer {
             0.0
         };
 
-        if total_records == 0 {
-            total_records = 1;
-        }
+        // Determine repeating record element
+        let best_record = record_candidates
+            .iter()
+            .filter(|c| c.with_children_count > 1)
+            .min_by_key(|c| (c.depth, -(c.with_children_count as i64)))
+            .map(|c| (c.name.clone(), c.with_children_count))
+            .or_else(|| {
+                record_candidates
+                    .iter()
+                    .filter(|c| c.total_count > 1)
+                    .min_by_key(|c| (c.depth, -(c.total_count as i64)))
+                    .map(|c| (c.name.clone(), c.total_count))
+            })
+            .or_else(|| {
+                record_candidates
+                    .iter()
+                    .filter(|c| c.depth == 1)
+                    .max_by_key(|c| c.total_count)
+                    .map(|c| (c.name.clone(), c.total_count))
+            });
+
+        let (detected_record_tag, total_records) = if let Some((tag, count)) = best_record {
+            (Some(tag), count)
+        } else {
+            (None, 1)
+        };
 
         let mut fields: Vec<FieldStats> = accumulators
-            .into_values()
+            .into_iter()
             .map(|acc| acc.to_stats(total_records))
             .collect();
         fields.sort_by(|a, b| b.total_occurrences.cmp(&a.total_occurrences).then_with(|| a.name.cmp(&b.name)));
@@ -830,6 +1105,7 @@ impl StreamingFieldAnalyzer {
             elapsed_secs: elapsed,
             throughput_mb_s: throughput,
             fields,
+            record_tag: detected_record_tag,
         })
     }
 
@@ -867,3 +1143,98 @@ impl StreamingFieldAnalyzer {
         res
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_analyze_xml_cdata_and_nested_fields() {
+        let xml = r#"<source xmlns:fo="http://www.w3.org/1999/XSL/Format">
+  <job>
+    <referencenumber>604233562</referencenumber>
+    <url><![CDATA[https://kimco.thejobnetwork.com/job/123]]></url>
+    <company><![CDATA[Kimco Staffing]]></company>
+    <category><![CDATA[General]]></category>
+    <CategoryID>28</CategoryID>
+    <city><![CDATA[Garden Grove]]></city>
+    <state><![CDATA[CA]]></state>
+    <country><![CDATA[US]]></country>
+    <description><![CDATA[<span>Software Engineer</span>]]></description>
+    <salary>
+      <min>50000</min>
+      <max>85000</max>
+      <currency>USD</currency>
+    </salary>
+  </job>
+</source>"#;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let report = StreamingFieldAnalyzer::analyze_xml(Cursor::new(xml), xml.len() as u64, cancel, None).unwrap();
+
+        assert_eq!(report.total_records, 1);
+
+        let field_names: Vec<&str> = report.fields.iter().map(|f| f.name.as_str()).collect();
+
+        // Must contain all direct CDATA fields
+        assert!(field_names.contains(&"url"), "Missing url");
+        assert!(field_names.contains(&"company"), "Missing company");
+        assert!(field_names.contains(&"category"), "Missing category");
+        assert!(field_names.contains(&"city"), "Missing city");
+        assert!(field_names.contains(&"state"), "Missing state");
+        assert!(field_names.contains(&"country"), "Missing country");
+        assert!(field_names.contains(&"description"), "Missing description");
+
+        // Must contain plain text fields
+        assert!(field_names.contains(&"referencenumber"), "Missing referencenumber");
+        assert!(field_names.contains(&"CategoryID"), "Missing CategoryID");
+
+        // Must contain nested fields and container
+        assert!(field_names.contains(&"salary"), "Missing salary container");
+        assert!(field_names.contains(&"salary/min"), "Missing salary/min");
+        assert!(field_names.contains(&"salary/max"), "Missing salary/max");
+        assert!(field_names.contains(&"salary/currency"), "Missing salary/currency");
+
+        // Verify values
+        let city_stat = report.fields.iter().find(|f| f.name == "city").unwrap();
+        assert_eq!(city_stat.inferred_type, InferredType::String);
+        assert_eq!(city_stat.min_value.as_deref(), Some("Garden Grove"));
+
+        let cat_stat = report.fields.iter().find(|f| f.name == "CategoryID").unwrap();
+        assert_eq!(cat_stat.inferred_type, InferredType::Integer);
+        assert_eq!(cat_stat.min_value.as_deref(), Some("28"));
+
+        assert_eq!(report.record_tag, Some("job".to_string()));
+    }
+
+    #[test]
+    fn test_analyze_xml_with_header_metadata_tags() {
+        let xml = r#"<source xmlns:fo="http://www.w3.org/1999/XSL/Format">
+  <publisher>TheJobNetwork</publisher>
+  <publisherurl>https://thejobnetwork.com</publisherurl>
+  <lastBuildDate>2026-09-22</lastBuildDate>
+  <job>
+    <referencenumber>101</referencenumber>
+    <title>Rust Developer</title>
+  </job>
+  <job>
+    <referencenumber>102</referencenumber>
+    <title>Backend Engineer</title>
+  </job>
+  <job>
+    <referencenumber>103</referencenumber>
+    <title>Systems Architect</title>
+  </job>
+</source>"#;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let report = StreamingFieldAnalyzer::analyze_xml(Cursor::new(xml), xml.len() as u64, cancel, None).unwrap();
+
+        assert_eq!(report.total_records, 3);
+        assert_eq!(report.record_tag, Some("job".to_string()));
+    }
+}
+

@@ -40,7 +40,7 @@ pub fn render_format_modal(
                 ui.colored_label(
                     Color32::from_rgb(80, 220, 100),
                     format!(
-                        "✓ Successfully formatted {:.2} MB in {:.2}s ({:.1} MB/s)",
+                        "Successfully formatted {:.2} MB in {:.2}s ({:.1} MB/s)",
                         (progress.bytes_processed as f64) / (1024.0 * 1024.0),
                         progress.elapsed_secs,
                         progress.speed_mb_s,
@@ -89,3 +89,107 @@ pub fn render_format_modal(
 
     result
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatTarget {
+    NewTab,
+    InPlace,
+    SaveAs,
+}
+
+pub enum FormatOptionsModalAction {
+    Execute {
+        indent_size: usize,
+        use_tabs: bool,
+        is_minify: bool,
+        target: FormatTarget,
+    },
+    Dismiss,
+}
+
+pub struct FormatOptionsModalState {
+    pub is_open: bool,
+    pub is_minify: bool,
+    pub indent_idx: usize, // 0: 2 spaces, 1: 4 spaces, 2: tabs
+    pub target: FormatTarget,
+}
+
+impl Default for FormatOptionsModalState {
+    fn default() -> Self {
+        Self {
+            is_open: false,
+            is_minify: false,
+            indent_idx: 0,
+            target: FormatTarget::NewTab,
+        }
+    }
+}
+
+pub fn render_format_options_modal(
+    ctx: &egui::Context,
+    state: &mut FormatOptionsModalState,
+    file_type_name: &str,
+) -> Option<FormatOptionsModalAction> {
+    if !state.is_open {
+        return None;
+    }
+
+    let mut action = None;
+    let title = if state.is_minify {
+        format!("Minify {} Document", file_type_name)
+    } else {
+        format!("Format & Beautify {} Document", file_type_name)
+    };
+
+    Window::new(RichText::new(format!("⚡ {}", title)).strong())
+        .collapsible(false)
+        .resizable(false)
+        .default_width(380.0)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.add_space(4.0);
+
+            if !state.is_minify {
+                ui.label(RichText::new("Indentation:").strong());
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut state.indent_idx, 0, "2 Spaces");
+                    ui.radio_value(&mut state.indent_idx, 1, "4 Spaces");
+                    ui.radio_value(&mut state.indent_idx, 2, "Tabs");
+                });
+                ui.add_space(8.0);
+            }
+
+            ui.label(RichText::new("Destination:").strong());
+            ui.radio_value(&mut state.target, FormatTarget::NewTab, "Open Formatted in New Tab (Recommended / Non-destructive)");
+            ui.radio_value(&mut state.target, FormatTarget::InPlace, "Replace Current File In-Place");
+            ui.radio_value(&mut state.target, FormatTarget::SaveAs, "Save Formatted As New File...");
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let action_btn_text = if state.is_minify { "⚡ Minify" } else { "⚡ Format" };
+                if ui.button(RichText::new(action_btn_text).strong().color(Color32::from_rgb(97, 175, 239))).clicked() {
+                    let (indent_size, use_tabs) = match state.indent_idx {
+                        1 => (4, false),
+                        2 => (1, true),
+                        _ => (2, false),
+                    };
+                    action = Some(FormatOptionsModalAction::Execute {
+                        indent_size,
+                        use_tabs,
+                        is_minify: state.is_minify,
+                        target: state.target,
+                    });
+                    state.is_open = false;
+                }
+
+                if ui.button("Cancel").clicked() {
+                    state.is_open = false;
+                    action = Some(FormatOptionsModalAction::Dismiss);
+                }
+            });
+            ui.add_space(4.0);
+        });
+
+    action
+}
+
