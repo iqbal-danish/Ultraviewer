@@ -9,6 +9,268 @@ use crate::file_engine::{FileEngine, line_index::LineIndex};
 
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum PredicateOp {
+    MissingOrEmpty,                  // not(x), x='', not(normalize-space(x))
+    HasData,                         // x!='', normalize-space(x)!=''
+    Equal(String),                   // x = 'val'
+    NotEqual(String),                // x != 'val'
+    GreaterThan(f64),                // x > 2.50
+    LessThan(f64),                   // x < 0.50
+    GreaterThanOrEqual(f64),         // x >= 1.00
+    LessThanOrEqual(f64),            // x <= 0.00
+    Contains(String),                // contains(x, 'val')
+    NotContains(String),             // not(contains(x, 'val'))
+    StartsWith(String),              // starts-with(x, 'val')
+    StringLengthLess(usize),         // string-length(x) < 5
+    StringLengthGreater(usize),      // string-length(x) > 100
+    StringLengthNotEqual(usize),     // string-length(x) != 2
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildPredicate {
+    pub child_tag: String,
+    pub op: PredicateOp,
+}
+
+pub fn parse_numeric(s: &str) -> Option<f64> {
+    let s_clean = s.trim().trim_matches(|c| c == '\'' || c == '"');
+    let mut num_str = String::new();
+    let mut has_digits = false;
+    for c in s_clean.chars() {
+        if c.is_ascii_digit() || c == '.' || c == '-' || c == '+' {
+            num_str.push(c);
+            if c.is_ascii_digit() {
+                has_digits = true;
+            }
+        } else if !num_str.is_empty() && (c.is_alphabetic() || c.is_whitespace()) {
+            break;
+        }
+    }
+    if has_digits {
+        num_str.parse::<f64>().ok()
+    } else {
+        None
+    }
+}
+
+pub fn clean_field_name(s: &str) -> String {
+    let mut trim = s.trim();
+    if let Some(pos) = trim.find("normalize-space(") {
+        let rest = &trim[pos + "normalize-space(".len()..];
+        let end = rest.rfind(')').unwrap_or(rest.len());
+        trim = &rest[..end];
+    }
+    trim = trim.trim().trim_matches(')').trim();
+    let clean = trim.split(':').last().unwrap_or(trim).trim();
+    if clean.is_empty() || clean == "." || clean == "text()" || clean.starts_with("text") {
+        ".".to_string()
+    } else {
+        clean.to_string()
+    }
+}
+
+impl ChildPredicate {
+    pub fn parse(pred: &str) -> Option<Self> {
+        let p = pred.trim();
+        if p.is_empty() {
+            return None;
+        }
+
+        // 1. String functions
+        if (p.starts_with("not(contains(") || p.starts_with("!contains(")) && p.ends_with(')') {
+            let inner = if p.starts_with("not(contains(") {
+                &p["not(contains(".len()..p.len() - 1].trim().trim_end_matches(')')
+            } else {
+                &p["!contains(".len()..p.len() - 1]
+            };
+            if let Some(comma) = inner.find(',') {
+                let field = clean_field_name(&inner[..comma]);
+                let val = inner[comma + 1..].trim().trim_matches(|c| c == '\'' || c == '"').to_string();
+                return Some(ChildPredicate {
+                    child_tag: field,
+                    op: PredicateOp::NotContains(val),
+                });
+            }
+        }
+
+        if p.starts_with("contains(") && p.ends_with(')') {
+            let inner = &p["contains(".len()..p.len() - 1];
+            if let Some(comma) = inner.find(',') {
+                let field = clean_field_name(&inner[..comma]);
+                let val = inner[comma + 1..].trim().trim_matches(|c| c == '\'' || c == '"').to_string();
+                return Some(ChildPredicate {
+                    child_tag: field,
+                    op: PredicateOp::Contains(val),
+                });
+            }
+        }
+
+        if p.starts_with("starts-with(") && p.ends_with(')') {
+            let inner = &p["starts-with(".len()..p.len() - 1];
+            if let Some(comma) = inner.find(',') {
+                let field = clean_field_name(&inner[..comma]);
+                let val = inner[comma + 1..].trim().trim_matches(|c| c == '\'' || c == '"').to_string();
+                return Some(ChildPredicate {
+                    child_tag: field,
+                    op: PredicateOp::StartsWith(val),
+                });
+            }
+        }
+
+        if p.starts_with("string-length(") {
+            if let Some(close_paren) = p.find(')') {
+                let field = clean_field_name(&p["string-length(".len()..close_paren]);
+                let rest = p[close_paren + 1..].trim();
+                if let Some(stripped) = rest.strip_prefix("!=") {
+                    if let Ok(n) = stripped.trim().parse::<usize>() {
+                        return Some(ChildPredicate {
+                            child_tag: field,
+                            op: PredicateOp::StringLengthNotEqual(n),
+                        });
+                    }
+                } else if let Some(stripped) = rest.strip_prefix('<') {
+                    if let Ok(n) = stripped.trim().parse::<usize>() {
+                        return Some(ChildPredicate {
+                            child_tag: field,
+                            op: PredicateOp::StringLengthLess(n),
+                        });
+                    }
+                } else if let Some(stripped) = rest.strip_prefix('>') {
+                    if let Ok(n) = stripped.trim().parse::<usize>() {
+                        return Some(ChildPredicate {
+                            child_tag: field,
+                            op: PredicateOp::StringLengthGreater(n),
+                        });
+                    }
+                }
+            }
+        }
+
+        // 2. not(...) or normalize-space(...)
+        if p.starts_with("not(") && p.ends_with(')') {
+            let inner = &p["not(".len()..p.len() - 1].trim();
+            let field = clean_field_name(inner);
+            return Some(ChildPredicate {
+                child_tag: field,
+                op: PredicateOp::MissingOrEmpty,
+            });
+        }
+        if let Some(stripped) = p.strip_prefix('!') {
+            let field = clean_field_name(stripped);
+            return Some(ChildPredicate {
+                child_tag: field,
+                op: PredicateOp::MissingOrEmpty,
+            });
+        }
+
+        // 3. Comparisons: >=, <=, !=, >, <, ==, =
+        if let Some(idx) = p.find(">=") {
+            let field = clean_field_name(&p[..idx]);
+            let val_str = p[idx + 2..].trim();
+            if let Some(n) = parse_numeric(val_str) {
+                return Some(ChildPredicate {
+                    child_tag: field,
+                    op: PredicateOp::GreaterThanOrEqual(n),
+                });
+            }
+        }
+        if let Some(idx) = p.find("<=") {
+            let field = clean_field_name(&p[..idx]);
+            let val_str = p[idx + 2..].trim();
+            if let Some(n) = parse_numeric(val_str) {
+                return Some(ChildPredicate {
+                    child_tag: field,
+                    op: PredicateOp::LessThanOrEqual(n),
+                });
+            }
+        }
+        if let Some(idx) = p.find("!=") {
+            let field = clean_field_name(&p[..idx]);
+            let val_str = p[idx + 2..].trim().trim_matches(|c| c == '\'' || c == '"');
+            if val_str.is_empty() {
+                return Some(ChildPredicate {
+                    child_tag: field,
+                    op: PredicateOp::HasData,
+                });
+            } else {
+                return Some(ChildPredicate {
+                    child_tag: field,
+                    op: PredicateOp::NotEqual(val_str.to_string()),
+                });
+            }
+        }
+        if let Some(idx) = p.find('>') {
+            let field = clean_field_name(&p[..idx]);
+            let val_str = p[idx + 1..].trim();
+            if let Some(n) = parse_numeric(val_str) {
+                return Some(ChildPredicate {
+                    child_tag: field,
+                    op: PredicateOp::GreaterThan(n),
+                });
+            }
+        }
+        if let Some(idx) = p.find('<') {
+            let field = clean_field_name(&p[..idx]);
+            let val_str = p[idx + 1..].trim();
+            if let Some(n) = parse_numeric(val_str) {
+                return Some(ChildPredicate {
+                    child_tag: field,
+                    op: PredicateOp::LessThan(n),
+                });
+            }
+        }
+        if let Some(idx) = p.find("==").or_else(|| p.find('=')) {
+            let op_len = if p[idx..].starts_with("==") { 2 } else { 1 };
+            let field = clean_field_name(&p[..idx]);
+            let val_str = p[idx + op_len..].trim().trim_matches(|c| c == '\'' || c == '"');
+            if val_str.is_empty() || val_str == "null" {
+                return Some(ChildPredicate {
+                    child_tag: field,
+                    op: PredicateOp::MissingOrEmpty,
+                });
+            } else {
+                return Some(ChildPredicate {
+                    child_tag: field,
+                    op: PredicateOp::Equal(val_str.to_string()),
+                });
+            }
+        }
+
+        None
+    }
+
+    pub fn evaluate(&self, text: Option<&str>) -> bool {
+        match text {
+            None => match &self.op {
+                PredicateOp::MissingOrEmpty => true,
+                PredicateOp::NotEqual(_) => true,
+                PredicateOp::NotContains(_) => true,
+                _ => false,
+            },
+            Some(raw) => {
+                let val_trim = raw.trim();
+                match &self.op {
+                    PredicateOp::MissingOrEmpty => val_trim.is_empty(),
+                    PredicateOp::HasData => !val_trim.is_empty(),
+                    PredicateOp::Equal(expected) => val_trim.eq_ignore_ascii_case(expected),
+                    PredicateOp::NotEqual(expected) => !val_trim.eq_ignore_ascii_case(expected),
+                    PredicateOp::GreaterThan(n) => parse_numeric(val_trim).map_or(false, |num| num > *n),
+                    PredicateOp::LessThan(n) => parse_numeric(val_trim).map_or(false, |num| num < *n),
+                    PredicateOp::GreaterThanOrEqual(n) => parse_numeric(val_trim).map_or(false, |num| num >= *n),
+                    PredicateOp::LessThanOrEqual(n) => parse_numeric(val_trim).map_or(false, |num| num <= *n),
+                    PredicateOp::Contains(sub) => val_trim.to_lowercase().contains(&sub.to_lowercase()),
+                    PredicateOp::NotContains(sub) => !val_trim.to_lowercase().contains(&sub.to_lowercase()),
+                    PredicateOp::StartsWith(prefix) => val_trim.starts_with(prefix),
+                    PredicateOp::StringLengthLess(len) => val_trim.chars().count() < *len,
+                    PredicateOp::StringLengthGreater(len) => val_trim.chars().count() > *len,
+                    PredicateOp::StringLengthNotEqual(len) => val_trim.chars().count() != *len,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct XPathStep {
     pub is_descendant: bool, // true if //, false if /
     pub tag: String,         // element name or "*"
@@ -17,6 +279,7 @@ pub struct XPathStep {
     pub index: Option<usize>,                          // 1-based sibling index [1]
     pub select_attr: Option<String>,                  // trailing /@attr
     pub missing_or_empty_child: Option<String>,        // e.g. "title" from not(title) or title=''
+    pub child_predicate: Option<ChildPredicate>,
 }
 
 fn extract_incomplete_field_name(pred: &str) -> String {
@@ -136,6 +399,7 @@ impl XPathQuery {
                         index: None,
                         select_attr: Some(attr_name),
                         missing_or_empty_child: None,
+                        child_predicate: None,
                     });
                 }
                 continue;
@@ -161,6 +425,7 @@ impl XPathQuery {
             let mut text_filter = None;
             let mut index = None;
             let mut missing_or_empty_child = None;
+            let mut child_predicate = None;
 
             // Check for predicates: [...]
             while i < len && chars[i] == '[' {
@@ -189,9 +454,13 @@ impl XPathQuery {
                 {
                     let field = extract_incomplete_field_name(pred_trim);
                     if !field.is_empty() {
-                        missing_or_empty_child = Some(field);
+                        missing_or_empty_child = Some(field.clone());
+                        child_predicate = Some(ChildPredicate {
+                            child_tag: field,
+                            op: PredicateOp::MissingOrEmpty,
+                        });
                     }
-                } else if pred_trim.starts_with('@') {
+                } else if pred_trim.starts_with('@') && !pred_trim.contains('>') && !pred_trim.contains('<') && !pred_trim.contains("!=") {
                     // Attribute predicate: @id or @id='abc' or @id="abc"
                     let attr_content = &pred_trim[1..];
                     if let Some(eq_idx) = attr_content.find('=') {
@@ -201,6 +470,11 @@ impl XPathQuery {
                     } else {
                         attr_filter = Some((attr_content.trim().to_string(), None));
                     }
+                } else if let Some(cp) = ChildPredicate::parse(pred_trim) {
+                    if cp.op == PredicateOp::MissingOrEmpty {
+                        missing_or_empty_child = Some(cp.child_tag.clone());
+                    }
+                    child_predicate = Some(cp);
                 } else if pred_trim.starts_with("text()") {
                     if let Some(eq_idx) = pred_trim.find('=') {
                         let v = pred_trim[eq_idx + 1..].trim().trim_matches(|c| c == '\'' || c == '"').to_string();
@@ -227,6 +501,7 @@ impl XPathQuery {
                 index,
                 select_attr: None,
                 missing_or_empty_child,
+                child_predicate,
             });
 
             // Guarantee progress to prevent infinite loop
@@ -509,9 +784,17 @@ impl StreamingQueryEngine {
         reader.config_mut().check_end_names = false;
         reader.config_mut().trim_text(false);
 
-        let target_missing_child = query.steps.last().and_then(|s| s.missing_or_empty_child.clone());
-        let (clean_target, clean_leaf, is_self_check) = if let Some(ref target_child) = target_missing_child {
-            let ct = target_child.trim().split(':').last().unwrap_or(target_child).trim().to_string();
+        let target_predicate = query.steps.last().and_then(|s| s.child_predicate.clone())
+            .or_else(|| {
+                query.steps.last().and_then(|s| s.missing_or_empty_child.as_ref()).map(|child| {
+                    ChildPredicate {
+                        child_tag: child.clone(),
+                        op: PredicateOp::MissingOrEmpty,
+                    }
+                })
+            });
+        let (clean_target, clean_leaf, is_self_check) = if let Some(ref pred) = target_predicate {
+            let ct = pred.child_tag.trim().split(':').last().unwrap_or(&pred.child_tag).trim().to_string();
             let cl = ct.split('/').last().unwrap_or(&ct).trim().to_string();
             let isc = cl == "." || cl == "text()" || cl == "normalize-space()" || cl.is_empty();
             (ct, cl, isc)
@@ -526,12 +809,15 @@ impl StreamingQueryEngine {
             tag_name: String,
             depth: usize,
             start_pos: u64,
-            has_valid_child: bool,
+            predicate: ChildPredicate,
             in_target_child: bool,
             target_child_depth: usize,
             target_child_pos: Option<u64>,
             target_child_tag: Option<String>,
             target_child_is_empty: bool,
+            collected_text: String,
+            child_seen: bool,
+            condition_satisfied: bool,
         }
 
         let mut candidate_record: Option<CandidateRecord> = None;
@@ -597,10 +883,8 @@ impl StreamingQueryEngine {
                 }
                 Ok(Event::Text(ref t)) => {
                     if let Some(ref mut cand) = candidate_record {
-                        if cand.in_target_child && !cand.has_valid_child {
-                            if t.iter().any(|&b| !b.is_ascii_whitespace()) {
-                                cand.has_valid_child = true;
-                            }
+                        if cand.in_target_child {
+                            cand.collected_text.push_str(&String::from_utf8_lossy(t.as_ref()));
                         }
                     }
                     buf.clear();
@@ -608,10 +892,8 @@ impl StreamingQueryEngine {
                 }
                 Ok(Event::CData(ref t)) => {
                     if let Some(ref mut cand) = candidate_record {
-                        if cand.in_target_child && !cand.has_valid_child {
-                            if t.iter().any(|&b| !b.is_ascii_whitespace()) {
-                                cand.has_valid_child = true;
-                            }
+                        if cand.in_target_child {
+                            cand.collected_text.push_str(&String::from_utf8_lossy(t.as_ref()));
                         }
                     }
                     buf.clear();
@@ -621,6 +903,9 @@ impl StreamingQueryEngine {
                     if let Some(ref mut cand) = candidate_record {
                         if cand.in_target_child && stack.len() <= cand.target_child_depth {
                             cand.in_target_child = false;
+                            if cand.predicate.evaluate(Some(&cand.collected_text)) {
+                                cand.condition_satisfied = true;
+                            }
                         }
 
                         let qname = e.name();
@@ -628,7 +913,13 @@ impl StreamingQueryEngine {
                         let end_local = end_bytes.split(|&b| b == b':').last().unwrap_or(end_bytes);
 
                         if stack.len() == cand.depth && end_local.eq_ignore_ascii_case(cand.tag_name.as_bytes()) {
-                            if !cand.has_valid_child {
+                            if !cand.child_seen {
+                                if cand.predicate.evaluate(None) {
+                                    cand.condition_satisfied = true;
+                                }
+                            }
+
+                            if cand.condition_satisfied {
                                 let (match_pos, match_preview, match_tag) = if let Some(child_pos) = cand.target_child_pos {
                                     let tag_str = cand.target_child_tag.as_deref().unwrap_or(&clean_leaf);
                                     let preview = if cand.target_child_is_empty {
@@ -697,27 +988,28 @@ impl StreamingQueryEngine {
                 sibling_counters.push(HashMap::new());
             }
 
-            if target_missing_child.is_some() {
+            if let Some(ref pred) = target_predicate {
                 if candidate_record.is_none() {
                     if Self::matches_xpath_stack(&stack, &query.steps) {
-                        let mut has_valid = false;
-                        if !is_self_check {
-                            if clean_leaf.starts_with('@') {
-                                let attr_key = &clean_leaf[1..];
-                                if let Some(val) = attrs.get(attr_key) {
-                                    if !val.trim().is_empty() {
-                                        has_valid = true;
-                                    }
-                                }
-                            } else if let Some(val) = attrs.get(&clean_leaf) {
-                                if !val.trim().is_empty() {
-                                    has_valid = true;
-                                }
-                            }
+                        let mut condition_satisfied = false;
+                        let mut child_seen = false;
+                        if clean_leaf.starts_with('@') {
+                            let attr_key = &clean_leaf[1..];
+                            let val_opt = attrs.get(attr_key).map(|s| s.as_str());
+                            condition_satisfied = pred.evaluate(val_opt);
+                            child_seen = true;
+                        } else if is_self_check {
+                            child_seen = true;
                         }
 
                         if is_empty {
-                            if !has_valid {
+                            if !child_seen {
+                                condition_satisfied = pred.evaluate(None);
+                            } else if is_self_check {
+                                condition_satisfied = pred.evaluate(Some(""));
+                            }
+
+                            if condition_satisfied {
                                 let line_number = get_line_num(tag_start_pos);
                                 let path = Self::build_xpath_from_stack(&stack);
                                 let preview = format!("<{} />", tag_name);
@@ -740,12 +1032,15 @@ impl StreamingQueryEngine {
                                 tag_name: tag_name.clone(),
                                 depth: stack.len(),
                                 start_pos: tag_start_pos,
-                                has_valid_child: has_valid,
+                                predicate: pred.clone(),
                                 in_target_child: is_self_check,
                                 target_child_depth: if is_self_check { stack.len() } else { 0 },
                                 target_child_pos: None,
                                 target_child_tag: None,
                                 target_child_is_empty: false,
+                                collected_text: String::new(),
+                                child_seen,
+                                condition_satisfied,
                             });
                         }
                     }
@@ -756,6 +1051,13 @@ impl StreamingQueryEngine {
                         cand.target_child_pos = Some(tag_start_pos);
                         cand.target_child_tag = Some(tag_name.clone());
                         cand.target_child_is_empty = is_empty;
+                        cand.child_seen = true;
+                        cand.collected_text.clear();
+                        if is_empty {
+                            if cand.predicate.evaluate(Some("")) {
+                                cand.condition_satisfied = true;
+                            }
+                        }
                     }
                 }
             } else {

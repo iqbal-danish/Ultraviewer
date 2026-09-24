@@ -2149,7 +2149,7 @@ impl UltraViewerApp {
             let line = m.line_number;
             self.active_match_idx = Some(idx);
             drop(matches);
-            self.scroll_to_line(line);
+            self.scroll_to_line_with_headroom(line, 4);
         }
     }
 
@@ -2620,7 +2620,7 @@ impl UltraViewerApp {
             self.query_match_idx + 1
         };
         let line = self.query_matches[self.query_match_idx - 1].line_number;
-        self.scroll_to_line(line);
+        self.scroll_to_line_with_headroom(line, 4);
     }
 
     pub fn prev_query_match(&mut self) {
@@ -2633,7 +2633,7 @@ impl UltraViewerApp {
             self.query_match_idx - 1
         };
         let line = self.query_matches[self.query_match_idx - 1].line_number;
-        self.scroll_to_line(line);
+        self.scroll_to_line_with_headroom(line, 4);
     }
 
     pub fn activate_virtual_slice_from_query(&mut self) {
@@ -4143,6 +4143,16 @@ impl UltraViewerApp {
         }
     }
 
+    pub fn scroll_to_line_with_headroom(&mut self, target_line: usize, headroom: usize) {
+        if let (Some(first), Some(last)) = (self.viewport.lines.first(), self.viewport.lines.last()) {
+            if target_line >= first.line_number + headroom && target_line + 2 <= last.line_number {
+                return;
+            }
+        }
+        let start_line = target_line.saturating_sub(headroom).max(1);
+        self.scroll_to_line(start_line);
+    }
+
     pub fn scroll_lines(&mut self, delta: isize) {
         if self.engine.is_some() {
             let max_line = self.line_index.as_ref().map(|i| i.total_lines()).unwrap_or(usize::MAX).max(1);
@@ -4735,7 +4745,7 @@ impl eframe::App for UltraViewerApp {
                 if self.query_match_idx == 0 && !self.query_matches.is_empty() {
                     self.query_match_idx = 1;
                     let line = self.query_matches[0].line_number;
-                    self.scroll_to_line(line);
+                    self.scroll_to_line_with_headroom(line, 4);
                 }
                 ctx.request_repaint();
             }
@@ -5427,7 +5437,6 @@ impl eframe::App for UltraViewerApp {
                 show_suggestions: &mut show_suggestions,
             };
             let header_act = egui::TopBottomPanel::top("unified_header_bar")
-                .exact_height(42.0)
                 .frame(egui::Frame::NONE)
                 .show(ctx, |ui| render_breadcrumb_bar(ui, header_props)).inner;
             self.query_text = query_text;
@@ -6477,7 +6486,9 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
 
     fn render_csv_grid_view(&mut self, ui: &mut Ui) {
         let available_rect = ui.available_rect_before_wrap();
-        let editor_h = available_rect.height();
+        let top_padding = 4.0;
+        let content_origin = egui::pos2(available_rect.min.x, available_rect.min.y + top_padding);
+        let editor_h = (available_rect.height() - top_padding).max(1.0);
         let total_w = available_rect.width();
         let ruler_w = 14.0;
         let spacing = 4.0;
@@ -6488,9 +6499,9 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
         let screen_lines = ((editor_h / row_h).floor() as usize).max(1);
         self.cached_screen_lines = screen_lines;
 
-        let grid_rect = Rect::from_min_size(available_rect.min, egui::vec2(grid_w, editor_h));
+        let grid_rect = Rect::from_min_size(content_origin, egui::vec2(grid_w, editor_h));
         let ruler_rect = Rect::from_min_size(
-            egui::pos2(available_rect.min.x + grid_w + spacing, available_rect.min.y),
+            egui::pos2(content_origin.x + grid_w + spacing, content_origin.y),
             egui::vec2(ruler_w, editor_h),
         );
 
@@ -6663,7 +6674,9 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
         let mut pending_focus = self.pending_focus_line;
 
         let available_rect = ui.available_rect_before_wrap();
-        let editor_h = available_rect.height();
+        let top_padding = 4.0;
+        let content_origin = egui::pos2(available_rect.min.x, available_rect.min.y + top_padding);
+        let editor_h = (available_rect.height() - top_padding).max(1.0);
         let total_w = available_rect.width();
         let ruler_w = 14.0;
         let spacing = 4.0;
@@ -6673,9 +6686,9 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
         let screen_lines = ((editor_h / line_h).floor() as usize).max(1);
         self.cached_screen_lines = screen_lines;
 
-        let viewport_rect = Rect::from_min_size(available_rect.min, egui::vec2(viewport_w, editor_h));
+        let viewport_rect = Rect::from_min_size(content_origin, egui::vec2(viewport_w, editor_h));
         let ruler_rect = Rect::from_min_size(
-            egui::pos2(available_rect.min.x + viewport_w + spacing, available_rect.min.y),
+            egui::pos2(content_origin.x + viewport_w + spacing, content_origin.y),
             egui::vec2(ruler_w, editor_h),
         );
 
@@ -6686,7 +6699,13 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
             vp_ui.set_clip_rect(viewport_rect);
             let ui = &mut vp_ui;
             self.editor_viewport_rect = Some(viewport_rect);
-            let gutter_w = 70.0;
+            let max_line_str = format_number(total_lines as u64);
+            let max_digits = max_line_str.len().max(5);
+            let char_w = ui.fonts(|f| f.glyph_width(&line_num_font, '0')).max(7.5);
+            let arrow_w = 16.0;
+            let num_col_w = (max_digits as f32 * char_w).max(42.0);
+            let chevron_w = 18.0;
+            let gutter_w = arrow_w + num_col_w + chevron_w + 14.0;
 
                     if word_wrap {
                         // Word Wrap ON: Virtualized vertical line window with per-line horizontal rows
@@ -6712,23 +6731,33 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                                 };
 
                                 ui.horizontal_top(|ui| {
-                                    // Line number gutter: line number on left (50px), folding chevron on right (18px)
-                                    let num_str = if is_active_search {
-                                        format!("▶{:>6}", format_number(line_no as u64))
-                                    } else {
-                                        format!("{:>7}", format_number(line_no as u64))
-                                    };
+                                    let line_h = ui.fonts(|f| f.row_height(&text_font));
+
+                                    // 1. Navigation Arrow indicator (left: arrow_w = 16.0px)
+                                    let (arrow_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(arrow_w, line_h),
+                                        Sense::hover(),
+                                    );
+                                    if is_active_search && ui.is_rect_visible(arrow_rect) {
+                                        ui.painter().text(
+                                            arrow_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "▶",
+                                            FontId::monospace(10.5),
+                                            Color32::from_rgb(97, 175, 239),
+                                        );
+                                    }
+
+                                    // 2. Line Number (num_col_w) - click and drag to select lines
+                                    let num_str = format!("{:>width$}", format_number(line_no as u64), width = max_digits);
                                     let color = if is_active_search {
                                         Color32::from_rgb(97, 175, 239)
                                     } else {
                                         line_num_color
                                     };
 
-                                    let line_h = ui.fonts(|f| f.row_height(&text_font));
-
-                                    // 1. Line Number (left: 50.0px) - click and drag to select lines
                                     let (num_rect, num_resp) = ui.allocate_exact_size(
-                                        egui::vec2(50.0, line_h),
+                                        egui::vec2(num_col_w, line_h),
                                         Sense::click_and_drag(),
                                     );
                                     if is_selected {
@@ -6740,7 +6769,7 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                                     }
                                     if ui.is_rect_visible(num_rect) {
                                         ui.painter().text(
-                                            Pos2::new(num_rect.right() - 4.0, num_rect.center().y),
+                                            Pos2::new(num_rect.right() - 2.0, num_rect.center().y),
                                             egui::Align2::RIGHT_CENTER,
                                             &num_str,
                                             line_num_font.clone(),
@@ -6748,9 +6777,9 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                                         );
                                     }
 
-                                    // 2. Chevron (right: 18.0px) - directly beside the code guide
+                                    // 3. Chevron (right: 18.0px) - directly beside the code guide
                                     let (ch_rect, ch_resp) = ui.allocate_exact_size(
-                                        egui::vec2(18.0, line_h),
+                                        egui::vec2(chevron_w, line_h),
                                         Sense::click(),
                                     );
                                     if let Some((_end, is_folded)) = folding_targets.get(&line_no) {
@@ -6826,12 +6855,19 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
 
                                     let resp = ui.add(te);
                                     if is_active_search {
+                                        ui.painter().rect_filled(
+                                            resp.rect,
+                                            2.0,
+                                            Color32::from_rgba_unmultiplied(97, 175, 239, 25),
+                                        );
                                         ui.painter().rect_stroke(
-                                            resp.rect.expand(1.0),
-                                            1.0_f32,
-                                            egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(97, 175, 239, 160)),
+                                            resp.rect,
+                                            2.0,
+                                            egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(97, 175, 239, 90)),
                                             egui::StrokeKind::Inside,
                                         );
+                                        let accent_rect = Rect::from_min_size(resp.rect.min, Vec2::new(3.0, resp.rect.height()));
+                                        ui.painter().rect_filled(accent_rect, 1.0, Color32::from_rgb(97, 175, 239));
                                     }
 
                                     let row_top = num_rect.min.y.min(resp.rect.min.y);
@@ -7044,12 +7080,12 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                         });
 
                         // Draw clean vertical separator line between gutter and text
-                        let gutter_divider_x = top_left.x + gutter_w + 2.0;
+                        let gutter_divider_x = top_left.x + gutter_w;
                         let bottom_y = ui.cursor().min.y;
                         ui.painter().vline(
                             gutter_divider_x,
                             top_left.y..=bottom_y,
-                            ui.visuals().widgets.noninteractive.bg_stroke,
+                            egui::Stroke::new(1.0_f32, Color32::from_rgb(45, 51, 61)),
                         );
                     } else {
                         // Word Wrap OFF: Horizontal scrolling with pinned line numbers column
@@ -7057,119 +7093,132 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                         let pointer_pos = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
 
                         ui.style_mut().always_scroll_the_only_direction = false;
-                        ScrollArea::horizontal()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    // Line numbers column
-                                    ui.vertical(|ui| {
-                                        ui.set_min_width(gutter_w);
-                                        let line_h = ui.fonts(|f| f.row_height(&text_font));
+                        ui.horizontal(|ui| {
+                            // Pinned line numbers column on left
+                            ui.vertical(|ui| {
+                                ui.set_width(gutter_w);
+                                let line_h = ui.fonts(|f| f.row_height(&text_font));
 
-                                        for line in &self.viewport.lines {
-                                            let line_no = line.line_number;
-                                            if hidden_lines.contains(&line_no) {
-                                                continue;
+                                for line in &self.viewport.lines {
+                                    let line_no = line.line_number;
+                                    if hidden_lines.contains(&line_no) {
+                                        continue;
+                                    }
+                                    let is_selected = if let Some((s, e)) = sel_range {
+                                        line_no >= s && line_no <= e
+                                    } else {
+                                        false
+                                    };
+                                    let is_active = active_match_line == Some(line_no);
+                                    let num_str = format!("{:>width$}", format_number(line_no as u64), width = max_digits);
+                                    let color = if is_active {
+                                        Color32::from_rgb(97, 175, 239)
+                                    } else {
+                                        line_num_color
+                                    };
+
+                                    ui.horizontal(|ui| {
+                                        // 1. Navigation Arrow indicator (left: arrow_w = 16.0px)
+                                        let (arrow_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(arrow_w, line_h),
+                                            Sense::hover(),
+                                        );
+                                        if is_active && ui.is_rect_visible(arrow_rect) {
+                                            ui.painter().text(
+                                                arrow_rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                "▶",
+                                                FontId::monospace(10.5),
+                                                Color32::from_rgb(97, 175, 239),
+                                            );
+                                        }
+
+                                        // 2. Line Number (num_col_w)
+                                        let (num_rect, num_resp) = ui.allocate_exact_size(
+                                            egui::vec2(num_col_w, line_h),
+                                            Sense::click_and_drag(),
+                                        );
+                                        if is_selected {
+                                            ui.painter().rect_filled(
+                                                num_rect,
+                                                0.0,
+                                                Color32::from_rgba_unmultiplied(61, 69, 86, 120),
+                                            );
+                                        }
+                                        if ui.is_rect_visible(num_rect) {
+                                            ui.painter().text(
+                                                Pos2::new(num_rect.right() - 2.0, num_rect.center().y),
+                                                egui::Align2::RIGHT_CENTER,
+                                                &num_str,
+                                                line_num_font.clone(),
+                                                color,
+                                            );
+                                        }
+
+                                        if num_resp.drag_started() || (num_resp.hovered() && primary_down && !self.gutter_drag_active) {
+                                            drag_start_detected = Some(line_no);
+                                            new_gutter_selection = Some((line_no, line_no));
+                                            clear_gutter_selection = false;
+                                        }
+
+                                        if num_resp.clicked() && shift_down {
+                                            let anchor = self.selection_anchor.unwrap_or(self.current_line);
+                                            new_gutter_selection = Some((anchor, line_no));
+                                            clear_gutter_selection = false;
+                                        } else if num_resp.clicked() && !shift_down {
+                                            let just_finished_drag = self.selection_anchor != self.selection_head && self.selection_anchor.is_some();
+                                            if !just_finished_drag {
+                                                new_gutter_selection = Some((line_no, line_no));
+                                                clear_gutter_selection = false;
                                             }
-                                            let is_selected = if let Some((s, e)) = sel_range {
-                                                line_no >= s && line_no <= e
+                                        }
+
+                                        if self.gutter_drag_active && primary_down && pointer_pos.map_or(false, |p| p.y >= num_rect.min.y && p.y <= num_rect.max.y) {
+                                            if let Some(start_line) = self.mouse_drag_start_line {
+                                                new_gutter_selection = Some((start_line, line_no));
+                                                clear_gutter_selection = false;
+                                            }
+                                        }
+
+                                        // 3. Chevron (right: 18.0px)
+                                        let (ch_rect, ch_resp) = ui.allocate_exact_size(
+                                            egui::vec2(chevron_w, line_h),
+                                            Sense::click(),
+                                        );
+                                        if let Some((_end, is_folded)) = folding_targets.get(&line_no) {
+                                            let ch_hovered = ch_resp.hovered();
+                                            let ch_icon = if *is_folded { Icon::ChevronRight } else { Icon::ChevronDown };
+                                            let ch_color = if ch_hovered {
+                                                Color32::from_rgb(230, 238, 250)
                                             } else {
-                                                false
+                                                Color32::from_rgb(140, 155, 175)
                                             };
-                                            let is_active = active_match_line == Some(line_no);
-                                            let num_str = if is_active {
-                                                format!("▶{:>6}", format_number(line_no as u64))
-                                            } else {
-                                                format!("{:>7}", format_number(line_no as u64))
-                                            };
-                                            let color = if is_active {
-                                                Color32::from_rgb(97, 175, 239)
-                                            } else {
-                                                line_num_color
-                                            };
-
-                                            ui.horizontal(|ui| {
-                                                // 1. Line Number (left: 50.0px)
-                                                let (num_rect, num_resp) = ui.allocate_exact_size(
-                                                    egui::vec2(50.0, line_h),
-                                                    Sense::click_and_drag(),
-                                                );
-                                                if is_selected {
-                                                    ui.painter().rect_filled(
-                                                        num_rect,
-                                                        0.0,
-                                                        Color32::from_rgba_unmultiplied(61, 69, 86, 120),
-                                                    );
-                                                }
-                                                if ui.is_rect_visible(num_rect) {
-                                                    ui.painter().text(
-                                                        Pos2::new(num_rect.right() - 4.0, num_rect.center().y),
-                                                        egui::Align2::RIGHT_CENTER,
-                                                        &num_str,
-                                                        line_num_font.clone(),
-                                                        color,
-                                                    );
-                                                }
-
-                                                if num_resp.drag_started() || (num_resp.hovered() && primary_down && !self.gutter_drag_active) {
-                                                    drag_start_detected = Some(line_no);
-                                                    new_gutter_selection = Some((line_no, line_no));
-                                                    clear_gutter_selection = false;
-                                                }
-
-                                                if num_resp.clicked() && shift_down {
-                                                    let anchor = self.selection_anchor.unwrap_or(self.current_line);
-                                                    new_gutter_selection = Some((anchor, line_no));
-                                                    clear_gutter_selection = false;
-                                                } else if num_resp.clicked() && !shift_down {
-                                                    let just_finished_drag = self.selection_anchor != self.selection_head && self.selection_anchor.is_some();
-                                                    if !just_finished_drag {
-                                                        new_gutter_selection = Some((line_no, line_no));
-                                                        clear_gutter_selection = false;
-                                                    }
-                                                }
-
-                                                if self.gutter_drag_active && primary_down && pointer_pos.map_or(false, |p| p.y >= num_rect.min.y && p.y <= num_rect.max.y) {
-                                                    if let Some(start_line) = self.mouse_drag_start_line {
-                                                        new_gutter_selection = Some((start_line, line_no));
-                                                        clear_gutter_selection = false;
-                                                    }
-                                                }
-
-                                                // 2. Chevron (right: 18.0px)
-                                                let (ch_rect, ch_resp) = ui.allocate_exact_size(
-                                                    egui::vec2(18.0, line_h),
-                                                    Sense::click(),
-                                                );
-                                                if let Some((_end, is_folded)) = folding_targets.get(&line_no) {
-                                                    let ch_hovered = ch_resp.hovered();
-                                                    let ch_icon = if *is_folded { Icon::ChevronRight } else { Icon::ChevronDown };
-                                                    let ch_color = if ch_hovered {
-                                                        Color32::from_rgb(230, 238, 250)
-                                                    } else {
-                                                        Color32::from_rgb(140, 155, 175)
-                                                    };
-                                                    if ch_hovered {
-                                                        ui.painter().rect_filled(ch_rect.shrink(1.0), 3.0, Color32::from_rgb(38, 44, 54));
-                                                    }
-                                                    paint_icon(
-                                                        ui.painter(),
-                                                        Rect::from_center_size(ch_rect.center(), Vec2::splat(11.0)),
-                                                        ch_icon,
-                                                        ch_color,
-                                                    );
-                                                    if ch_resp.on_hover_text(if *is_folded { "Unfold Block" } else { "Fold Block" }).clicked() {
-                                                        toggle_fold_for = Some(line_no);
-                                                    }
-                                                }
-                                            });
+                                            if ch_hovered {
+                                                ui.painter().rect_filled(ch_rect.shrink(1.0), 3.0, Color32::from_rgb(38, 44, 54));
+                                            }
+                                            paint_icon(
+                                                ui.painter(),
+                                                Rect::from_center_size(ch_rect.center(), Vec2::splat(11.0)),
+                                                ch_icon,
+                                                ch_color,
+                                            );
+                                            if ch_resp.on_hover_text(if *is_folded { "Unfold Block" } else { "Fold Block" }).clicked() {
+                                                toggle_fold_for = Some(line_no);
+                                            }
                                         }
                                     });
+                                }
+                            });
 
-                                    ui.separator();
+                            // Crisp vertical divider line between pinned gutter and content
+                            let (sep_rect, _) = ui.allocate_exact_size(egui::vec2(1.0, ui.available_height()), Sense::hover());
+                            ui.painter().rect_filled(sep_rect, 0.0, Color32::from_rgb(45, 51, 61));
 
-                                    // Content column (native singleline TextEdit per line for instant cursor positioning and editing)
-                                    ui.vertical(|ui| {
+                                    // Content column (horizontally scrollable, while gutter remains pinned)
+                                    ScrollArea::horizontal()
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            ui.vertical(|ui| {
                                         for line in &mut self.viewport.lines {
                                             let line_no = line.line_number;
                                             if hidden_lines.contains(&line_no) {
@@ -7231,12 +7280,19 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
 
                                                 let resp = ui.add(te);
                                                 if is_active_search {
+                                                    ui.painter().rect_filled(
+                                                        resp.rect,
+                                                        2.0,
+                                                        Color32::from_rgba_unmultiplied(97, 175, 239, 25),
+                                                    );
                                                     ui.painter().rect_stroke(
-                                                        resp.rect.expand(1.0),
-                                                        1.0_f32,
-                                                        egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(97, 175, 239, 160)),
+                                                        resp.rect,
+                                                        2.0,
+                                                        egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(97, 175, 239, 90)),
                                                         egui::StrokeKind::Inside,
                                                     );
+                                                    let accent_rect = Rect::from_min_size(resp.rect.min, Vec2::new(3.0, resp.rect.height()));
+                                                    ui.painter().rect_filled(accent_rect, 1.0, Color32::from_rgb(97, 175, 239));
                                                 }
 
                                                 let pointer_in_row = pointer_pos.map_or(false, |p| p.y >= resp.rect.min.y && p.y <= resp.rect.max.y);

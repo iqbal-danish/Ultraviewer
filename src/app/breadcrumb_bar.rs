@@ -80,23 +80,23 @@ pub fn render_breadcrumb_bar(ui: &mut Ui, props: BreadcrumbBarProps) -> Option<B
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
 
-                // Path Type Badge (pill styling matching query bar)
-                let type_badge = egui::Frame::NONE
-                    .fill(label_color.gamma_multiply(0.18))
-                    .stroke(egui::Stroke::new(1.0_f32, label_color.gamma_multiply(0.85)))
-                    .corner_radius(4.0)
-                    .inner_margin(egui::Margin::symmetric(8, 4));
-
-                type_badge.show(ui, |ui| {
-                    ui.label(
-                        RichText::new(type_label)
-                            .size(13.5)
-                            .strong()
-                            .color(label_color),
-                    );
-                });
-
                 if !props.is_query_open {
+                    // Path Type Badge (pill styling matching query bar)
+                    let type_badge = egui::Frame::NONE
+                        .fill(label_color.gamma_multiply(0.18))
+                        .stroke(egui::Stroke::new(1.0_f32, label_color.gamma_multiply(0.85)))
+                        .corner_radius(4.0)
+                        .inner_margin(egui::Margin::symmetric(8, 4));
+
+                    type_badge.show(ui, |ui| {
+                        ui.label(
+                            RichText::new(type_label)
+                                .size(13.5)
+                                .strong()
+                                .color(label_color),
+                        );
+                    });
+
                     // ── Inactive Query State: Full Breadcrumb trail on left, Action buttons on right ──
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Query Bar Open Button
@@ -257,28 +257,20 @@ pub fn render_breadcrumb_bar(ui: &mut Ui, props: BreadcrumbBarProps) -> Option<B
 
                         // 2. Middle & Left: Query Mode Badge + Suggestions Toggle + Elastic Query Input
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            // Query Mode Indicator Badge (XPath / JSONPath) - cleanly identifies query language with no collision!
+                            // Query Mode Indicator Badge (XPath / JSONPath)
                             let mode_name = if is_xml { "XPath" } else { "JSONPath" };
-                            let mode_w = if is_xml { 56.0 } else { 76.0 };
+                            let mode_w = if is_xml { 60.0 } else { 80.0 };
                             let (mode_rect, mode_resp) = ui.allocate_exact_size(Vec2::new(mode_w, 28.0), Sense::hover());
-                            let mode_bg = if props.dark_mode {
-                                Color32::from_rgb(33, 37, 43)
-                            } else {
-                                Color32::from_rgb(235, 240, 248)
-                            };
-                            let mode_border = if props.dark_mode {
-                                Color32::from_rgb(52, 60, 72)
-                            } else {
-                                Color32::from_rgb(210, 218, 230)
-                            };
+                            let mode_bg = label_color.gamma_multiply(0.18);
+                            let mode_border = label_color.gamma_multiply(0.85);
                             ui.painter().rect_filled(mode_rect, 4.0, mode_bg);
                             ui.painter().rect_stroke(mode_rect, 4.0, egui::Stroke::new(1.0_f32, mode_border), egui::StrokeKind::Inside);
                             ui.painter().text(
                                 mode_rect.center(),
                                 egui::Align2::CENTER_CENTER,
                                 mode_name,
-                                egui::FontId::proportional(12.5),
-                                Color32::from_rgb(97, 175, 239),
+                                egui::FontId::proportional(13.0),
+                                label_color,
                             );
                             mode_resp.on_hover_text(format!("Query language: {} (Press Esc or click Close to return to breadcrumbs)", mode_name));
 
@@ -343,13 +335,13 @@ pub fn render_breadcrumb_bar(ui: &mut Ui, props: BreadcrumbBarProps) -> Option<B
                                 .fill(if props.dark_mode { Color32::from_rgb(27, 30, 36) } else { Color32::WHITE })
                                 .stroke(egui::Stroke::new(1.0_f32, if props.dark_mode { Color32::from_rgb(50, 56, 66) } else { Color32::from_rgb(205, 212, 222) }))
                                 .corner_radius(4.0)
-                                .inner_margin(egui::Margin::symmetric(10, 5))
+                                .inner_margin(egui::Margin::symmetric(10, 3))
                                 .show(ui, |ui| {
                                     let edit = ui.add(
                                         egui::TextEdit::singleline(props.query_text)
-                                            .hint_text(RichText::new(placeholder).size(14.0).color(Color32::from_rgb(110, 118, 130)))
+                                            .hint_text(RichText::new(placeholder).size(13.5).color(Color32::from_rgb(110, 118, 130)))
                                             .desired_width(input_well_width)
-                                            .font(egui::FontId::monospace(15.0))
+                                            .font(egui::FontId::monospace(14.0))
                                             .frame(false)
                                     );
                                     let rect = edit.rect;
@@ -412,6 +404,9 @@ pub fn render_breadcrumb_bar(ui: &mut Ui, props: BreadcrumbBarProps) -> Option<B
                                                 let mut active_cat = ui.data_mut(|d| d.get_temp::<SuggestionCategory>(active_cat_id).unwrap_or(SuggestionCategory::All));
 
                                                 let count_all = props.suggestions.len();
+                                                let count_bids = props.suggestions.iter().filter(|s| s.category == SuggestionCategory::BidsAndPricing).count();
+                                                let count_geo = props.suggestions.iter().filter(|s| s.category == SuggestionCategory::LocationAndGeo).count();
+                                                let count_links = props.suggestions.iter().filter(|s| s.category == SuggestionCategory::LinksAndQuality).count();
                                                 let count_empty = props.suggestions.iter().filter(|s| s.category == SuggestionCategory::EmptyFields).count();
                                                 let count_data = props.suggestions.iter().filter(|s| s.category == SuggestionCategory::HasData).count();
                                                 let count_elem = props.suggestions.iter().filter(|s| s.category == SuggestionCategory::Elements).count();
@@ -497,6 +492,15 @@ pub fn render_breadcrumb_bar(ui: &mut Ui, props: BreadcrumbBarProps) -> Option<B
                                                     };
 
                                                     render_tab(ui, SuggestionCategory::All, Some(Icon::Sparkle), "All", count_all, Color32::from_rgb(97, 175, 239));
+                                                    if count_bids > 0 {
+                                                        render_tab(ui, SuggestionCategory::BidsAndPricing, Some(Icon::Sparkle), "Bids & CPC", count_bids, Color32::from_rgb(229, 192, 123));
+                                                    }
+                                                    if count_geo > 0 {
+                                                        render_tab(ui, SuggestionCategory::LocationAndGeo, Some(Icon::Cube), "Location", count_geo, Color32::from_rgb(198, 120, 221));
+                                                    }
+                                                    if count_links > 0 {
+                                                        render_tab(ui, SuggestionCategory::LinksAndQuality, Some(Icon::Sparkle), "Quality & Links", count_links, Color32::from_rgb(86, 182, 194));
+                                                    }
                                                     if count_empty > 0 {
                                                         render_tab(ui, SuggestionCategory::EmptyFields, Some(Icon::Warning), "Empty Fields", count_empty, Color32::from_rgb(224, 108, 117));
                                                     }
@@ -562,6 +566,57 @@ pub fn render_breadcrumb_bar(ui: &mut Ui, props: BreadcrumbBarProps) -> Option<B
                                                                     Color32::from_rgb(224, 108, 117),
                                                                 );
                                                                 content_left + 60.0
+                                                            } else if sug.category == SuggestionCategory::BidsAndPricing {
+                                                                let badge_rect = Rect::from_min_size(Pos2::new(content_left, row_rect.center().y - 9.0), Vec2::new(42.0, 18.0));
+                                                                ui.painter().rect(
+                                                                    badge_rect,
+                                                                    3.0,
+                                                                    Color32::from_rgb(229, 192, 123).gamma_multiply(0.2),
+                                                                    egui::Stroke::new(1.0_f32, Color32::from_rgb(229, 192, 123).gamma_multiply(0.6)),
+                                                                    egui::StrokeKind::Inside,
+                                                                );
+                                                                ui.painter().text(
+                                                                    badge_rect.center(),
+                                                                    egui::Align2::CENTER_CENTER,
+                                                                    "BID",
+                                                                    egui::FontId::monospace(10.5),
+                                                                    Color32::from_rgb(229, 192, 123),
+                                                                );
+                                                                content_left + 50.0
+                                                            } else if sug.category == SuggestionCategory::LocationAndGeo {
+                                                                let badge_rect = Rect::from_min_size(Pos2::new(content_left, row_rect.center().y - 9.0), Vec2::new(42.0, 18.0));
+                                                                ui.painter().rect(
+                                                                    badge_rect,
+                                                                    3.0,
+                                                                    Color32::from_rgb(198, 120, 221).gamma_multiply(0.2),
+                                                                    egui::Stroke::new(1.0_f32, Color32::from_rgb(198, 120, 221).gamma_multiply(0.6)),
+                                                                    egui::StrokeKind::Inside,
+                                                                );
+                                                                ui.painter().text(
+                                                                    badge_rect.center(),
+                                                                    egui::Align2::CENTER_CENTER,
+                                                                    "GEO",
+                                                                    egui::FontId::monospace(10.5),
+                                                                    Color32::from_rgb(198, 120, 221),
+                                                                );
+                                                                content_left + 50.0
+                                                            } else if sug.category == SuggestionCategory::LinksAndQuality {
+                                                                let badge_rect = Rect::from_min_size(Pos2::new(content_left, row_rect.center().y - 9.0), Vec2::new(42.0, 18.0));
+                                                                ui.painter().rect(
+                                                                    badge_rect,
+                                                                    3.0,
+                                                                    Color32::from_rgb(86, 182, 194).gamma_multiply(0.2),
+                                                                    egui::Stroke::new(1.0_f32, Color32::from_rgb(86, 182, 194).gamma_multiply(0.6)),
+                                                                    egui::StrokeKind::Inside,
+                                                                );
+                                                                ui.painter().text(
+                                                                    badge_rect.center(),
+                                                                    egui::Align2::CENTER_CENTER,
+                                                                    "QA",
+                                                                    egui::FontId::monospace(10.5),
+                                                                    Color32::from_rgb(86, 182, 194),
+                                                                );
+                                                                content_left + 50.0
                                                             } else {
                                                                 let icon_rect = Rect::from_min_size(Pos2::new(content_left + 2.0, row_rect.center().y - 7.0), Vec2::splat(14.0));
                                                                 match sug.kind {
@@ -588,12 +643,16 @@ pub fn render_breadcrumb_bar(ui: &mut Ui, props: BreadcrumbBarProps) -> Option<B
                                                             };
 
                                                             // 3. Query Label (truncated if exceptionally long)
-                                                            let label_color = if sug.category == SuggestionCategory::EmptyFields {
-                                                                Color32::from_rgb(224, 108, 117)
-                                                            } else if is_hovered {
-                                                                Color32::WHITE
-                                                            } else {
-                                                                Color32::from_rgb(97, 175, 239)
+                                                            let label_color = match sug.category {
+                                                                SuggestionCategory::EmptyFields => Color32::from_rgb(224, 108, 117),
+                                                                SuggestionCategory::BidsAndPricing => Color32::from_rgb(229, 192, 123),
+                                                                SuggestionCategory::LocationAndGeo => Color32::from_rgb(198, 120, 221),
+                                                                SuggestionCategory::LinksAndQuality => Color32::from_rgb(86, 182, 194),
+                                                                _ => if is_hovered {
+                                                                    Color32::WHITE
+                                                                } else {
+                                                                    Color32::from_rgb(97, 175, 239)
+                                                                },
                                                             };
                                                             let label_font = egui::FontId::monospace(13.5);
                                                             let max_label_chars = 48;

@@ -15,6 +15,9 @@ pub enum SuggestionKind {
 pub enum SuggestionCategory {
     #[default]
     All,
+    BidsAndPricing,
+    LocationAndGeo,
+    LinksAndQuality,
     EmptyFields,
     HasData,
     Elements,
@@ -28,6 +31,57 @@ pub struct QuerySuggestion {
     pub query: String,
     pub kind: SuggestionKind,
     pub category: SuggestionCategory,
+}
+
+pub fn is_pricing_tag(tag: &str) -> bool {
+    let lower = tag.to_lowercase();
+    lower.contains("cpc")
+        || lower.contains("bid")
+        || lower.contains("budget")
+        || lower.contains("cost")
+        || lower.contains("price")
+        || lower.contains("rate")
+        || lower.contains("salary")
+        || lower.contains("wage")
+        || lower.contains("compensation")
+        || lower.contains("payout")
+}
+
+pub fn is_location_tag(tag: &str) -> bool {
+    let lower = tag.to_lowercase();
+    lower.contains("state")
+        || lower.contains("country")
+        || lower.contains("city")
+        || lower.contains("location")
+        || lower.contains("zip")
+        || lower.contains("postal")
+        || lower.contains("region")
+        || lower.contains("geo")
+        || lower.contains("address")
+        || lower.contains("nation")
+}
+
+pub fn is_link_tag(tag: &str) -> bool {
+    let lower = tag.to_lowercase();
+    lower.contains("url")
+        || lower.contains("link")
+        || lower.contains("apply")
+        || lower.contains("href")
+        || lower.contains("source")
+        || lower.contains("landing")
+        || lower.contains("click")
+        || lower.contains("redirect")
+}
+
+pub fn is_content_tag(tag: &str) -> bool {
+    let lower = tag.to_lowercase();
+    lower.contains("title")
+        || lower.contains("description")
+        || lower.contains("body")
+        || lower.contains("summary")
+        || lower.contains("headline")
+        || lower.contains("content")
+        || lower.contains("text")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -334,7 +388,212 @@ impl DiscoveredTags {
             });
         };
 
-        // 1. If user typed "empty", generate empty queries for all discovered tags
+        let push_pricing_variants_for_tag = |results: &mut Vec<QuerySuggestion>, tag: &str, rec: &str| {
+            if tag == rec {
+                return;
+            }
+            results.push(QuerySuggestion {
+                label: format!("//{}[{}<=0]", rec, tag),
+                description: format!("Find <{}> where <{}> <= 0 (invalid/missing/zero bid)", rec, tag),
+                query: format!("//{}[{}<=0]", rec, tag),
+                kind: SuggestionKind::Template,
+                category: SuggestionCategory::BidsAndPricing,
+            });
+            results.push(QuerySuggestion {
+                label: format!("//{}[{}>2.0]", rec, tag),
+                description: format!("Find high-bid <{}> where <{}> > $2.00", rec, tag),
+                query: format!("//{}[{}>2.0]", rec, tag),
+                kind: SuggestionKind::Template,
+                category: SuggestionCategory::BidsAndPricing,
+            });
+            results.push(QuerySuggestion {
+                label: format!("//{}[{}<0.50]", rec, tag),
+                description: format!("Find low-bid <{}> where <{}> < $0.50", rec, tag),
+                query: format!("//{}[{}<0.50]", rec, tag),
+                kind: SuggestionKind::Template,
+                category: SuggestionCategory::BidsAndPricing,
+            });
+            results.push(QuerySuggestion {
+                label: format!("//{}[{}>5.0]", rec, tag),
+                description: format!("Find premium-tier <{}> where <{}> > $5.00", rec, tag),
+                query: format!("//{}[{}>5.0]", rec, tag),
+                kind: SuggestionKind::Template,
+                category: SuggestionCategory::BidsAndPricing,
+            });
+            results.push(QuerySuggestion {
+                label: format!("//{}[{}=0]", rec, tag),
+                description: format!("Find free clicks <{}> where <{}> = 0", rec, tag),
+                query: format!("//{}[{}=0]", rec, tag),
+                kind: SuggestionKind::Template,
+                category: SuggestionCategory::BidsAndPricing,
+            });
+        };
+
+        let push_location_variants_for_tag = |results: &mut Vec<QuerySuggestion>, tag: &str, rec: &str| {
+            if tag == rec {
+                return;
+            }
+            let lower = tag.to_lowercase();
+            if lower.contains("country") || lower.contains("nation") {
+                results.push(QuerySuggestion {
+                    label: format!("//{}[{}!='US']", rec, tag),
+                    description: format!("Find international / non-US <{}> (<{}> != 'US')", rec, tag),
+                    query: format!("//{}[{}!='US']", rec, tag),
+                    kind: SuggestionKind::Template,
+                    category: SuggestionCategory::LocationAndGeo,
+                });
+                results.push(QuerySuggestion {
+                    label: format!("//{}[{}='US']", rec, tag),
+                    description: format!("Find US domestic <{}> (<{}> = 'US')", rec, tag),
+                    query: format!("//{}[{}='US']", rec, tag),
+                    kind: SuggestionKind::Template,
+                    category: SuggestionCategory::LocationAndGeo,
+                });
+                results.push(QuerySuggestion {
+                    label: format!("//{}[contains({}, 'Remote')]", rec, tag),
+                    description: format!("Find Remote <{}> via <{}>", rec, tag),
+                    query: format!("//{}[contains({}, 'Remote')]", rec, tag),
+                    kind: SuggestionKind::Template,
+                    category: SuggestionCategory::LocationAndGeo,
+                });
+            } else if lower.contains("state") || lower.contains("region") {
+                results.push(QuerySuggestion {
+                    label: format!("//{}[{}='CA']", rec, tag),
+                    description: format!("Find California <{}> (<{}> = 'CA')", rec, tag),
+                    query: format!("//{}[{}='CA']", rec, tag),
+                    kind: SuggestionKind::Template,
+                    category: SuggestionCategory::LocationAndGeo,
+                });
+                results.push(QuerySuggestion {
+                    label: format!("//{}[{}='TX']", rec, tag),
+                    description: format!("Find Texas <{}> (<{}> = 'TX')", rec, tag),
+                    query: format!("//{}[{}='TX']", rec, tag),
+                    kind: SuggestionKind::Template,
+                    category: SuggestionCategory::LocationAndGeo,
+                });
+                results.push(QuerySuggestion {
+                    label: format!("//{}[string-length({})!=2]", rec, tag),
+                    description: format!("Find non-standard state codes in <{}> (length != 2)", tag),
+                    query: format!("//{}[string-length({})!=2]", rec, tag),
+                    kind: SuggestionKind::Template,
+                    category: SuggestionCategory::LocationAndGeo,
+                });
+            } else if lower.contains("zip") || lower.contains("postal") {
+                results.push(QuerySuggestion {
+                    label: format!("//{}[string-length({})<5]", rec, tag),
+                    description: format!("Find truncated/malformed postal codes in <{}>", tag),
+                    query: format!("//{}[string-length({})<5]", rec, tag),
+                    kind: SuggestionKind::Template,
+                    category: SuggestionCategory::LocationAndGeo,
+                });
+            } else {
+                results.push(QuerySuggestion {
+                    label: format!("//{}[contains({}, 'Remote')]", rec, tag),
+                    description: format!("Find Remote <{}> in <{}>", rec, tag),
+                    query: format!("//{}[contains({}, 'Remote')]", rec, tag),
+                    kind: SuggestionKind::Template,
+                    category: SuggestionCategory::LocationAndGeo,
+                });
+                results.push(QuerySuggestion {
+                    label: format!("//{}[string-length({})<3]", rec, tag),
+                    description: format!("Find suspiciously short location strings in <{}>", tag),
+                    query: format!("//{}[string-length({})<3]", rec, tag),
+                    kind: SuggestionKind::Template,
+                    category: SuggestionCategory::LocationAndGeo,
+                });
+            }
+        };
+
+        let push_link_variants_for_tag = |results: &mut Vec<QuerySuggestion>, tag: &str, rec: &str| {
+            if tag == rec {
+                return;
+            }
+            results.push(QuerySuggestion {
+                label: format!("//{}[not(starts-with({}, 'https://'))]", rec, tag),
+                description: format!("Flag unsecure or non-HTTPS URLs in <{}>", tag),
+                query: format!("//{}[not(starts-with({}, 'https://'))]", rec, tag),
+                kind: SuggestionKind::Template,
+                category: SuggestionCategory::LinksAndQuality,
+            });
+            results.push(QuerySuggestion {
+                label: format!("//{}[not(contains({}, 'utm_source'))]", rec, tag),
+                description: format!("Find URLs in <{}> missing UTM campaign tracking", tag),
+                query: format!("//{}[not(contains({}, 'utm_source'))]", rec, tag),
+                kind: SuggestionKind::Template,
+                category: SuggestionCategory::LinksAndQuality,
+            });
+            results.push(QuerySuggestion {
+                label: format!("//{}[contains({}, 'localhost')]", rec, tag),
+                description: format!("Flag staging/localhost links leaking in <{}>", tag),
+                query: format!("//{}[contains({}, 'localhost')]", rec, tag),
+                kind: SuggestionKind::Template,
+                category: SuggestionCategory::LinksAndQuality,
+            });
+            results.push(QuerySuggestion {
+                label: format!("//{}[string-length({})<15]", rec, tag),
+                description: format!("Flag broken or truncated URLs in <{}>", tag),
+                query: format!("//{}[string-length({})<15]", rec, tag),
+                kind: SuggestionKind::Template,
+                category: SuggestionCategory::LinksAndQuality,
+            });
+        };
+
+        let push_content_quality_variants_for_tag = |results: &mut Vec<QuerySuggestion>, tag: &str, rec: &str| {
+            if tag == rec {
+                return;
+            }
+            results.push(QuerySuggestion {
+                label: format!("//{}[string-length({})<5]", rec, tag),
+                description: format!("Find suspiciously short <{}> (< 5 chars)", tag),
+                query: format!("//{}[string-length({})<5]", rec, tag),
+                kind: SuggestionKind::Template,
+                category: SuggestionCategory::LinksAndQuality,
+            });
+            results.push(QuerySuggestion {
+                label: format!("//{}[contains({}, 'Test')]", rec, tag),
+                description: format!("Find test jobs/records with 'Test' in <{}>", tag),
+                query: format!("//{}[contains({}, 'Test')]", rec, tag),
+                kind: SuggestionKind::Template,
+                category: SuggestionCategory::LinksAndQuality,
+            });
+            results.push(QuerySuggestion {
+                label: format!("//{}[contains({}, '&amp;')]", rec, tag),
+                description: format!("Find unescaped HTML entities in <{}>", tag),
+                query: format!("//{}[contains({}, '&amp;')]", rec, tag),
+                kind: SuggestionKind::Template,
+                category: SuggestionCategory::LinksAndQuality,
+            });
+        };
+
+        let push_semantic_variants_for_tag = |results: &mut Vec<QuerySuggestion>, tag: &str, rec: &str| {
+            if is_pricing_tag(tag) {
+                push_pricing_variants_for_tag(results, tag, rec);
+            }
+            if is_location_tag(tag) {
+                push_location_variants_for_tag(results, tag, rec);
+            }
+            if is_link_tag(tag) {
+                push_link_variants_for_tag(results, tag, rec);
+            }
+            if is_content_tag(tag) {
+                push_content_quality_variants_for_tag(results, tag, rec);
+            }
+        };
+
+        // Determine target active field
+        let is_path_mode = input.contains('/') || input.contains('[');
+        let active_field = if !term.is_empty() {
+            Some(term.as_str())
+        } else {
+            active_tag.as_deref()
+        };
+
+        // 1. High-level topic searches (when user types a keyword in freeform mode)
+        let is_pricing_query = !is_path_mode && (term == "bid" || term == "bids" || term == "cpc" || term == "price" || term == "pricing" || term == "budget" || term == "salary" || term == "cost");
+        let is_geo_query = !is_path_mode && (term == "geo" || term == "location" || term == "state" || term == "country" || term == "nation" || term == "zip" || term == "us");
+        let is_link_query = !is_path_mode && (term == "link" || term == "links" || term == "url" || term == "utm" || term == "http" || term == "https");
+        let is_quality_query = !is_path_mode && (term == "qa" || term == "quality" || term == "test" || term == "check");
+
         if is_empty_query {
             for tag in &self.tags {
                 push_empty_variants_for_tag(&mut results, tag, rec_tag);
@@ -350,22 +609,66 @@ impl DiscoveredTags {
             }
             let mut seen = HashSet::new();
             results.retain(|s| seen.insert(s.query.clone()));
-            results.truncate(50);
+            results.truncate(60);
             return results;
         }
 
-        // Determine target active field
-        let is_path_mode = input.contains('/') || input.contains('[');
-        let active_field = if !term.is_empty() {
-            Some(term.as_str())
-        } else {
-            active_tag.as_deref()
-        };
+        if is_pricing_query {
+            let pricing_tags: Vec<String> = self.tags.iter().filter(|t| is_pricing_tag(t)).cloned().collect();
+            let targets = if !pricing_tags.is_empty() { pricing_tags } else { vec!["cpc".to_string()] };
+            for t in &targets {
+                push_empty_variants_for_tag(&mut results, t, rec_tag);
+                push_pricing_variants_for_tag(&mut results, t, rec_tag);
+            }
+            let mut seen = HashSet::new();
+            results.retain(|s| seen.insert(s.query.clone()));
+            results.truncate(60);
+            return results;
+        }
+
+        if is_geo_query {
+            let geo_tags: Vec<String> = self.tags.iter().filter(|t| is_location_tag(t)).cloned().collect();
+            let targets = if !geo_tags.is_empty() { geo_tags } else { vec!["country".to_string(), "state".to_string()] };
+            for t in &targets {
+                push_empty_variants_for_tag(&mut results, t, rec_tag);
+                push_location_variants_for_tag(&mut results, t, rec_tag);
+            }
+            let mut seen = HashSet::new();
+            results.retain(|s| seen.insert(s.query.clone()));
+            results.truncate(60);
+            return results;
+        }
+
+        if is_link_query {
+            let link_tags: Vec<String> = self.tags.iter().filter(|t| is_link_tag(t)).cloned().collect();
+            let targets = if !link_tags.is_empty() { link_tags } else { vec!["url".to_string()] };
+            for t in &targets {
+                push_empty_variants_for_tag(&mut results, t, rec_tag);
+                push_link_variants_for_tag(&mut results, t, rec_tag);
+            }
+            let mut seen = HashSet::new();
+            results.retain(|s| seen.insert(s.query.clone()));
+            results.truncate(60);
+            return results;
+        }
+
+        if is_quality_query {
+            let content_tags: Vec<String> = self.tags.iter().filter(|t| is_content_tag(t)).cloned().collect();
+            let targets = if !content_tags.is_empty() { content_tags } else { vec!["title".to_string(), "description".to_string()] };
+            for t in &targets {
+                push_empty_variants_for_tag(&mut results, t, rec_tag);
+                push_content_quality_variants_for_tag(&mut results, t, rec_tag);
+            }
+            let mut seen = HashSet::new();
+            results.retain(|s| seen.insert(s.query.clone()));
+            results.truncate(60);
+            return results;
+        }
 
         // 2. Active field queries prioritized first
         if let Some(target) = active_field {
             if target == rec_tag {
-                // If on container/record element (e.g. <job>), suggest matching container + empty checks for all children
+                // If on container/record element (e.g. <job>), suggest matching container + checks for all children
                 results.push(QuerySuggestion {
                     label: format!("//{}", rec_tag),
                     description: format!("Match all <{}> records in document", rec_tag),
@@ -376,6 +679,7 @@ impl DiscoveredTags {
                 for tag in &self.tags {
                     if tag != rec_tag && Some(tag) != self.root_tag.as_ref() {
                         push_empty_variants_for_tag(&mut results, tag, rec_tag);
+                        push_semantic_variants_for_tag(&mut results, tag, rec_tag);
                         results.push(QuerySuggestion {
                             label: format!("//{}[normalize-space({})!='']", rec_tag, tag),
                             description: format!("Find <{}> where <{}> has valid content", rec_tag, tag),
@@ -388,9 +692,12 @@ impl DiscoveredTags {
             } else {
                 // Focused on a specific field tag (e.g. <title> or <cpc>)
                 push_empty_variants_for_tag(&mut results, target, rec_tag);
+                push_semantic_variants_for_tag(&mut results, target, rec_tag);
+
                 if let Some(immediate_parent) = parent_from_path {
                     if immediate_parent != rec_tag && immediate_parent != target {
                         push_empty_variants_for_tag(&mut results, target, immediate_parent);
+                        push_semantic_variants_for_tag(&mut results, target, immediate_parent);
                     }
                 }
                 results.push(QuerySuggestion {
@@ -427,6 +734,7 @@ impl DiscoveredTags {
                     for tag in &self.tags {
                         if tag != rec_tag && tag != target && Some(tag) != self.root_tag.as_ref() {
                             push_empty_variants_for_tag(&mut results, tag, rec_tag);
+                            push_semantic_variants_for_tag(&mut results, tag, rec_tag);
                             results.push(QuerySuggestion {
                                 label: format!("//{}", tag),
                                 description: format!("Match all <{}> elements", tag),
@@ -455,6 +763,7 @@ impl DiscoveredTags {
                     matched_any_tag = true;
                     if tag != rec_tag {
                         push_empty_variants_for_tag(&mut results, tag, rec_tag);
+                        push_semantic_variants_for_tag(&mut results, tag, rec_tag);
                     }
                     results.push(QuerySuggestion {
                         label: format!("//{}", tag),
@@ -476,7 +785,7 @@ impl DiscoveredTags {
             }
         }
 
-        // 4. Fallback: If user typed an arbitrary field name not in sample (e.g. "title")
+        // 4. Fallback: If user typed an arbitrary field name not in sample (e.g. "salary")
         let is_valid_ident = !term.is_empty()
             && term.len() >= 2
             && term.len() <= 32
@@ -491,6 +800,7 @@ impl DiscoveredTags {
 
         if !matched_any_tag && is_valid_ident {
             push_empty_variants_for_tag(&mut results, &term, rec_tag);
+            push_semantic_variants_for_tag(&mut results, &term, rec_tag);
             results.push(QuerySuggestion {
                 label: format!("//{}", term),
                 description: format!("Match all <{}> elements", term),
@@ -548,10 +858,10 @@ impl DiscoveredTags {
             }
         }
 
-        // Deduplicate suggestions by query string and cap to 60 items
+        // Deduplicate suggestions by query string and cap to 80 items
         let mut seen = HashSet::new();
         results.retain(|s| seen.insert(s.query.clone()));
-        results.truncate(60);
+        results.truncate(80);
         results
     }
 
@@ -610,6 +920,42 @@ impl DiscoveredTags {
                     category: SuggestionCategory::HasData,
                 });
 
+                // Pricing templates
+                if is_pricing_tag(key) {
+                    results.push(QuerySuggestion {
+                        label: format!("$[?(@.{} <= 0)]", key),
+                        description: format!("Find records where '{}' <= 0 (invalid/zero bid)", key),
+                        query: format!("$[?(@.{} <= 0)]", key),
+                        kind: SuggestionKind::Template,
+                        category: SuggestionCategory::BidsAndPricing,
+                    });
+                    results.push(QuerySuggestion {
+                        label: format!("$[?(@.{} > 2.0)]", key),
+                        description: format!("Find high-bid records where '{}' > 2.00", key),
+                        query: format!("$[?(@.{} > 2.0)]", key),
+                        kind: SuggestionKind::Template,
+                        category: SuggestionCategory::BidsAndPricing,
+                    });
+                }
+
+                // Location templates
+                if is_location_tag(key) {
+                    results.push(QuerySuggestion {
+                        label: format!("$[?(@.{} != 'US')]", key),
+                        description: format!("Find international / non-US records ('{}' != 'US')", key),
+                        query: format!("$[?(@.{} != 'US')]", key),
+                        kind: SuggestionKind::Template,
+                        category: SuggestionCategory::LocationAndGeo,
+                    });
+                    results.push(QuerySuggestion {
+                        label: format!("$[?(@.{} == 'US')]", key),
+                        description: format!("Find US domestic records ('{}' == 'US')", key),
+                        query: format!("$[?(@.{} == 'US')]", key),
+                        kind: SuggestionKind::Template,
+                        category: SuggestionCategory::LocationAndGeo,
+                    });
+                }
+
                 // Elements and Paths
                 results.push(QuerySuggestion {
                     label: format!("$.{}", key),
@@ -637,7 +983,7 @@ impl DiscoveredTags {
 
         let mut seen = HashSet::new();
         results.retain(|s| seen.insert(s.query.clone()));
-        results.truncate(40);
+        results.truncate(60);
         results
     }
 }
@@ -769,6 +1115,53 @@ mod tests {
         assert!(!sugs.is_empty());
         assert!(sugs.iter().any(|s| s.query == "$[?(!@.title || @.title == '')]"));
         assert!(sugs.iter().any(|s| s.query == "$.title"));
+    }
+
+    #[test]
+    fn test_pricing_suggestions_for_cpc() {
+        let mut disc = DiscoveredTags::default();
+        disc.record_tag = Some("job".to_string());
+        disc.tags = vec!["job".to_string(), "title".to_string(), "cpc".to_string()];
+
+        let sugs = disc.suggest("cpc", None, Some(FileType::Xml));
+        assert!(!sugs.is_empty());
+
+        let pricing_sugs: Vec<_> = sugs.iter().filter(|s| s.category == SuggestionCategory::BidsAndPricing).collect();
+        assert!(pricing_sugs.iter().any(|s| s.query == "//job[cpc<=0]"));
+        assert!(pricing_sugs.iter().any(|s| s.query == "//job[cpc>2.0]"));
+        assert!(pricing_sugs.iter().any(|s| s.query == "//job[cpc<0.50]"));
+        assert!(pricing_sugs.iter().any(|s| s.query == "//job[cpc=0]"));
+    }
+
+    #[test]
+    fn test_location_suggestions_for_country_and_state() {
+        let mut disc = DiscoveredTags::default();
+        disc.record_tag = Some("job".to_string());
+        disc.tags = vec!["job".to_string(), "country".to_string(), "state".to_string()];
+
+        let sugs_country = disc.suggest("country", None, Some(FileType::Xml));
+        let geo_country: Vec<_> = sugs_country.iter().filter(|s| s.category == SuggestionCategory::LocationAndGeo).collect();
+        assert!(geo_country.iter().any(|s| s.query == "//job[country!='US']"));
+        assert!(geo_country.iter().any(|s| s.query == "//job[country='US']"));
+
+        let sugs_state = disc.suggest("state", None, Some(FileType::Xml));
+        let geo_state: Vec<_> = sugs_state.iter().filter(|s| s.category == SuggestionCategory::LocationAndGeo).collect();
+        assert!(geo_state.iter().any(|s| s.query == "//job[state='CA']"));
+        assert!(geo_state.iter().any(|s| s.query == "//job[state='TX']"));
+        assert!(geo_state.iter().any(|s| s.query == "//job[string-length(state)!=2]"));
+    }
+
+    #[test]
+    fn test_link_quality_suggestions_for_url() {
+        let mut disc = DiscoveredTags::default();
+        disc.record_tag = Some("job".to_string());
+        disc.tags = vec!["job".to_string(), "url".to_string()];
+
+        let sugs = disc.suggest("url", None, Some(FileType::Xml));
+        let link_sugs: Vec<_> = sugs.iter().filter(|s| s.category == SuggestionCategory::LinksAndQuality).collect();
+        assert!(link_sugs.iter().any(|s| s.query == "//job[not(starts-with(url, 'https://'))]"));
+        assert!(link_sugs.iter().any(|s| s.query == "//job[not(contains(url, 'utm_source'))]"));
+        assert!(link_sugs.iter().any(|s| s.query == "//job[contains(url, 'localhost')]"));
     }
 }
 
