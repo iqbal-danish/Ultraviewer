@@ -27,15 +27,22 @@ impl Default for AppSession {
 
 impl AppSession {
     fn session_file_path() -> Option<PathBuf> {
-        let app_dir = if let Ok(appdata) = std::env::var("APPDATA") {
-            PathBuf::from(appdata).join("UltraViewer")
-        } else if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-            PathBuf::from(home).join(".ultraviewer")
-        } else {
+        #[cfg(test)]
+        {
             return None;
-        };
-        let _ = fs::create_dir_all(&app_dir);
-        Some(app_dir.join("session.txt"))
+        }
+        #[cfg(not(test))]
+        {
+            let app_dir = if let Ok(appdata) = std::env::var("APPDATA") {
+                PathBuf::from(appdata).join("UltraViewer")
+            } else if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+                PathBuf::from(home).join(".ultraviewer")
+            } else {
+                return None;
+            };
+            let _ = fs::create_dir_all(&app_dir);
+            Some(app_dir.join("session.txt"))
+        }
     }
 
     pub fn load() -> Self {

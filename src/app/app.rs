@@ -4486,6 +4486,14 @@ impl UltraViewerApp {
     }
 
 
+    pub fn is_description_tag_name(tag: &str) -> bool {
+        let lower = tag.to_ascii_lowercase();
+        matches!(
+            lower.as_str(),
+            "description" | "job_description" | "job-description" | "jobbody" | "job_body" | "jobdesc" | "body"
+        )
+    }
+
     pub fn find_last_description_open(bytes: &[u8]) -> Option<usize> {
         let needle = b"<description";
         let n = bytes.len();
@@ -4603,10 +4611,8 @@ impl UltraViewerApp {
             return None;
         };
 
-        if self.fold_all_descriptions {
-            if self.unfolded_lines_override.contains(&line_no) {
-                return None;
-            }
+        // 1. Manually folded lines
+        if self.folded_lines.contains(&line_no) {
             if let Some(&cached) = self.folding_end_cache.get(&line_no) {
                 if cached > line_no {
                     return Some(cached);
@@ -4618,30 +4624,57 @@ impl UltraViewerApp {
                     let end_pos = memchr::memchr(b'\n', bytes).unwrap_or(bytes.len());
                     let line_str = String::from_utf8_lossy(&bytes[..end_pos]);
                     let trimmed = line_str.trim();
-                    if trimmed.starts_with("<description") {
-                        let (opens, closes) = Self::count_exact_xml_tags(trimmed, "description");
-                        if opens > closes {
-                            let close_needle = b"</description>";
-                            let forward_len = (2_097_152).min((engine.size().saturating_sub(offset)) as usize);
-                            if let Ok(f_bytes) = engine.read_range(offset, forward_len) {
-                                if let Some(pos) = f_bytes.windows(close_needle.len()).position(|w| w == close_needle) {
-                                    let close_abs = offset + pos as u64 + close_needle.len() as u64;
-                                    let end_line = index.byte_offset_to_line(engine, close_abs);
-                                    if end_line > line_no {
-                                        self.folding_end_cache.insert(line_no, end_line);
-                                        self.enclosing_description_cache.insert(line_no, end_line);
-                                        return Some(end_line);
-                                    }
+                    if let Some(tag_name) = Self::extract_tag_name(trimmed) {
+                        let close_needle = format!("</{}>", tag_name);
+                        let forward_len = (2_097_152).min((engine.size().saturating_sub(offset)) as usize);
+                        if let Ok(f_bytes) = engine.read_range(offset, forward_len) {
+                            if let Some(pos) = f_bytes.windows(close_needle.len()).position(|w| w == close_needle.as_bytes()) {
+                                let close_abs = offset + pos as u64 + close_needle.len() as u64;
+                                let end_line = index.byte_offset_to_line(engine, close_abs);
+                                if end_line > line_no {
+                                    self.folding_end_cache.insert(line_no, end_line);
+                                    return Some(end_line);
                                 }
                             }
                         }
                     }
                 }
             }
-        } else if self.folded_lines.contains(&line_no) {
-            if let Some(&cached) = self.folding_end_cache.get(&line_no) {
+        }
+
+        // 2. Automatically folded descriptions (ONLY description tags)
+        if self.fold_all_descriptions && !self.unfolded_lines_override.contains(&line_no) {
+            if let Some(&cached) = self.enclosing_description_cache.get(&line_no) {
                 if cached > line_no {
                     return Some(cached);
+                }
+            }
+            if let Some(offset) = index.line_to_byte_offset(engine, line_no) {
+                let scan_len = (4096).min((engine.size().saturating_sub(offset)) as usize);
+                if let Ok(bytes) = engine.read_range(offset, scan_len) {
+                    let end_pos = memchr::memchr(b'\n', bytes).unwrap_or(bytes.len());
+                    let line_str = String::from_utf8_lossy(&bytes[..end_pos]);
+                    let trimmed = line_str.trim();
+                    if let Some(tag_name) = Self::extract_tag_name(trimmed) {
+                        if Self::is_description_tag_name(&tag_name) {
+                            let (opens, closes) = Self::count_exact_xml_tags(trimmed, &tag_name);
+                            if opens > closes {
+                                let close_needle = format!("</{}>", tag_name);
+                                let forward_len = (2_097_152).min((engine.size().saturating_sub(offset)) as usize);
+                                if let Ok(f_bytes) = engine.read_range(offset, forward_len) {
+                                    if let Some(pos) = f_bytes.windows(close_needle.len()).position(|w| w == close_needle.as_bytes()) {
+                                        let close_abs = offset + pos as u64 + close_needle.len() as u64;
+                                        let end_line = index.byte_offset_to_line(engine, close_abs);
+                                        if end_line > line_no {
+                                            self.folding_end_cache.insert(line_no, end_line);
+                                            self.enclosing_description_cache.insert(line_no, end_line);
+                                            return Some(end_line);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -4721,18 +4754,23 @@ impl UltraViewerApp {
                         let line_text = String::from_utf8_lossy(line_raw).into_owned();
                         let trimmed = line_text.trim();
 
-                        let starts_desc_fold = if self.fold_all_descriptions && !self.unfolded_lines_override.contains(&chunk_line_num) {
-                            if trimmed.starts_with("<description") {
-                                let (opens, closes) = Self::count_exact_xml_tags(trimmed, "description");
-                                opens > closes
+                        let is_desc_fold = if self.fold_all_descriptions && !self.unfolded_lines_override.contains(&chunk_line_num) {
+                            if let Some(tag_name) = Self::extract_tag_name(trimmed) {
+                                if Self::is_description_tag_name(&tag_name) {
+                                    let (opens, closes) = Self::count_exact_xml_tags(trimmed, &tag_name);
+                                    opens > closes
+                                } else {
+                                    false
+                                }
                             } else {
                                 false
                             }
                         } else {
-                            self.folded_lines.contains(&chunk_line_num)
+                            false
                         };
+                        let starts_fold = is_desc_fold || self.folded_lines.contains(&chunk_line_num);
 
-                        if starts_desc_fold {
+                        if starts_fold {
                             curr_line = chunk_line_num;
                             hit_fold = true;
                             break;
@@ -4754,7 +4792,12 @@ impl UltraViewerApp {
                     }
                 }
 
-                if !hit_fold {
+                if hit_fold {
+                    // Safety check: ensure curr_line advances even if is_line_folded_header cannot find close tag
+                    if self.is_line_folded_header(curr_line).is_none() {
+                        curr_line += 1;
+                    }
+                } else {
                     if chunk_line_num == curr_line {
                         curr_line += 1;
                     } else {
@@ -4848,21 +4891,20 @@ impl UltraViewerApp {
             let new_line = if self.fold_all_descriptions && !self.viewport.lines.is_empty() {
                 if delta > 0 {
                     let steps = delta as usize;
-                    if let Some(pos) = self.viewport.lines.iter().position(|l| l.line_number == self.current_line) {
-                        let target_idx = pos + steps;
-                        if target_idx < self.viewport.lines.len() {
-                            self.viewport.lines[target_idx].line_number
-                        } else {
-                            let last = self.viewport.lines.last().map(|l| l.line_number).unwrap_or(self.current_line);
-                            last.saturating_add(target_idx - (self.viewport.lines.len() - 1)).min(max_line)
-                        }
-                    } else if steps < self.viewport.lines.len() {
-                        self.viewport.lines[steps].line_number
+                    let first_line = self.viewport.lines.first().map(|l| l.line_number).unwrap_or(self.current_line);
+                    let base_idx = self.viewport.lines.iter().position(|l| l.line_number == self.current_line)
+                        .or_else(|| self.viewport.lines.iter().position(|l| l.line_number == first_line))
+                        .unwrap_or(0);
+                    let target_idx = base_idx + steps;
+                    if target_idx < self.viewport.lines.len() {
+                        self.viewport.lines[target_idx].line_number
                     } else {
-                        self.viewport.lines.last().map(|l| l.line_number).unwrap_or_else(|| self.current_line.saturating_add(steps).min(max_line))
+                        let last = self.viewport.lines.last().map(|l| l.line_number).unwrap_or(self.current_line);
+                        last.saturating_add(target_idx - (self.viewport.lines.len() - 1)).min(max_line)
                     }
                 } else {
-                    let mut curr = self.current_line;
+                    let top_line = self.viewport.lines.first().map(|l| l.line_number).unwrap_or(self.current_line);
+                    let mut curr = top_line;
                     let steps = (-delta) as usize;
                     for _ in 0..steps {
                         if curr <= 1 {
@@ -7710,7 +7752,7 @@ fn find_folding_end_extended(
             ) {
                 if end_line > line_no {
                     let tag_name = Self::extract_tag_name(&line.text);
-                    let is_desc = tag_name.as_deref() == Some("description");
+                    let is_desc = tag_name.as_deref().map_or(false, Self::is_description_tag_name);
                     let is_folded = if self.fold_all_descriptions && is_desc {
                         !self.unfolded_lines_override.contains(&line_no)
                     } else {
@@ -7785,18 +7827,19 @@ fn find_folding_end_extended(
 
         ui.allocate_rect(available_rect, Sense::hover());
 
+        let max_line_str = format_number(total_lines as u64);
+        let max_digits = max_line_str.len().max(5);
+        let char_w = ui.fonts(|f| f.glyph_width(&line_num_font, '0')).max(7.5);
+        let arrow_w = 16.0;
+        let num_col_w = (max_digits as f32 * char_w).max(42.0);
+        let chevron_w = 18.0;
+        let gutter_w = arrow_w + num_col_w + chevron_w + 14.0;
+
         {
             let mut vp_ui = ui.new_child(egui::UiBuilder::new().max_rect(viewport_rect).layout(egui::Layout::left_to_right(egui::Align::Min)));
             vp_ui.set_clip_rect(viewport_rect);
             let ui = &mut vp_ui;
             self.editor_viewport_rect = Some(viewport_rect);
-            let max_line_str = format_number(total_lines as u64);
-            let max_digits = max_line_str.len().max(5);
-            let char_w = ui.fonts(|f| f.glyph_width(&line_num_font, '0')).max(7.5);
-            let arrow_w = 16.0;
-            let num_col_w = (max_digits as f32 * char_w).max(42.0);
-            let chevron_w = 18.0;
-            let gutter_w = arrow_w + num_col_w + chevron_w + 14.0;
 
                     if word_wrap {
                         // Word Wrap ON: Virtualized vertical line window with per-line horizontal rows
@@ -8632,7 +8675,7 @@ fn find_folding_end_extended(
             let is_desc_line = self.viewport.lines.iter()
                 .find(|l| l.line_number == fold_line)
                 .and_then(|l| Self::extract_tag_name(&l.text))
-                .as_deref() == Some("description");
+                .map_or(false, |t| Self::is_description_tag_name(&t));
 
             if self.fold_all_descriptions && is_desc_line {
                 if self.unfolded_lines_override.contains(&fold_line) {
@@ -8647,7 +8690,13 @@ fn find_folding_end_extended(
                     self.folded_lines.insert(fold_line);
                 }
             }
-            self.scroll_to_line(self.current_line);
+            // Anchor to the top visible line on screen so unfolding/folding never causes the view to jump
+            let top_line = self.viewport.lines.first().map(|l| l.line_number).unwrap_or(self.current_line);
+            self.scroll_to_line(top_line);
+            self.current_line = top_line;
+            focused_line = None;
+            self.active_edit_line = None;
+            self.pending_focus_line = None;
         }
 
         if let Some(line) = drag_start_detected {
@@ -8672,7 +8721,8 @@ fn find_folding_end_extended(
             ui.ctx().memory_mut(|m| m.stop_text_input());
         }
         if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-            if primary_pressed && viewport_rect.contains(pos) && focused_line.is_none() && !self.gutter_drag_active && self.active_edit_line.is_none() {
+            let is_in_gutter = pos.x < content_origin.x + gutter_w;
+            if primary_pressed && viewport_rect.contains(pos) && !is_in_gutter && toggle_fold_for.is_none() && focused_line.is_none() && !self.gutter_drag_active && self.active_edit_line.is_none() {
                 let target_line = self.viewport.lines.last().map(|l| l.line_number).unwrap_or(1);
                 let text = self.viewport.lines.iter().find(|l| l.line_number == target_line)
                     .map(|l| l.text.clone())
@@ -9382,6 +9432,146 @@ mod tests {
     }
 
     #[test]
+    fn test_scroll_virtualized_description_folding() {
+        let path = std::path::Path::new(r"C:\Users\diqbal\Downloads\09a4645a686303ef1744.xml");
+        if !path.exists() {
+            return;
+        }
+        let mut app = UltraViewerApp::default();
+        app.open_file(path.to_path_buf());
+        app.fold_all_descriptions = true;
+        app.scroll_to_line(8416);
+
+        // Ensure lines are non-empty and strictly sorted ascending
+        assert!(!app.viewport.lines.is_empty());
+        for i in 1..app.viewport.lines.len() {
+            assert!(app.viewport.lines[i].line_number > app.viewport.lines[i - 1].line_number);
+        }
+
+        // Scroll forward (down) 10 times
+        for _ in 0..10 {
+            app.scroll_lines(5);
+            assert!(!app.viewport.lines.is_empty());
+            for i in 1..app.viewport.lines.len() {
+                assert!(app.viewport.lines[i].line_number > app.viewport.lines[i - 1].line_number);
+            }
+        }
+
+        // Scroll backward (up) 10 times
+        for _ in 0..10 {
+            app.scroll_lines(-5);
+            assert!(!app.viewport.lines.is_empty());
+            for i in 1..app.viewport.lines.len() {
+                assert!(app.viewport.lines[i].line_number > app.viewport.lines[i - 1].line_number);
+            }
+        }
+    }
+
+    #[test]
+    fn test_job_not_folded_when_cached_in_folding_end_cache() {
+        let path = std::path::Path::new(r"C:\Users\diqbal\Downloads\09a4645a686303ef1744.xml");
+        if !path.exists() {
+            return;
+        }
+        let mut app = UltraViewerApp::default();
+        app.open_file(path.to_path_buf());
+        app.fold_all_descriptions = true;
+
+        // Simulate gutter chevron detection caching `<job>` and other non-description tags
+        app.folding_end_cache.insert(9, 100);
+        app.folding_end_cache.insert(101, 131);
+        app.folding_end_cache.insert(132, 162);
+        app.folding_end_cache.insert(163, 286);
+        app.folding_end_cache.insert(287, 317);
+
+        app.scroll_to_line(1);
+
+        // Verify that line 9 (<job>) did NOT fold into line 101 (<job>)!
+        // The children inside <job> (like <title>, <company>, etc.) must be visible!
+        let line_numbers: Vec<usize> = app.viewport.lines.iter().map(|l| l.line_number).collect();
+        assert!(line_numbers.contains(&9), "Viewport must contain line 9 (<job>)");
+        assert!(line_numbers.contains(&10), "Viewport must contain line 10 (<title>) inside <job>");
+        assert!(!line_numbers.iter().all(|&ln| app.folding_end_cache.contains_key(&ln)), "Viewport must not solely contain <job> headers");
+
+        // Rigid test: simulate continuous scrolling down 40 times (200 lines equivalent)
+        for step in 0..40 {
+            app.scroll_lines(5);
+            assert!(!app.viewport.lines.is_empty(), "Viewport cannot be empty at step {}", step);
+
+            // Ensure strictly ascending line numbers
+            for i in 1..app.viewport.lines.len() {
+                assert!(
+                    app.viewport.lines[i].line_number > app.viewport.lines[i - 1].line_number,
+                    "Line numbers must strictly increase at step {}: prev={}, curr={}",
+                    step,
+                    app.viewport.lines[i - 1].line_number,
+                    app.viewport.lines[i].line_number
+                );
+            }
+
+            // Ensure we do NOT see only `<job>` tags in the viewport
+            let job_count = app.viewport.lines.iter().filter(|l| l.text.trim().starts_with("<job")).count();
+            let total_count = app.viewport.lines.len();
+            assert!(
+                job_count < total_count / 2,
+                "Step {}: viewport should not be dominated by <job> tags alone! (job_count={}, total={})",
+                step,
+                job_count,
+                total_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_description_tag_name_variants() {
+        assert!(UltraViewerApp::is_description_tag_name("description"));
+        assert!(UltraViewerApp::is_description_tag_name("Description"));
+        assert!(UltraViewerApp::is_description_tag_name("body"));
+        assert!(UltraViewerApp::is_description_tag_name("Body"));
+        assert!(UltraViewerApp::is_description_tag_name("jobbody"));
+        assert!(UltraViewerApp::is_description_tag_name("job_body"));
+        assert!(UltraViewerApp::is_description_tag_name("job_description"));
+        assert!(UltraViewerApp::is_description_tag_name("job-description"));
+        assert!(UltraViewerApp::is_description_tag_name("jobdesc"));
+        assert!(!UltraViewerApp::is_description_tag_name("job"));
+        assert!(!UltraViewerApp::is_description_tag_name("title"));
+        assert!(!UltraViewerApp::is_description_tag_name("campaign"));
+    }
+
+    #[test]
+    fn test_unfold_description_anchors_viewport() {
+        let path = std::path::Path::new(r"C:\Users\diqbal\Downloads\09a4645a686303ef1744.xml");
+        if !path.exists() {
+            return;
+        }
+        let mut app = UltraViewerApp::default();
+        app.open_file(path.to_path_buf());
+        app.fold_all_descriptions = true;
+        app.scroll_to_line(1);
+
+        // Before unfolding, line 11 is folded
+        let first_before = app.viewport.lines.first().map(|l| l.line_number).unwrap();
+        assert_eq!(first_before, 1);
+        let has_line_12_before = app.viewport.lines.iter().any(|l| l.line_number == 12);
+        assert!(!has_line_12_before, "Line 12 should be hidden when line 11 description is folded");
+
+        // Simulate unfolding line 11 (chevron click)
+        app.unfolded_lines_override.insert(11);
+        let top_line = app.viewport.lines.first().map(|l| l.line_number).unwrap_or(app.current_line);
+        app.scroll_to_line(top_line);
+        app.current_line = top_line;
+
+        // Viewport must remain anchored to line 1 and not jump to later jobs
+        let first_after = app.viewport.lines.first().map(|l| l.line_number).unwrap();
+        assert_eq!(first_after, 1, "Viewport must remain anchored at line 1 after unfolding line 11");
+        assert_eq!(app.current_line, 1);
+
+        // Now line 12 (unfolded body) must be present in the viewport
+        let has_line_12_after = app.viewport.lines.iter().any(|l| l.line_number == 12);
+        assert!(has_line_12_after, "Line 12 should now be visible after unfolding line 11");
+    }
+
+    #[test]
     fn test_extract_sample_xml_with_record_tag() {
         let xml = r#"<source>
   <publisher>Acme Corp</publisher>
@@ -10034,6 +10224,11 @@ mod tests {
 
         // Open virtual slice in new tab
         app.open_virtual_slice_in_new_tab();
+        if let Some(ref idx) = app.line_index {
+            while !idx.is_complete() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
 
         // 2 tabs now
         assert_eq!(app.tabs.len(), 2);
@@ -10072,6 +10267,11 @@ mod tests {
 
         let mut app = UltraViewerApp::default();
         app.do_open_file(&file_path);
+        if let Some(ref idx) = app.line_index {
+            while !idx.is_complete() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
 
         assert!(!app.hex_viewer.is_enabled);
         assert_eq!(app.get_total_lines(), 4);
