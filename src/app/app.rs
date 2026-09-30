@@ -221,6 +221,7 @@ pub struct UltraViewerApp {
     pub fold_all_descriptions: bool,
     pub unfolded_lines_override: HashSet<usize>,
     pub folding_end_cache: std::collections::HashMap<usize, usize>,
+    pub enclosing_description_cache: std::collections::BTreeMap<usize, usize>,
     pub selection_anchor: Option<usize>,
     pub selection_anchor_col: Option<usize>,
     pub selection_head: Option<usize>,
@@ -390,6 +391,7 @@ impl Default for UltraViewerApp {
             fold_all_descriptions: false,
             unfolded_lines_override: HashSet::new(),
             folding_end_cache: std::collections::HashMap::new(),
+            enclosing_description_cache: std::collections::BTreeMap::new(),
             selection_anchor: None,
             selection_anchor_col: None,
             selection_head: None,
@@ -2082,6 +2084,7 @@ impl UltraViewerApp {
             self.fold_all_descriptions = tab.fold_all_descriptions;
             self.unfolded_lines_override = tab.unfolded_lines_override.clone();
             self.folding_end_cache.clear();
+            self.enclosing_description_cache.clear();
             self.selection_anchor = tab.selection_anchor;
             self.selection_head = tab.selection_head;
             self.current_xpath = tab.current_xpath.clone();
@@ -2231,6 +2234,7 @@ impl UltraViewerApp {
         self.fold_all_descriptions = false;
         self.unfolded_lines_override.clear();
         self.folding_end_cache.clear();
+        self.enclosing_description_cache.clear();
     }
 
     fn cancel_tree_builders(&mut self) {
@@ -2989,6 +2993,17 @@ impl UltraViewerApp {
         self.fold_all_descriptions = !self.fold_all_descriptions;
         self.unfolded_lines_override.clear();
         self.folding_end_cache.clear();
+        self.enclosing_description_cache.clear();
+
+        if self.fold_all_descriptions {
+            if let Some((start, end)) = self.find_enclosing_description_range(self.current_line) {
+                if self.current_line > start && self.current_line <= end {
+                    self.current_line = start;
+                }
+            }
+        }
+        self.scroll_to_line(self.current_line);
+
         let msg = if self.fold_all_descriptions {
             "Folded all <description> tags (Ctrl+Alt+D to toggle)"
         } else {
@@ -3002,6 +3017,8 @@ impl UltraViewerApp {
         self.folded_lines.clear();
         self.unfolded_lines_override.clear();
         self.folding_end_cache.clear();
+        self.enclosing_description_cache.clear();
+        self.scroll_to_line(self.current_line);
         self.status_notification = Some(("Unfolded all folded blocks".to_string(), Instant::now()));
     }
 
@@ -4469,48 +4486,349 @@ impl UltraViewerApp {
     }
 
 
-    pub fn scroll_to_line(&mut self, target_line: usize) {
-        if let (Some(ref engine), Some(ref index)) = (&self.engine, &self.line_index) {
-            let max_line = if let Some(ref slice) = self.active_slice {
-                slice.line_count().max(1)
-            } else {
-                let delta = self.document.as_ref().map_or(0, |d| d.total_lines_delta);
-                ((index.total_lines() as i64 + delta).max(1)) as usize
-            };
-            let clamped = target_line.clamp(1, max_line);
-            self.current_line = clamped;
-            if let Some(ref slice) = self.active_slice {
-                self.viewport.load_virtual_lines(engine, index, slice, clamped, VISIBLE_LINE_BUFFER);
-            } else {
-                let is_dirty = self.document.as_ref().map_or(false, |d| d.is_dirty());
-                if is_dirty {
-                    let first_line = self.viewport.lines.first().map(|l| l.line_number).unwrap_or(0);
-                    if first_line != clamped || self.viewport.lines.is_empty() {
-                        if let Some(ref doc) = self.document {
-                            // Compute offset for clamped line in the piece table
-                            let start_offset = if clamped <= 1 {
-                                0
-                            } else if let Some(l) = self.viewport.lines.iter().find(|l| l.line_number == clamped) {
-                                l.byte_offset
-                            } else {
-                                let (so, _) = Self::piece_table_line_offsets_pair(&doc.piece_table, engine, clamped, clamped);
-                                so.unwrap_or(0)
-                            };
-                            let window_bytes = (VISIBLE_LINE_BUFFER * 512).max(65536);
-                            self.viewport.load_from_piece_table(&doc.piece_table, engine, start_offset, window_bytes, clamped);
-                        }
+    pub fn find_last_description_open(bytes: &[u8]) -> Option<usize> {
+        let needle = b"<description";
+        let n = bytes.len();
+        let n_len = needle.len();
+        let mut search_end = n;
+        while search_end >= n_len {
+            if let Some(pos) = bytes[..search_end].windows(n_len).rposition(|w| w == needle) {
+                let next_idx = pos + n_len;
+                if next_idx == n || bytes[next_idx] == b'>' || bytes[next_idx] == b'/' || bytes[next_idx].is_ascii_whitespace() {
+                    if pos == 0 || bytes[pos - 1] != b'/' {
+                        return Some(pos);
                     }
+                }
+                search_end = pos;
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    pub fn find_last_description_close(bytes: &[u8]) -> Option<usize> {
+        let needle = b"</description";
+        let n = bytes.len();
+        let n_len = needle.len();
+        let mut search_end = n;
+        while search_end >= n_len {
+            if let Some(pos) = bytes[..search_end].windows(n_len).rposition(|w| w == needle) {
+                let next_idx = pos + n_len;
+                if next_idx == n || bytes[next_idx] == b'>' || bytes[next_idx].is_ascii_whitespace() {
+                    return Some(pos);
+                }
+                search_end = pos;
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    pub fn find_enclosing_description_range(&mut self, line_no: usize) -> Option<(usize, usize)> {
+        if !self.fold_all_descriptions {
+            return None;
+        }
+
+        // 1. Check in-memory range cache (BTreeMap lookup in O(log N))
+        if let Some((&start, &end)) = self.enclosing_description_cache.range(..=line_no).next_back() {
+            if line_no <= end {
+                if self.unfolded_lines_override.contains(&start) {
+                    return None;
+                }
+                return Some((start, end));
+            }
+        }
+
+        let (Some(ref engine), Some(ref index)) = (&self.engine, &self.line_index) else {
+            return None;
+        };
+
+        let line_offset = index.line_to_byte_offset(engine, line_no)?;
+        // Scan backwards up to 262,144 bytes (256 KB)
+        let scan_back = 262_144.min(line_offset) as usize;
+        let start_scan = line_offset.saturating_sub(scan_back as u64);
+        let bytes = engine.read_range(start_scan, scan_back).ok()?;
+
+        let last_open_rel = Self::find_last_description_open(bytes);
+        let last_close_rel = Self::find_last_description_close(bytes);
+
+        if let Some(open_rel) = last_open_rel {
+            let is_unclosed = match last_close_rel {
+                Some(close_rel) => open_rel > close_rel,
+                None => true,
+            };
+            if is_unclosed {
+                let open_abs = start_scan + open_rel as u64;
+                let desc_start_line = index.byte_offset_to_line(engine, open_abs);
+
+                let close_needle = b"</description>";
+                let close_abs = {
+                    let forward_len = (2_097_152).min(engine.size().saturating_sub(open_abs) as usize);
+                    if let Ok(f_bytes) = engine.read_range(open_abs, forward_len) {
+                        f_bytes.windows(close_needle.len())
+                            .position(|w| w == close_needle)
+                            .map(|p| open_abs + p as u64 + close_needle.len() as u64)
+                    } else {
+                        None
+                    }
+                };
+
+                let desc_end_line = if let Some(c_abs) = close_abs {
+                    index.byte_offset_to_line(engine, c_abs)
                 } else {
-                    self.viewport.load_lines_indexed(engine, index, clamped, VISIBLE_LINE_BUFFER);
+                    desc_start_line
+                };
+
+                if desc_end_line > desc_start_line {
+                    self.enclosing_description_cache.insert(desc_start_line, desc_end_line);
+                    self.folding_end_cache.insert(desc_start_line, desc_end_line);
+
+                    if line_no >= desc_start_line && line_no <= desc_end_line {
+                        if self.unfolded_lines_override.contains(&desc_start_line) {
+                            return None;
+                        }
+                        return Some((desc_start_line, desc_end_line));
+                    }
                 }
             }
+        }
+
+        None
+    }
+
+    pub fn is_line_folded_header(&mut self, line_no: usize) -> Option<usize> {
+        let (Some(ref engine), Some(ref index)) = (&self.engine, &self.line_index) else {
+            return None;
+        };
+
+        if self.fold_all_descriptions {
+            if self.unfolded_lines_override.contains(&line_no) {
+                return None;
+            }
+            if let Some(&cached) = self.folding_end_cache.get(&line_no) {
+                if cached > line_no {
+                    return Some(cached);
+                }
+            }
+            if let Some(offset) = index.line_to_byte_offset(engine, line_no) {
+                let scan_len = (4096).min((engine.size().saturating_sub(offset)) as usize);
+                if let Ok(bytes) = engine.read_range(offset, scan_len) {
+                    let end_pos = memchr::memchr(b'\n', bytes).unwrap_or(bytes.len());
+                    let line_str = String::from_utf8_lossy(&bytes[..end_pos]);
+                    let trimmed = line_str.trim();
+                    if trimmed.starts_with("<description") {
+                        let (opens, closes) = Self::count_exact_xml_tags(trimmed, "description");
+                        if opens > closes {
+                            let close_needle = b"</description>";
+                            let forward_len = (2_097_152).min((engine.size().saturating_sub(offset)) as usize);
+                            if let Ok(f_bytes) = engine.read_range(offset, forward_len) {
+                                if let Some(pos) = f_bytes.windows(close_needle.len()).position(|w| w == close_needle) {
+                                    let close_abs = offset + pos as u64 + close_needle.len() as u64;
+                                    let end_line = index.byte_offset_to_line(engine, close_abs);
+                                    if end_line > line_no {
+                                        self.folding_end_cache.insert(line_no, end_line);
+                                        self.enclosing_description_cache.insert(line_no, end_line);
+                                        return Some(end_line);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if self.folded_lines.contains(&line_no) {
+            if let Some(&cached) = self.folding_end_cache.get(&line_no) {
+                if cached > line_no {
+                    return Some(cached);
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn load_viewport_lines_virtualized(&mut self, start_line: usize, desired_count: usize) {
+        let (Some(engine), Some(index)) = (self.engine.clone(), self.line_index.clone()) else {
+            return;
+        };
+
+        if !self.fold_all_descriptions && self.folded_lines.is_empty() {
+            self.viewport.load_lines_indexed(&engine, &index, start_line, desired_count);
+            return;
+        }
+
+        self.viewport.total_file_size = engine.size();
+        self.viewport.encoding = engine.detect_encoding();
+        self.viewport.lines.clear();
+
+        let max_line = self.get_total_lines();
+        let mut curr_line = start_line.clamp(1, max_line);
+
+        while self.viewport.lines.len() < desired_count && curr_line <= max_line {
+            if let Some(end_line) = self.is_line_folded_header(curr_line) {
+                if let Some(offset) = index.line_to_byte_offset(&engine, curr_line) {
+                    let scan_len = (4096).min((engine.size().saturating_sub(offset)) as usize);
+                    if let Ok(bytes) = engine.read_range(offset, scan_len) {
+                        let end_pos = memchr::memchr(b'\n', bytes).unwrap_or(bytes.len());
+                        let mut line_bytes = &bytes[..end_pos];
+                        if line_bytes.ends_with(b"\r") {
+                            line_bytes = &line_bytes[..line_bytes.len() - 1];
+                        }
+                        let text = String::from_utf8_lossy(line_bytes).into_owned();
+                        self.viewport.lines.push(crate::editor::ViewportLine {
+                            line_number: curr_line,
+                            byte_offset: offset,
+                            text,
+                            is_truncated: false,
+                        });
+                    }
+                }
+
+                if end_line > curr_line {
+                    curr_line = end_line + 1;
+                } else {
+                    curr_line += 1;
+                }
+            } else {
+                let start_chunk_line = curr_line;
+                let needed = desired_count.saturating_sub(self.viewport.lines.len());
+                let start_offset = index.line_to_byte_offset(&engine, start_chunk_line).unwrap_or(0);
+                let window_bytes = (needed * 512).max(16384).min((engine.size().saturating_sub(start_offset)) as usize);
+
+                if window_bytes == 0 {
+                    break;
+                }
+
+                let chunk_bytes = match engine.read_range(start_offset, window_bytes) {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+
+                let mut chunk_line_num = start_chunk_line;
+                let mut chunk_offset = start_offset;
+                let mut line_start = 0;
+                let mut hit_fold = false;
+
+                for i in 0..chunk_bytes.len() {
+                    if chunk_bytes[i] == b'\n' {
+                        let mut line_end = i;
+                        if line_end > line_start && chunk_bytes[line_end - 1] == b'\r' {
+                            line_end -= 1;
+                        }
+                        let line_raw = &chunk_bytes[line_start..line_end];
+                        let line_text = String::from_utf8_lossy(line_raw).into_owned();
+                        let trimmed = line_text.trim();
+
+                        let starts_desc_fold = if self.fold_all_descriptions && !self.unfolded_lines_override.contains(&chunk_line_num) {
+                            if trimmed.starts_with("<description") {
+                                let (opens, closes) = Self::count_exact_xml_tags(trimmed, "description");
+                                opens > closes
+                            } else {
+                                false
+                            }
+                        } else {
+                            self.folded_lines.contains(&chunk_line_num)
+                        };
+
+                        if starts_desc_fold {
+                            curr_line = chunk_line_num;
+                            hit_fold = true;
+                            break;
+                        } else {
+                            self.viewport.lines.push(crate::editor::ViewportLine {
+                                line_number: chunk_line_num,
+                                byte_offset: chunk_offset,
+                                text: line_text,
+                                is_truncated: false,
+                            });
+                            chunk_line_num += 1;
+                            chunk_offset = start_offset + (i as u64) + 1;
+                            line_start = i + 1;
+
+                            if self.viewport.lines.len() >= desired_count {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if !hit_fold {
+                    if chunk_line_num == curr_line {
+                        curr_line += 1;
+                    } else {
+                        curr_line = chunk_line_num;
+                    }
+                }
+            }
+        }
+
+        if self.viewport.lines.is_empty() {
+            self.viewport.lines.push(crate::editor::ViewportLine {
+                line_number: 1,
+                byte_offset: 0,
+                text: String::new(),
+                is_truncated: false,
+            });
+        }
+
+        if let Some(first) = self.viewport.lines.first() {
+            self.viewport.start_offset = first.byte_offset;
+        }
+    }
+
+    pub fn scroll_to_line(&mut self, target_line: usize) {
+        let (Some(engine), Some(index)) = (self.engine.clone(), self.line_index.clone()) else {
+            return;
+        };
+
+        let max_line = if let Some(ref slice) = self.active_slice {
+            slice.line_count().max(1)
+        } else {
+            let delta = self.document.as_ref().map_or(0, |d| d.total_lines_delta);
+            ((index.total_lines() as i64 + delta).max(1)) as usize
+        };
+        let mut clamped = target_line.clamp(1, max_line);
+        if self.fold_all_descriptions {
+            if let Some((start_line, end_line)) = self.find_enclosing_description_range(clamped) {
+                if clamped > start_line && clamped <= end_line {
+                    clamped = start_line;
+                }
+            }
+        }
+        self.current_line = clamped;
+        if let Some(ref slice) = self.active_slice {
+            self.viewport.load_virtual_lines(&engine, &index, slice, clamped, VISIBLE_LINE_BUFFER);
+        } else {
+            let is_dirty = self.document.as_ref().map_or(false, |d| d.is_dirty());
+            if is_dirty {
+                let first_line = self.viewport.lines.first().map(|l| l.line_number).unwrap_or(0);
+                if first_line != clamped || self.viewport.lines.is_empty() {
+                    if let Some(ref doc) = self.document {
+                        // Compute offset for clamped line in the piece table
+                        let start_offset = if clamped <= 1 {
+                            0
+                        } else if let Some(l) = self.viewport.lines.iter().find(|l| l.line_number == clamped) {
+                            l.byte_offset
+                        } else {
+                            let (so, _) = Self::piece_table_line_offsets_pair(&doc.piece_table, &engine, clamped, clamped);
+                            so.unwrap_or(0)
+                        };
+                        let window_bytes = (VISIBLE_LINE_BUFFER * 512).max(65536);
+                        self.viewport.load_from_piece_table(&doc.piece_table, &engine, start_offset, window_bytes, clamped);
+                    }
+                }
+            } else {
+                self.load_viewport_lines_virtualized(clamped, VISIBLE_LINE_BUFFER);
+            }
+        }
             if let Some(ref doc) = self.document {
                 self.viewport.apply_line_overrides(&doc.modified_lines);
             }
             self.jump_line_input = clamped.to_string();
-            if let Some(offset) = self.viewport.lines.first().map(|l| l.byte_offset) {
-                self.jump_offset_input = offset.to_string();
-            }
+        if let Some(offset) = self.viewport.lines.first().map(|l| l.byte_offset) {
+            self.jump_offset_input = offset.to_string();
         }
     }
 
@@ -4527,10 +4845,44 @@ impl UltraViewerApp {
     pub fn scroll_lines(&mut self, delta: isize) {
         if self.engine.is_some() {
             let max_line = self.get_total_lines();
-            let new_line = if delta < 0 {
-                self.current_line.saturating_sub((-delta) as usize).max(1)
+            let new_line = if self.fold_all_descriptions && !self.viewport.lines.is_empty() {
+                if delta > 0 {
+                    let steps = delta as usize;
+                    if let Some(pos) = self.viewport.lines.iter().position(|l| l.line_number == self.current_line) {
+                        let target_idx = pos + steps;
+                        if target_idx < self.viewport.lines.len() {
+                            self.viewport.lines[target_idx].line_number
+                        } else {
+                            let last = self.viewport.lines.last().map(|l| l.line_number).unwrap_or(self.current_line);
+                            last.saturating_add(target_idx - (self.viewport.lines.len() - 1)).min(max_line)
+                        }
+                    } else if steps < self.viewport.lines.len() {
+                        self.viewport.lines[steps].line_number
+                    } else {
+                        self.viewport.lines.last().map(|l| l.line_number).unwrap_or_else(|| self.current_line.saturating_add(steps).min(max_line))
+                    }
+                } else {
+                    let mut curr = self.current_line;
+                    let steps = (-delta) as usize;
+                    for _ in 0..steps {
+                        if curr <= 1 {
+                            break;
+                        }
+                        let prev = curr - 1;
+                        if let Some((start, _end)) = self.find_enclosing_description_range(prev) {
+                            curr = start;
+                        } else {
+                            curr = prev;
+                        }
+                    }
+                    curr
+                }
             } else {
-                self.current_line.saturating_add(delta as usize).min(max_line)
+                if delta < 0 {
+                    self.current_line.saturating_sub((-delta) as usize).max(1)
+                } else {
+                    self.current_line.saturating_add(delta as usize).min(max_line)
+                }
             };
             self.scroll_to_line(new_line);
         }
@@ -8295,6 +8647,7 @@ fn find_folding_end_extended(
                     self.folded_lines.insert(fold_line);
                 }
             }
+            self.scroll_to_line(self.current_line);
         }
 
         if let Some(line) = drag_start_detected {
@@ -9011,6 +9364,21 @@ mod tests {
         assert!(!app.fold_all_descriptions);
         assert!(app.unfolded_lines_override.is_empty());
         assert!(app.folded_lines.is_empty());
+    }
+
+    #[test]
+    fn test_find_last_description_open_close() {
+        let sample1 = b"<job><title>Lead</title><description><![CDATA[Some text";
+        assert_eq!(UltraViewerApp::find_last_description_open(sample1), Some(24));
+        assert_eq!(UltraViewerApp::find_last_description_close(sample1), None);
+
+        let sample2 = b"<job><description_id>123</description_id><description>Job Body</description>";
+        assert_eq!(UltraViewerApp::find_last_description_open(sample2), Some(41));
+        assert_eq!(UltraViewerApp::find_last_description_close(sample2), Some(62));
+
+        let sample3 = b"<job><description><![CDATA[Body]]></description><company>Acme</company>";
+        assert_eq!(UltraViewerApp::find_last_description_open(sample3), Some(5));
+        assert_eq!(UltraViewerApp::find_last_description_close(sample3), Some(34));
     }
 
     #[test]
