@@ -43,6 +43,8 @@ pub enum PaletteAction {
     OpenFolder,
     RegisterContextMenu,
     UnregisterContextMenu,
+    ToggleFoldDescriptions,
+    UnfoldAll,
     KeyboardShortcuts,
     About,
 }
@@ -90,6 +92,8 @@ impl CommandItem {
             CommandItem { category: "Preferences", title: "Color Theme: Tokyo Night", shortcut: "", action: PaletteAction::SetThemeTokyoNight },
             CommandItem { category: "Preferences", title: "Color Theme: VS Code Light Modern", shortcut: "", action: PaletteAction::SetThemeLightModern },
             CommandItem { category: "XML", title: "Validate XML Document", shortcut: "", action: PaletteAction::XmlValidate },
+            CommandItem { category: "XML", title: "Toggle Fold All Descriptions", shortcut: "Ctrl+Alt+D", action: PaletteAction::ToggleFoldDescriptions },
+            CommandItem { category: "XML", title: "Unfold All Folded Blocks", shortcut: "Ctrl+Alt+U", action: PaletteAction::UnfoldAll },
             CommandItem { category: "XML", title: "Toggle XML Structure Tree", shortcut: "Ctrl+Shift+T", action: PaletteAction::XmlToggleTree },
             CommandItem { category: "XML", title: "Repair XML Declaration (Normalize <?xml ...?>)", shortcut: "", action: PaletteAction::XmlRepairDeclaration },
             CommandItem { category: "JSON", title: "Validate JSON Document", shortcut: "", action: PaletteAction::JsonValidate },

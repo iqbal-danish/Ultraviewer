@@ -19,6 +19,8 @@ pub struct TabBarProps<'a> {
     pub is_edit_mode: bool,
     pub word_wrap: bool,
     pub is_hex_mode: bool,
+    pub is_xml: bool,
+    pub fold_all_descriptions: bool,
     pub current_line: usize,
     pub total_lines: usize,
     pub breadcrumb: Option<&'a str>,
@@ -34,6 +36,7 @@ pub enum TabBarAction {
     SaveFile,
     ToggleWrap,
     ToggleHexView,
+    ToggleFoldDescriptions,
     ToggleSearch,
     ToggleTree,
     FormatBeautify,
@@ -256,6 +259,42 @@ pub fn render_tab_bar(
             );
             if hex_resp.on_hover_text("Toggle Zero-Copy Hex & Binary Inspector (Ctrl+Shift+H)").clicked() {
                 action = Some(TabBarAction::ToggleHexView);
+            }
+
+            if props.is_xml {
+                ui.add_space(4.0);
+                let fold_text = if props.fold_all_descriptions { "Fold Desc: ON" } else { "Fold Desc: OFF" };
+                let fold_color = if props.fold_all_descriptions {
+                    Color32::from_rgb(229, 192, 123)
+                } else {
+                    Color32::from_rgb(140, 150, 165)
+                };
+                let (fold_rect, fold_resp) = ui.allocate_exact_size(Vec2::new(104.0, 26.0), Sense::click());
+                let fold_hovered = fold_resp.hovered();
+                let fold_bg = if props.fold_all_descriptions {
+                    Color32::from_rgb(50, 42, 28)
+                } else if fold_hovered {
+                    Color32::from_rgb(34, 38, 45)
+                } else {
+                    Color32::from_rgb(22, 25, 30)
+                };
+                let fold_border = if props.fold_all_descriptions {
+                    Color32::from_rgb(234, 179, 8)
+                } else {
+                    Color32::from_rgb(44, 49, 58)
+                };
+                ui.painter().rect_filled(fold_rect, 4.0, fold_bg);
+                ui.painter().rect_stroke(fold_rect, 4.0, egui::Stroke::new(1.0_f32, fold_border), egui::StrokeKind::Inside);
+                ui.painter().text(
+                    fold_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    fold_text,
+                    egui::FontId::proportional(12.0),
+                    fold_color,
+                );
+                if fold_resp.on_hover_text("Fold/Unfold All <description> Tags (Ctrl+Alt+D)").clicked() {
+                    action = Some(TabBarAction::ToggleFoldDescriptions);
+                }
             }
         });
     });

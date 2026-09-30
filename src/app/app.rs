@@ -49,7 +49,7 @@ fn apply_modern_theme(ctx: &egui::Context, theme: ColorTheme) {
     theme.apply(ctx);
 }
 
-const VISIBLE_LINE_BUFFER: usize = 60;
+const VISIBLE_LINE_BUFFER: usize = 120;
 
 pub struct ActiveAnalysis {
     pub cancel: Arc<AtomicBool>,
@@ -108,6 +108,8 @@ pub struct OpenDocState {
     pub xml_tree_root: Option<Arc<XmlTreeNode>>,
     pub json_tree_root: Option<Arc<JsonTreeNode>>,
     pub folded_lines: HashSet<usize>,
+    pub fold_all_descriptions: bool,
+    pub unfolded_lines_override: HashSet<usize>,
     pub selection_anchor: Option<usize>,
     pub selection_head: Option<usize>,
     pub current_xpath: Option<String>,
@@ -216,6 +218,9 @@ pub struct UltraViewerApp {
 
     // Code folding & Multi-line Selection
     pub folded_lines: HashSet<usize>,
+    pub fold_all_descriptions: bool,
+    pub unfolded_lines_override: HashSet<usize>,
+    pub folding_end_cache: std::collections::HashMap<usize, usize>,
     pub selection_anchor: Option<usize>,
     pub selection_anchor_col: Option<usize>,
     pub selection_head: Option<usize>,
@@ -382,6 +387,9 @@ impl Default for UltraViewerApp {
             status_notification: None,
 
             folded_lines: HashSet::new(),
+            fold_all_descriptions: false,
+            unfolded_lines_override: HashSet::new(),
+            folding_end_cache: std::collections::HashMap::new(),
             selection_anchor: None,
             selection_anchor_col: None,
             selection_head: None,
@@ -1945,6 +1953,8 @@ impl UltraViewerApp {
                     xml_tree_root: None,
                     json_tree_root: None,
                     folded_lines: HashSet::new(),
+                    fold_all_descriptions: false,
+                    unfolded_lines_override: HashSet::new(),
                     selection_anchor: None,
                     selection_head: None,
                     current_xpath: None,
@@ -2035,6 +2045,8 @@ impl UltraViewerApp {
                 tab.xml_tree_root = self.xml_tree_root.clone();
                 tab.json_tree_root = self.json_tree_root.clone();
                 tab.folded_lines = self.folded_lines.clone();
+                tab.fold_all_descriptions = self.fold_all_descriptions;
+                tab.unfolded_lines_override = self.unfolded_lines_override.clone();
                 tab.selection_anchor = self.selection_anchor;
                 tab.selection_head = self.selection_head;
                 tab.current_xpath = self.current_xpath.clone();
@@ -2067,6 +2079,9 @@ impl UltraViewerApp {
             self.xml_tree_root = tab.xml_tree_root.clone();
             self.json_tree_root = tab.json_tree_root.clone();
             self.folded_lines = tab.folded_lines.clone();
+            self.fold_all_descriptions = tab.fold_all_descriptions;
+            self.unfolded_lines_override = tab.unfolded_lines_override.clone();
+            self.folding_end_cache.clear();
             self.selection_anchor = tab.selection_anchor;
             self.selection_head = tab.selection_head;
             self.current_xpath = tab.current_xpath.clone();
@@ -2212,6 +2227,10 @@ impl UltraViewerApp {
         self.edit_line_buffer.clear();
         self.active_slice = None;
         self.hex_viewer = HexViewerState::default();
+        self.folded_lines.clear();
+        self.fold_all_descriptions = false;
+        self.unfolded_lines_override.clear();
+        self.folding_end_cache.clear();
     }
 
     fn cancel_tree_builders(&mut self) {
@@ -2964,6 +2983,26 @@ impl UltraViewerApp {
                 }
             }
         }
+    }
+
+    pub fn toggle_fold_all_descriptions(&mut self) {
+        self.fold_all_descriptions = !self.fold_all_descriptions;
+        self.unfolded_lines_override.clear();
+        self.folding_end_cache.clear();
+        let msg = if self.fold_all_descriptions {
+            "Folded all <description> tags (Ctrl+Alt+D to toggle)"
+        } else {
+            "Unfolded all <description> tags"
+        };
+        self.status_notification = Some((msg.to_string(), Instant::now()));
+    }
+
+    pub fn unfold_all(&mut self) {
+        self.fold_all_descriptions = false;
+        self.folded_lines.clear();
+        self.unfolded_lines_override.clear();
+        self.folding_end_cache.clear();
+        self.status_notification = Some(("Unfolded all folded blocks".to_string(), Instant::now()));
     }
 
     pub fn copy_virtual_slice(&mut self, ctx: &egui::Context) {
@@ -4694,6 +4733,27 @@ impl UltraViewerApp {
             self.url_modal_state.open();
         }
 
+        let ctrl_alt_d = ctx.input_mut(|i| {
+            let is_pressed = (i.modifiers.command || i.modifiers.ctrl) && i.modifiers.alt && !i.modifiers.shift && i.key_pressed(Key::D);
+            if is_pressed {
+                i.events.retain(|e| !matches!(e, egui::Event::Key { key: Key::D, .. }));
+            }
+            is_pressed
+        });
+        if ctrl_alt_d && self.engine.is_some() {
+            self.toggle_fold_all_descriptions();
+        }
+        let unfold_all_chord = ctx.input_mut(|i| {
+            let is_pressed = (i.modifiers.command || i.modifiers.ctrl) && i.modifiers.alt && i.modifiers.shift && i.key_pressed(Key::D);
+            if is_pressed {
+                i.events.retain(|e| !matches!(e, egui::Event::Key { key: Key::D, .. }));
+            }
+            is_pressed
+        });
+        if unfold_all_chord && self.engine.is_some() {
+            self.unfold_all();
+        }
+
         let (is_next_tab, is_prev_tab) = ctx.input_mut(|i| {
             let ctrl = i.modifiers.command || i.modifiers.ctrl;
             let shift = i.modifiers.shift;
@@ -5480,6 +5540,7 @@ impl eframe::App for UltraViewerApp {
                     is_maximized,
                     self.auto_save,
                     self.word_wrap,
+                    self.fold_all_descriptions,
                 )
             })
             .inner;
@@ -5507,6 +5568,8 @@ impl eframe::App for UltraViewerApp {
                     self.word_wrap = !self.word_wrap;
                     self.persist_session();
                 }
+                MenuAction::ToggleFoldDescriptions => self.toggle_fold_all_descriptions(),
+                MenuAction::UnfoldAll => self.unfold_all(),
                 MenuAction::Find => self.trigger_find_with_selection(ctx),
                 MenuAction::FindAndReplace => self.toggle_find_and_replace(ctx),
                 MenuAction::SelectNextOccurrence => self.select_next_occurrence(ctx),
@@ -5865,6 +5928,8 @@ impl eframe::App for UltraViewerApp {
                     is_edit_mode: self.is_edit_mode,
                     word_wrap: self.word_wrap,
                     is_hex_mode: self.hex_viewer.is_enabled,
+                    is_xml,
+                    fold_all_descriptions: self.fold_all_descriptions,
                     current_line: self.current_line,
                     total_lines,
                     breadcrumb: None,
@@ -5881,6 +5946,7 @@ impl eframe::App for UltraViewerApp {
                         TabBarAction::SaveFile => action_save = true,
                         TabBarAction::ToggleWrap => self.word_wrap = !self.word_wrap,
                         TabBarAction::ToggleHexView => self.toggle_hex_view(),
+                        TabBarAction::ToggleFoldDescriptions => self.toggle_fold_all_descriptions(),
                         TabBarAction::ToggleSearch => action_toggle_search = true,
                         TabBarAction::ToggleTree => {
                             self.active_activity_panel = match self.active_activity_panel {
@@ -6936,6 +7002,8 @@ impl UltraViewerApp {
                     Err(err) => self.error_message = Some(err),
                 }
             }
+            PaletteAction::ToggleFoldDescriptions => self.toggle_fold_all_descriptions(),
+            PaletteAction::UnfoldAll => self.unfold_all(),
             PaletteAction::About => self.show_about_dialog = true,
             PaletteAction::Undo => self.undo(),
             PaletteAction::Redo => self.redo(),
@@ -7038,6 +7106,61 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                     depth -= 1;
                     if depth == 0 {
                         return Some(lines[i].line_number);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_tag_name(text: &str) -> Option<String> {
+    let t = text.trim();
+    if t.starts_with('<') && !t.starts_with("</") && !t.starts_with("<?") && !t.starts_with("<!--") && !t.ends_with("/>") {
+        let name = t[1..].split(|c: char| c.is_whitespace() || c == '>').next()?;
+        if !name.is_empty() && !name.starts_with('!') {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+fn find_folding_end_extended(
+    lines: &[crate::editor::ViewportLine],
+    start_idx: usize,
+    engine: Option<&FileEngine>,
+    line_index: Option<&LineIndex>,
+    cache: &mut std::collections::HashMap<usize, usize>,
+) -> Option<usize> {
+    let start_line = lines.get(start_idx)?;
+    let start_line_num = start_line.line_number;
+
+    if let Some(&cached_end) = cache.get(&start_line_num) {
+        return Some(cached_end);
+    }
+
+    if let Some(end) = Self::find_folding_end(lines, start_idx) {
+        cache.insert(start_line_num, end);
+        return Some(end);
+    }
+
+    let text = start_line.text.trim();
+    if let Some(tag_name) = Self::extract_tag_name(text) {
+        if let (Some(eng), Some(idx)) = (engine, line_index) {
+            let close_needle = format!("</{}>", tag_name);
+            let needle_bytes = close_needle.as_bytes();
+            let start_offset = start_line.byte_offset;
+            let max_scan = 524_288.min((eng.size().saturating_sub(start_offset)) as usize);
+            if max_scan > 0 {
+                if let Ok(bytes) = eng.read_range(start_offset, max_scan) {
+                    if let Some(pos) = bytes.windows(needle_bytes.len()).position(|w| w == needle_bytes) {
+                        let match_byte_offset = start_offset + pos as u64;
+                        let end_line = idx.byte_offset_to_line(eng, match_byte_offset);
+                        if end_line > start_line_num {
+                            cache.insert(start_line_num, end_line);
+                            return Some(end_line);
+                        }
                     }
                 }
             }
@@ -7222,12 +7345,28 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
         let mut folding_targets: std::collections::HashMap<usize, (usize, bool)> = std::collections::HashMap::new();
 
         for (idx, line) in self.viewport.lines.iter().enumerate() {
-            if let Some(end_line) = Self::find_folding_end(&self.viewport.lines, idx) {
-                if end_line > line.line_number {
-                    let is_folded = self.folded_lines.contains(&line.line_number);
-                    folding_targets.insert(line.line_number, (end_line, is_folded));
+            let line_no = line.line_number;
+            if hidden_lines.contains(&line_no) {
+                continue;
+            }
+            if let Some(end_line) = Self::find_folding_end_extended(
+                &self.viewport.lines,
+                idx,
+                self.engine.as_deref(),
+                self.line_index.as_deref(),
+                &mut self.folding_end_cache,
+            ) {
+                if end_line > line_no {
+                    let tag_name = Self::extract_tag_name(&line.text);
+                    let is_desc = tag_name.as_deref() == Some("description");
+                    let is_folded = if self.fold_all_descriptions && is_desc {
+                        !self.unfolded_lines_override.contains(&line_no)
+                    } else {
+                        self.folded_lines.contains(&line_no)
+                    };
+                    folding_targets.insert(line_no, (end_line, is_folded));
                     if is_folded {
-                        for h in (line.line_number + 1)..=end_line {
+                        for h in (line_no + 1)..=end_line {
                             hidden_lines.insert(h);
                         }
                     }
@@ -7411,7 +7550,14 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
 
                                     // Native Line Editor (direct cursor positioning, word selection, and real-time editing)
                                     let edit_id = egui::Id::new("line_editor").with(line_no);
-                                    let mut line_text = line.text.clone();
+                                    let is_this_line_folded = folding_targets.get(&line_no).map_or(false, |(_, f)| *f);
+                                    let mut line_text = if is_this_line_folded {
+                                        let tag = Self::extract_tag_name(&line.text).unwrap_or_else(|| "tag".to_string());
+                                        let folded_count = folding_targets.get(&line_no).map_or(1, |(e, _)| e.saturating_sub(line_no));
+                                        format!("{} ... </{}>  [+ {} lines folded]", line.text.trim_end(), tag, folded_count)
+                                    } else {
+                                        line.text.clone()
+                                    };
 
                                     if pending_focus.map_or(false, |(l, _)| l == line_no) {
                                         let target_col = pending_focus.unwrap().1;
@@ -7454,9 +7600,13 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                                         .margin(egui::Margin::ZERO)
                                         .desired_width(target_wrap_w)
                                         .desired_rows(1)
+                                        .interactive(self.is_edit_mode && !is_this_line_folded)
                                         .layouter(&mut layouter);
 
                                     let resp = ui.add(te);
+                                    if is_this_line_folded && resp.double_clicked() {
+                                        toggle_fold_for = Some(line_no);
+                                    }
                                     if is_active_search {
                                         ui.painter().rect_filled(
                                             resp.rect,
@@ -7839,7 +7989,14 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
 
                                             ui.horizontal(|ui| {
                                                 let edit_id = egui::Id::new("line_editor").with(line_no);
-                                                let mut line_text = line.text.clone();
+                                                let is_this_line_folded = folding_targets.get(&line_no).map_or(false, |(_, f)| *f);
+                                                let mut line_text = if is_this_line_folded {
+                                                    let tag = Self::extract_tag_name(&line.text).unwrap_or_else(|| "tag".to_string());
+                                                    let folded_count = folding_targets.get(&line_no).map_or(1, |(e, _)| e.saturating_sub(line_no));
+                                                    format!("{} ... </{}>  [+ {} lines folded]", line.text.trim_end(), tag, folded_count)
+                                                } else {
+                                                    line.text.clone()
+                                                };
 
                                                     if pending_focus.map_or(false, |(l, _)| l == line_no) {
                                                         let target_col = pending_focus.unwrap().1;
@@ -7875,7 +8032,8 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                                                     };
 
                                                 let char_w = ui.fonts(|f| f.glyph_width(&text_font, ' '));
-                                                let line_w = (line.text.chars().count() as f32 + 5.0) * char_w;
+                                                let display_char_count = line_text.chars().count();
+                                                let line_w = (display_char_count as f32 + 5.0) * char_w;
                                                 let desired_w = line_w.max(ui.available_width());
 
                                                 let te = egui::TextEdit::multiline(&mut line_text)
@@ -7885,9 +8043,13 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                                                     .margin(egui::Margin::ZERO)
                                                     .desired_width(desired_w)
                                                     .desired_rows(1)
+                                                    .interactive(self.is_edit_mode && !is_this_line_folded)
                                                     .layouter(&mut layouter);
 
                                                 let resp = ui.add(te);
+                                                if is_this_line_folded && resp.double_clicked() {
+                                                    toggle_fold_for = Some(line_no);
+                                                }
                                                 if is_active_search {
                                                     ui.painter().rect_filled(
                                                         resp.rect,
@@ -8115,10 +8277,23 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
         }
 
         if let Some(fold_line) = toggle_fold_for {
-            if self.folded_lines.contains(&fold_line) {
-                self.folded_lines.remove(&fold_line);
+            let is_desc_line = self.viewport.lines.iter()
+                .find(|l| l.line_number == fold_line)
+                .and_then(|l| Self::extract_tag_name(&l.text))
+                .as_deref() == Some("description");
+
+            if self.fold_all_descriptions && is_desc_line {
+                if self.unfolded_lines_override.contains(&fold_line) {
+                    self.unfolded_lines_override.remove(&fold_line);
+                } else {
+                    self.unfolded_lines_override.insert(fold_line);
+                }
             } else {
-                self.folded_lines.insert(fold_line);
+                if self.folded_lines.contains(&fold_line) {
+                    self.folded_lines.remove(&fold_line);
+                } else {
+                    self.folded_lines.insert(fold_line);
+                }
             }
         }
 
@@ -8794,6 +8969,48 @@ mod tests {
         // Line 3 has no folding since it closes on the same line
         let leaf_fold = UltraViewerApp::find_folding_end(&lines, 2);
         assert_eq!(leaf_fold, None);
+    }
+
+    #[test]
+    fn test_find_folding_end_cdata_description() {
+        use crate::editor::ViewportLine;
+
+        let lines = vec![
+            ViewportLine { line_number: 445, byte_offset: 0, text: "  <url>https://example.com</url>".to_string(), is_truncated: false },
+            ViewportLine { line_number: 446, byte_offset: 35, text: "  <description><![CDATA[".to_string(), is_truncated: false },
+            ViewportLine { line_number: 447, byte_offset: 60, text: "    &lt;strong&gt;Title:&lt;/strong&gt; Avionics".to_string(), is_truncated: false },
+            ViewportLine { line_number: 448, byte_offset: 110, text: "    &lt;br /&gt;".to_string(), is_truncated: false },
+            ViewportLine { line_number: 475, byte_offset: 130, text: "  ]]></description>".to_string(), is_truncated: false },
+            ViewportLine { line_number: 476, byte_offset: 152, text: "  <job_reference>123</job_reference>".to_string(), is_truncated: false },
+        ];
+
+        let desc_fold = UltraViewerApp::find_folding_end(&lines, 1);
+        assert_eq!(desc_fold, Some(475));
+
+        let mut cache = std::collections::HashMap::new();
+        let ext_fold = UltraViewerApp::find_folding_end_extended(&lines, 1, None, None, &mut cache);
+        assert_eq!(ext_fold, Some(475));
+        assert_eq!(cache.get(&446), Some(&475));
+    }
+
+    #[test]
+    fn test_toggle_fold_all_descriptions() {
+        let mut app = UltraViewerApp::default();
+        assert!(!app.fold_all_descriptions);
+
+        app.toggle_fold_all_descriptions();
+        assert!(app.fold_all_descriptions);
+        assert!(app.unfolded_lines_override.is_empty());
+
+        // Override a specific line
+        app.unfolded_lines_override.insert(446);
+        assert!(app.unfolded_lines_override.contains(&446));
+
+        // Unfold all clears everything
+        app.unfold_all();
+        assert!(!app.fold_all_descriptions);
+        assert!(app.unfolded_lines_override.is_empty());
+        assert!(app.folded_lines.is_empty());
     }
 
     #[test]

@@ -46,6 +46,8 @@ pub enum MenuAction {
     TransformLowercase,
     CopyXPath,
     ToggleWordWrap,
+    ToggleFoldDescriptions,
+    UnfoldAll,
     OpenKeyboardShortcuts,
     SetTheme(super::theme::ColorTheme),
     About,
@@ -64,6 +66,7 @@ pub fn render_menu_bar(
     is_maximized: bool,
     auto_save: bool,
     word_wrap: bool,
+    fold_all_descriptions: bool,
 ) -> Option<MenuAction> {
     let mut action = None;
 
@@ -278,6 +281,20 @@ pub fn render_menu_bar(
         if is_xml {
             ui.menu_button("XML", |ui| {
                 style_popup(ui);
+                let fold_label = if fold_all_descriptions {
+                    "Unfold All Descriptions (Ctrl+Alt+D)"
+                } else {
+                    "Fold All Descriptions (Ctrl+Alt+D)"
+                };
+                if ui.button(fold_label).clicked() {
+                    action = Some(MenuAction::ToggleFoldDescriptions);
+                    ui.close_menu();
+                }
+                if ui.button("Unfold All Blocks (Ctrl+Alt+U)").clicked() {
+                    action = Some(MenuAction::UnfoldAll);
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.button("Validate XML Document").clicked() {
                     action = Some(MenuAction::XmlValidate);
                     ui.close_menu();
