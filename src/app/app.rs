@@ -2383,7 +2383,7 @@ impl UltraViewerApp {
     pub fn select_match(&mut self, idx: usize) {
         let matches = self.search_matches.read().unwrap();
         if let Some(m) = matches.get(idx) {
-            let line = m.line_number;
+            let line = m.line();
             self.active_match_idx = Some(idx);
             drop(matches);
             if let Some(ref slice) = self.active_slice {
@@ -2568,9 +2568,9 @@ impl UltraViewerApp {
             }
         };
 
-        let match_item = self.search_matches.read().unwrap().get(current_idx).cloned();
+        let match_item = self.search_matches.read().unwrap().get(current_idx).copied();
         if let Some(m) = match_item {
-            let line_no = m.line_number;
+            let line_no = m.line();
             let old_line = match self.get_line_text_for_resolver(line_no) {
                 Some(t) => t,
                 None => return,
@@ -2609,12 +2609,13 @@ impl UltraViewerApp {
             }
         }
 
-        let matches = self.search_matches.read().unwrap().clone();
-        if matches.is_empty() {
-            return;
-        }
-
-        let mut line_numbers: Vec<usize> = matches.iter().map(|m| m.line_number).collect();
+        let mut line_numbers: Vec<usize> = {
+            let matches = self.search_matches.read().unwrap();
+            if matches.is_empty() {
+                return;
+            }
+            matches.iter().map(|m| m.line()).collect()
+        };
         line_numbers.sort_unstable();
         line_numbers.dedup();
 
@@ -2923,7 +2924,7 @@ impl UltraViewerApp {
             return;
         }
 
-        let mut lines: Vec<usize> = matches.iter().map(|m| m.line_number).collect();
+        let mut lines: Vec<usize> = matches.iter().map(|m| m.line()).collect();
         drop(matches);
         lines.sort_unstable();
         lines.dedup();
@@ -5298,7 +5299,7 @@ impl eframe::App for UltraViewerApp {
                 let matches_count = self.search_matches.read().unwrap().len();
                 if matches_count > slice.matching_lines.len() {
                     let matches = self.search_matches.read().unwrap();
-                    let mut lines: Vec<usize> = matches.iter().map(|m| m.line_number).collect();
+                    let mut lines: Vec<usize> = matches.iter().map(|m| m.line()).collect();
                     drop(matches);
                     lines.sort_unstable();
                     lines.dedup();
@@ -6190,7 +6191,6 @@ impl eframe::App for UltraViewerApp {
 
         // Search Results Bottom Panel
         if self.show_search_results && has_file {
-            let matches_snapshot = self.search_matches.read().unwrap().clone();
             let mut selected_match = None;
             let mut close_panel = false;
 
@@ -6200,11 +6200,13 @@ impl eframe::App for UltraViewerApp {
                 .height_range(80.0..=400.0)
                 .frame(egui::Frame::NONE.fill(Color32::from_rgb(30, 34, 39)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 26, 31))))
                 .show(ctx, |ui| {
+                    let matches_guard = self.search_matches.read().unwrap();
                     render_search_results_panel(
                         ui,
-                        &matches_snapshot,
+                        &matches_guard,
                         self.search_matches_count(),
                         self.active_match_idx,
+                        self.engine.as_deref(),
                         &mut selected_match,
                         &mut close_panel,
                     );
@@ -7128,7 +7130,7 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                 self.query_matches.get(self.query_match_idx - 1).map(|m| m.line_number)
             } else if self.show_search_bar {
                 self.active_match_idx.and_then(|idx| {
-                    self.search_matches.read().unwrap().get(idx).map(|m| m.line_number)
+                    self.search_matches.read().unwrap().get(idx).map(|m| m.line())
                 })
             } else {
                 None
@@ -7176,7 +7178,7 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
             self.query_matches.get(self.query_match_idx - 1).map(|m| m.line_number)
         } else if self.show_search_bar {
             self.active_match_idx.and_then(|idx| {
-                self.search_matches.read().unwrap().get(idx).map(|m| m.line_number)
+                self.search_matches.read().unwrap().get(idx).map(|m| m.line())
             })
         } else {
             None
@@ -9371,19 +9373,16 @@ mod tests {
                 line_number: 10,
                 byte_offset: 100,
                 match_length: 5,
-                snippet: "error 1".to_string(),
             });
             matches.push(SearchResultMatch {
                 line_number: 25,
                 byte_offset: 250,
                 match_length: 5,
-                snippet: "error 2".to_string(),
             });
             matches.push(SearchResultMatch {
                 line_number: 50,
                 byte_offset: 500,
                 match_length: 5,
-                snippet: "error 3".to_string(),
             });
         }
         app.search_query.pattern = "error".to_string();
@@ -9411,13 +9410,11 @@ mod tests {
                 line_number: 10,
                 byte_offset: 100,
                 match_length: 5,
-                snippet: "error 1".to_string(),
             });
             matches.push(SearchResultMatch {
                 line_number: 25,
                 byte_offset: 250,
                 match_length: 5,
-                snippet: "error 2".to_string(),
             });
         }
         app.search_query.pattern = "error".to_string();
@@ -9450,13 +9447,11 @@ mod tests {
                 line_number: 2,
                 byte_offset: 14,
                 match_length: 5,
-                snippet: "error found".to_string(),
             });
             matches.push(SearchResultMatch {
                 line_number: 4,
                 byte_offset: 42,
                 match_length: 5,
-                snippet: "another error".to_string(),
             });
         }
         app.search_query.pattern = "error".to_string();
@@ -9581,7 +9576,6 @@ mod tests {
             line_number: 10,
             byte_offset: 100,
             match_length: 5,
-            snippet: "test match".to_string(),
         });
         assert!(app.show_search_bar);
         assert_eq!(app.active_match_idx, Some(2));

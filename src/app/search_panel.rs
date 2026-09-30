@@ -303,6 +303,7 @@ pub fn render_search_results_panel(
     matches: &[SearchResultMatch],
     actual_matches: usize,
     active_idx: Option<usize>,
+    engine: Option<&crate::file_engine::FileEngine>,
     on_select: &mut Option<usize>,
     on_close: &mut bool,
 ) {
@@ -374,6 +375,21 @@ pub fn render_search_results_panel(
                     Color32::TRANSPARENT
                 };
 
+                let snippet = if let Some(eng) = engine {
+                    let off = m.byte_offset;
+                    let len = (m.match_length as usize).min(160);
+                    let start = off.saturating_sub(20);
+                    let end = (off + len as u64 + 40).min(eng.size());
+                    eng.read_range(start, (end - start) as usize)
+                        .map(|bytes| {
+                            let s = String::from_utf8_lossy(bytes);
+                            s.replace(['\r', '\n', '\t'], " ").trim().to_string()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
                 let response = egui::Frame::NONE
                     .fill(bg_color)
                     .corner_radius(2.0)
@@ -386,11 +402,11 @@ pub fn render_search_results_panel(
 
                             // Line Number
                             ui.allocate_ui_with_layout(Vec2::new(60.0, 16.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(format!("{}", m.line_number)).font(line_num_font.clone()).color(Color32::from_rgb(97, 175, 239)));
+                                ui.label(RichText::new(format!("{}", m.line())).font(line_num_font.clone()).color(Color32::from_rgb(97, 175, 239)));
                             });
 
                             // Snippet Preview
-                            ui.label(RichText::new(&m.snippet).font(text_font.clone()).color(Color32::from_rgb(171, 178, 191)));
+                            ui.label(RichText::new(&snippet).font(text_font.clone()).color(Color32::from_rgb(171, 178, 191)));
                         });
                     }).response;
 

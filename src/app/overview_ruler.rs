@@ -31,25 +31,42 @@ pub fn render_overview_ruler(
     let num_pixels = (rect.height() as usize).max(1);
     let mut painted_pixels = vec![false; num_pixels + 1];
 
-    for m in props.search_matches {
-        let ratio = ((m.line_number.saturating_sub(1)) as f32 / total).clamp(0.0, 1.0);
-        let px = ((ratio * (rect.height() - 1.0)) as usize).min(num_pixels);
-        let is_active = Some(m.line_number) == props.active_match_line;
+    let total_matches = props.search_matches.len();
+    if total_matches > 0 {
+        let stride = (total_matches / (num_pixels * 8)).max(1);
+        let mut painted_count = 0;
 
-        if !painted_pixels[px] || is_active {
-            painted_pixels[px] = true;
-            let tick_y = rect.top() + ratio * rect.height();
-            let tick_rect = Rect::from_min_size(
-                egui::pos2(rect.left() + 1.0, tick_y - 1.0),
-                Vec2::new(ruler_width - 2.0, 2.5),
-            );
-            let color = if is_active {
-                active_match_color
-            } else {
-                match_color
-            };
-            ui.painter().rect_filled(tick_rect, 0.5, color);
+        for i in (0..total_matches).step_by(stride) {
+            let m = props.search_matches[i];
+            let ratio = ((m.line().saturating_sub(1)) as f32 / total).clamp(0.0, 1.0);
+            let px = ((ratio * (rect.height() - 1.0)) as usize).min(num_pixels);
+
+            if !painted_pixels[px] {
+                painted_pixels[px] = true;
+                painted_count += 1;
+                let tick_y = rect.top() + ratio * rect.height();
+                let tick_rect = Rect::from_min_size(
+                    egui::pos2(rect.left() + 1.0, tick_y - 1.0),
+                    Vec2::new(ruler_width - 2.0, 2.5),
+                );
+                ui.painter().rect_filled(tick_rect, 0.5, match_color);
+
+                if painted_count >= num_pixels {
+                    break;
+                }
+            }
         }
+    }
+
+    // Always draw active match tick on top
+    if let Some(active_line) = props.active_match_line {
+        let ratio = ((active_line.saturating_sub(1)) as f32 / total).clamp(0.0, 1.0);
+        let tick_y = rect.top() + ratio * rect.height();
+        let tick_rect = Rect::from_min_size(
+            egui::pos2(rect.left() + 1.0, tick_y - 1.0),
+            Vec2::new(ruler_width - 2.0, 2.5),
+        );
+        ui.painter().rect_filled(tick_rect, 0.5, active_match_color);
     }
 
     // 3. Draw Viewport Thumb (VS Code translucent aesthetic slider)

@@ -12,8 +12,7 @@ use super::types::{SearchQuery, SearchResultMatch, SearchStatus};
 
 const SEARCH_CHUNK_SIZE: usize = 1024 * 1024; // 1 MB streaming chunks
 const OVERLAP_SIZE: usize = 512;               // Overlap across chunk borders
-const MAX_STORED_MATCHES: usize = 5_000_000;   // Store up to 5,000,000 navigable matches in memory
-const MAX_SNIPPET_MATCHES: usize = 5_000;      // Extract text snippets for first 5,000 matches in results table
+const MAX_STORED_MATCHES: usize = 15_000_000;  // Store up to 15,000,000 navigable matches in memory (~240 MB)
 
 pub struct SearchWorker;
 
@@ -134,17 +133,10 @@ impl SearchWorker {
                         let line_number = current_line;
 
                         if matches_count <= MAX_STORED_MATCHES {
-                            let snippet = if matches_count <= MAX_SNIPPET_MATCHES {
-                                Self::extract_snippet(active_slice, start_in_chunk, match_len)
-                            } else {
-                                String::new()
-                            };
-
                             chunk_items.push(SearchResultMatch {
-                                line_number,
                                 byte_offset: abs_start,
-                                match_length: match_len,
-                                snippet,
+                                line_number: line_number as u32,
+                                match_length: match_len as u32,
                             });
                         }
                     }
@@ -185,34 +177,5 @@ impl SearchWorker {
                 };
             })
             .expect("Failed to spawn search worker thread")
-    }
-
-    fn extract_snippet(slice: &[u8], match_start: usize, match_len: usize) -> String {
-        let prefix_start = match_start.saturating_sub(40);
-        let mut line_start = prefix_start;
-        for i in (prefix_start..match_start).rev() {
-            if slice[i] == b'\n' {
-                line_start = i + 1;
-                break;
-            }
-        }
-
-        let match_end = match_start + match_len;
-        let suffix_end = (match_end + 60).min(slice.len());
-        let mut line_end = suffix_end;
-        for i in match_end..suffix_end {
-            if slice[i] == b'\n' || slice[i] == b'\r' {
-                line_end = i;
-                break;
-            }
-        }
-
-        let raw = &slice[line_start..line_end];
-        let mut text = String::from_utf8_lossy(raw).trim().to_string();
-        if text.len() > 120 {
-            text.truncate(120);
-            text.push_str("...");
-        }
-        text
     }
 }

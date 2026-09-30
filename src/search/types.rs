@@ -23,12 +23,19 @@ impl SearchQuery {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct SearchResultMatch {
-    pub line_number: usize,
     pub byte_offset: u64,
-    pub match_length: usize,
-    pub snippet: String,
+    pub line_number: u32,
+    pub match_length: u32,
+}
+
+impl SearchResultMatch {
+    #[inline(always)]
+    pub fn line(&self) -> usize {
+        self.line_number as usize
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
