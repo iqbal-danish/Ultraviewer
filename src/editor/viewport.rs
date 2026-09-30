@@ -54,6 +54,13 @@ impl Viewport {
         self.lines.clear();
 
         if engine.is_empty() {
+            self.start_offset = 0;
+            self.lines.push(ViewportLine {
+                line_number: 1,
+                byte_offset: 0,
+                text: String::new(),
+                is_truncated: false,
+            });
             return;
         }
 
@@ -92,6 +99,15 @@ impl Viewport {
                     }
                 }
             }
+        }
+
+        if self.lines.is_empty() {
+            self.lines.push(ViewportLine {
+                line_number: 1,
+                byte_offset: 0,
+                text: String::new(),
+                is_truncated: false,
+            });
         }
     }
 
@@ -152,7 +168,17 @@ impl Viewport {
         self.start_offset = start_offset;
         self.lines.clear();
 
-        if engine.is_empty() || start_offset >= engine.size() {
+        if engine.is_empty() {
+            self.lines.push(ViewportLine {
+                line_number: 1,
+                byte_offset: 0,
+                text: String::new(),
+                is_truncated: false,
+            });
+            return;
+        }
+
+        if start_offset >= engine.size() {
             return;
         }
 

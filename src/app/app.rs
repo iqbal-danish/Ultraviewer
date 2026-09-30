@@ -30,6 +30,7 @@ use super::diff_viewer::{render_diff_modal, DiffViewerAction, DiffViewerState};
 use super::field_extract_modal::{render_field_extract_modal, FieldExtractModalAction, FieldExtractModalState};
 use super::folder_explorer::{render_folder_explorer, FolderAction, FolderExplorerState};
 use super::format_modal::{render_format_modal, render_format_options_modal, FormatModalAction, FormatOptionsModalAction, FormatOptionsModalState, FormatTarget};
+use super::hex_viewer::{render_hex_viewer, HexViewerAction, HexViewerState};
 use super::icons::{paint_icon, Icon};
 use super::json_tree_panel::render_json_tree_panel;
 use super::menu::{render_menu_bar, MenuAction};
@@ -39,6 +40,8 @@ use super::session::AppSession;
 use super::status_bar::{format_number, render_status_bar, StatusBarAction, StatusBarProps};
 use super::tab_bar::{render_tab_bar, TabBarAction, TabBarProps, TabInfo};
 use super::url_modal::{render_url_modal, UrlModalAction, UrlModalState};
+use super::keymapper::{KeybindingsConfig, ShortcutAction};
+use super::keymapper_modal::{render_keymapper_modal, KeymapperModalState};
 use super::theme::ColorTheme;
 use super::xml_tree_panel::render_xml_tree_panel;
 
@@ -108,6 +111,8 @@ pub struct OpenDocState {
     pub selection_anchor: Option<usize>,
     pub selection_head: Option<usize>,
     pub current_xpath: Option<String>,
+    pub active_slice: Option<VirtualSlice>,
+    pub hex_viewer: HexViewerState,
 }
 
 pub struct UltraViewerApp {
@@ -220,6 +225,7 @@ pub struct UltraViewerApp {
     pub cached_screen_lines: usize,
     pub untitled_counter: usize,
     pub line_edit_initial_texts: std::collections::HashMap<usize, String>,
+    pub active_cursor_col: usize,
 
     // XPath / JSONPath resolution state
     pub current_xpath: Option<String>,
@@ -243,12 +249,15 @@ pub struct UltraViewerApp {
     pub show_query_suggestions: bool,
 
     pub active_slice: Option<VirtualSlice>,
+    pub hex_viewer: HexViewerState,
     pub field_extract_state: FieldExtractModalState,
     pub field_extract_cancel: Option<Arc<AtomicBool>>,
     pub field_extract_rx: Option<crossbeam_channel::Receiver<(PathBuf, bool, Result<u64, String>)>>,
     pub field_extract_prog_rx: Option<crossbeam_channel::Receiver<crate::analysis::ExtractionProgress>>,
     pub format_options_state: FormatOptionsModalState,
     pub url_modal_state: UrlModalState,
+    pub keybindings: KeybindingsConfig,
+    pub keymapper_modal: KeymapperModalState,
     pub auto_save: bool,
     pub auto_save_timer: Option<Instant>,
     pub pending_slice_on_query_complete: bool,
@@ -385,6 +394,7 @@ impl Default for UltraViewerApp {
             cached_screen_lines: 30,
             untitled_counter: 0,
             line_edit_initial_texts: std::collections::HashMap::new(),
+            active_cursor_col: 0,
             current_xpath: None,
             last_resolved_line: 0,
             last_resolved_col: None,
@@ -405,12 +415,15 @@ impl Default for UltraViewerApp {
             show_query_suggestions: false,
 
             active_slice: None,
+            hex_viewer: HexViewerState::default(),
             field_extract_state: FieldExtractModalState::default(),
             field_extract_cancel: None,
             field_extract_rx: None,
             field_extract_prog_rx: None,
             format_options_state: FormatOptionsModalState::default(),
             url_modal_state: UrlModalState::default(),
+            keybindings: KeybindingsConfig::load(),
+            keymapper_modal: KeymapperModalState::default(),
             auto_save: auto_save_init,
             auto_save_timer: None,
             pending_slice_on_query_complete: false,
@@ -548,6 +561,9 @@ impl UltraViewerApp {
     /// Authoritative total line count for the document, accurately reflecting
     /// background indexing as well as any in-memory line deletions, splits, or merges.
     pub fn get_total_lines(&self) -> usize {
+        if let Some(ref slice) = self.active_slice {
+            return slice.line_count().max(1);
+        }
         let base = self.line_index.as_ref().map(|i| i.total_lines()).unwrap_or(1);
         let delta = self.document.as_ref().map_or(0, |d| d.total_lines_delta);
         ((base as i64 + delta).max(1)) as usize
@@ -947,7 +963,7 @@ impl UltraViewerApp {
         let line = self.current_line;
         let col = self.pending_focus_line.and_then(|(l, c)| if l == line { Some(c) } else { None })
             .or_else(|| self.selection_head_col)
-            .unwrap_or(0);
+            .unwrap_or(self.active_cursor_col);
         (line, col)
     }
 
@@ -959,6 +975,7 @@ impl UltraViewerApp {
             .map(|l| l.text.chars().count())
             .unwrap_or(0);
         let target_col = col.min(max_col);
+        self.active_cursor_col = target_col;
         self.pending_focus_line = Some((target_line, target_col));
         self.active_edit_line = Some(target_line);
         if let Some(l) = self.viewport.lines.iter().find(|l| l.line_number == target_line) {
@@ -1121,6 +1138,10 @@ impl UltraViewerApp {
 
             let added_count = chunks.len() - 1;
             let text_byte_len = text.as_bytes().len() as u64;
+
+            if let Some(ref mut doc) = self.document {
+                doc.total_lines_delta += added_count as i64;
+            }
 
             for l in &mut self.viewport.lines[idx + 1..] {
                 l.line_number += added_count;
@@ -1318,6 +1339,8 @@ impl UltraViewerApp {
             l.byte_offset += 1;
         }
 
+        doc.total_lines_delta += 1;
+
         // Shift doc.modified_lines
         let mut shifted = std::collections::HashMap::new();
         for (k, v) in doc.modified_lines.drain() {
@@ -1376,6 +1399,8 @@ impl UltraViewerApp {
             l.line_number -= 1;
             l.byte_offset = l.byte_offset.saturating_sub(newline_len);
         }
+
+        doc.total_lines_delta -= 1;
 
         // Shift doc.modified_lines
         let mut shifted = std::collections::HashMap::new();
@@ -1725,6 +1750,9 @@ impl UltraViewerApp {
         if let Some(existing) = self.tabs.iter().find(|t| t.path == path_buf) {
             let id = existing.id;
             self.switch_to_tab(id);
+            if self.active_slice.is_some() {
+                self.exit_virtual_slice();
+            }
             return;
         }
 
@@ -1734,6 +1762,8 @@ impl UltraViewerApp {
         self.cancel_tree_builders();
         self.cancel_analysis();
         self.analyzer_state = AnalyzerPanelState::default();
+        self.active_slice = None;
+        self.hex_viewer = HexViewerState::default();
 
         let start_time = Instant::now();
         match FileEngine::open(path) {
@@ -1762,7 +1792,14 @@ impl UltraViewerApp {
 
                 self.document = Some(EditorDocument::new(engine.size()));
                 self.is_edit_mode = true;
-                self.active_edit_line = None;
+                if engine.is_empty() {
+                    self.active_edit_line = Some(1);
+                    self.pending_focus_line = Some((1, 0));
+                    self.active_cursor_col = 0;
+                    self.line_edit_initial_texts.insert(1, String::new());
+                } else {
+                    self.active_edit_line = None;
+                }
                 self.edit_line_buffer.clear();
                 self.folded_lines.clear();
                 self.selection_anchor = None;
@@ -1827,6 +1864,8 @@ impl UltraViewerApp {
                     selection_anchor: None,
                     selection_head: None,
                     current_xpath: None,
+                    active_slice: None,
+                    hex_viewer: HexViewerState::default(),
                 };
                 self.tabs.push(new_tab);
 
@@ -1906,6 +1945,8 @@ impl UltraViewerApp {
                 tab.selection_anchor = self.selection_anchor;
                 tab.selection_head = self.selection_head;
                 tab.current_xpath = self.current_xpath.clone();
+                tab.active_slice = self.active_slice.clone();
+                tab.hex_viewer = self.hex_viewer.clone();
             }
         }
     }
@@ -1914,6 +1955,7 @@ impl UltraViewerApp {
         if self.active_tab_id == Some(tab_id) && self.engine.is_some() {
             return;
         }
+        self.flush_active_line_edit();
         self.sync_active_tab_state();
 
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
@@ -1935,6 +1977,8 @@ impl UltraViewerApp {
             self.selection_anchor = tab.selection_anchor;
             self.selection_head = tab.selection_head;
             self.current_xpath = tab.current_xpath.clone();
+            self.active_slice = tab.active_slice.clone();
+            self.hex_viewer = tab.hex_viewer.clone();
             self.last_resolved_line = 0;
 
             self.search_matches.write().unwrap().clear();
@@ -1954,6 +1998,8 @@ impl UltraViewerApp {
                 self.csv_grid.is_enabled = false;
                 self.csv_grid.headers.clear();
             }
+
+            self.scroll_to_line(self.current_line);
         }
     }
 
@@ -1985,6 +2031,38 @@ impl UltraViewerApp {
         self.active_tab_id = None;
         self.do_close_file();
         self.persist_session();
+    }
+
+    pub fn next_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        if let Some(curr_id) = self.active_tab_id {
+            if let Some(curr_idx) = self.tabs.iter().position(|t| t.id == curr_id) {
+                let next_idx = (curr_idx + 1) % self.tabs.len();
+                let next_id = self.tabs[next_idx].id;
+                self.switch_to_tab(next_id);
+            }
+        } else if let Some(first_tab) = self.tabs.first() {
+            let next_id = first_tab.id;
+            self.switch_to_tab(next_id);
+        }
+    }
+
+    pub fn prev_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        if let Some(curr_id) = self.active_tab_id {
+            if let Some(curr_idx) = self.tabs.iter().position(|t| t.id == curr_id) {
+                let prev_idx = if curr_idx == 0 { self.tabs.len() - 1 } else { curr_idx - 1 };
+                let prev_id = self.tabs[prev_idx].id;
+                self.switch_to_tab(prev_id);
+            }
+        } else if let Some(last_tab) = self.tabs.last() {
+            let prev_id = last_tab.id;
+            self.switch_to_tab(prev_id);
+        }
     }
 
     pub fn trigger_folder_dialog(&mut self) {
@@ -2033,6 +2111,8 @@ impl UltraViewerApp {
         self.is_edit_mode = false;
         self.active_edit_line = None;
         self.edit_line_buffer.clear();
+        self.active_slice = None;
+        self.hex_viewer = HexViewerState::default();
     }
 
     fn cancel_tree_builders(&mut self) {
@@ -2087,6 +2167,51 @@ impl UltraViewerApp {
             self.search_cancel = Some(cancel);
             self.search_handle = Some(handle);
         }
+    }
+
+    pub fn trigger_find_with_selection(&mut self, ctx: &egui::Context) {
+        if self.engine.is_none() {
+            return;
+        }
+
+        let selected = self.get_selected_text().or_else(|| {
+            if let Some(line_no) = self.active_edit_line {
+                let edit_id = egui::Id::new("line_editor").with(line_no);
+                if let Some(state) = egui::text_edit::TextEditState::load(ctx, edit_id) {
+                    if let Some(r) = state.cursor.char_range() {
+                        let s = r.primary.index.min(r.secondary.index);
+                        let e = r.primary.index.max(r.secondary.index);
+                        if s < e {
+                            if let Some(line_text) = self.get_line_text_for_resolver(line_no) {
+                                let chars: Vec<char> = line_text.chars().collect();
+                                if e <= chars.len() {
+                                    return Some(chars[s..e].iter().collect());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        });
+
+        if let Some(text) = selected {
+            let candidate = text.lines().next().unwrap_or("");
+            if !candidate.is_empty() && candidate.len() <= 1000 {
+                let changed = self.search_query.pattern != candidate;
+                self.search_query.pattern = candidate.to_string();
+                if changed || self.search_matches.read().unwrap().is_empty() {
+                    self.start_search();
+                } else if self.active_match_idx.is_none() {
+                    self.select_match(0);
+                }
+            }
+        } else if !self.search_query.pattern.is_empty() && self.search_matches.read().unwrap().is_empty() {
+            self.start_search();
+        }
+
+        self.show_search_bar = true;
+        self.focus_search_input = true;
     }
 
     pub fn cancel_search(&mut self) {
@@ -2149,6 +2274,15 @@ impl UltraViewerApp {
             let line = m.line_number;
             self.active_match_idx = Some(idx);
             drop(matches);
+            if let Some(ref slice) = self.active_slice {
+                if !self.viewport.lines.iter().any(|l| l.line_number == line) {
+                    if let Some(virt_line) = slice.physical_to_virtual(line) {
+                        let start_line = virt_line.saturating_sub(4).max(1);
+                        self.scroll_to_line(start_line);
+                    }
+                }
+                return;
+            }
             self.scroll_to_line_with_headroom(line, 4);
         }
     }
@@ -2638,8 +2772,7 @@ impl UltraViewerApp {
 
     pub fn activate_virtual_slice_from_query(&mut self) {
         if self.active_slice.is_some() {
-            self.active_slice = None;
-            self.scroll_to_line(1);
+            self.exit_virtual_slice();
             return;
         }
 
@@ -2663,9 +2796,100 @@ impl UltraViewerApp {
         self.scroll_to_line(1);
     }
 
-    pub fn exit_virtual_slice(&mut self) {
-        self.active_slice = None;
+    pub fn toggle_filter_view(&mut self) {
+        if self.active_slice.is_some() {
+            self.exit_virtual_slice();
+            return;
+        }
+
+        let matches = self.search_matches.read().unwrap();
+        if matches.is_empty() {
+            if !self.search_query.is_empty() {
+                drop(matches);
+                self.start_search();
+            }
+            return;
+        }
+
+        let mut lines: Vec<usize> = matches.iter().map(|m| m.line_number).collect();
+        drop(matches);
+        lines.sort_unstable();
+        lines.dedup();
+
+        let total_lines = self.line_index.as_ref().map(|i| i.total_lines()).unwrap_or(0);
+        let pattern = if self.search_query.pattern.is_empty() {
+            "Matches".to_string()
+        } else {
+            self.search_query.pattern.clone()
+        };
+
+        let slice = VirtualSlice::new(
+            format!("Filter: \"{}\"", pattern),
+            SliceSource::Search(pattern),
+            lines,
+            total_lines,
+        );
+
+        self.active_slice = Some(slice);
         self.scroll_to_line(1);
+    }
+
+    pub fn exit_virtual_slice(&mut self) {
+        let target_line = self.viewport.lines.first().map(|l| l.line_number).unwrap_or(1);
+        self.active_slice = None;
+        self.scroll_to_line(target_line);
+    }
+
+    pub fn toggle_hex_view(&mut self) {
+        if self.engine.is_none() {
+            return;
+        }
+        self.hex_viewer.is_enabled = !self.hex_viewer.is_enabled;
+        if self.hex_viewer.is_enabled {
+            // Synchronize text cursor line -> byte offset in hex viewer
+            if let (Some(ref engine), Some(ref index)) = (&self.engine, &self.line_index) {
+                if let Some(byte_off) = index.line_to_byte_offset(engine, self.current_line) {
+                    self.hex_viewer.selected_offset = Some(byte_off);
+                    let target_row = byte_off / self.hex_viewer.bytes_per_row as u64;
+                    let top_row = target_row.saturating_sub(4);
+                    self.hex_viewer.current_offset = top_row * self.hex_viewer.bytes_per_row as u64;
+                }
+            }
+        } else {
+            // Synchronize selected byte offset in hex viewer -> text line
+            if let Some(sel_off) = self.hex_viewer.selected_offset {
+                if let (Some(ref engine), Some(ref index)) = (&self.engine, &self.line_index) {
+                    let target_line = index.byte_offset_to_line(engine, sel_off);
+                    self.scroll_to_line(target_line);
+                }
+            }
+        }
+    }
+
+    pub fn copy_virtual_slice(&mut self, ctx: &egui::Context) {
+        let (Some(ref engine), Some(ref index), Some(ref slice)) = (&self.engine, &self.line_index, &self.active_slice) else {
+            return;
+        };
+
+        let mut lines = Vec::with_capacity(slice.matching_lines.len().min(50_000));
+        for &line_no in slice.matching_lines.iter().take(50_000) {
+            if let Some(offset) = index.line_to_byte_offset(engine, line_no) {
+                let next_offset = index.line_to_byte_offset(engine, line_no + 1).unwrap_or_else(|| engine.size());
+                let line_len = (next_offset.saturating_sub(offset)) as usize;
+                let max_len = line_len.min(65536);
+                if let Ok(bytes) = engine.read_range(offset, max_len) {
+                    let end_pos = memchr::memchr(b'\n', bytes).unwrap_or(bytes.len());
+                    let mut line_bytes = &bytes[..end_pos];
+                    if line_bytes.ends_with(b"\r") {
+                        line_bytes = &line_bytes[..line_bytes.len() - 1];
+                    }
+                    lines.push(String::from_utf8_lossy(line_bytes).to_string());
+                }
+            }
+        }
+        let count = lines.len();
+        ctx.copy_text(lines.join("\n"));
+        self.status_notification = Some((format!("Copied {} filtered lines to clipboard", count), Instant::now()));
     }
 
     pub fn export_virtual_slice(&mut self, output_path: &Path) {
@@ -2677,7 +2901,9 @@ impl UltraViewerApp {
             use std::io::Write;
             for &line_no in &slice.matching_lines {
                 if let Some(offset) = index.line_to_byte_offset(engine, line_no) {
-                    let max_len = 8192.min((engine.size() - offset) as usize);
+                    let next_offset = index.line_to_byte_offset(engine, line_no + 1).unwrap_or_else(|| engine.size());
+                    let line_len = (next_offset.saturating_sub(offset)) as usize;
+                    let max_len = line_len.min(10 * 1024 * 1024);
                     if let Ok(bytes) = engine.read_range(offset, max_len) {
                         let end_pos = memchr::memchr(b'\n', bytes).unwrap_or(bytes.len());
                         let _ = out_file.write_all(&bytes[..end_pos]);
@@ -2701,6 +2927,7 @@ impl UltraViewerApp {
         let temp_slice_path = temp_dir.join(format!("{}_slice_{}.{}", stem, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), ext));
 
         self.export_virtual_slice(&temp_slice_path);
+        self.exit_virtual_slice();
         self.open_file(&temp_slice_path);
     }
 
@@ -2799,7 +3026,12 @@ impl UltraViewerApp {
     }
 
     pub fn close_search_bar(&mut self) {
+        self.cancel_search();
         self.show_search_bar = false;
+        self.show_replace_bar = false;
+        self.active_match_idx = None;
+        self.search_matches.write().unwrap().clear();
+        self.last_executed_query = None;
     }
 
     pub fn is_search_bar_visible(&self) -> bool {
@@ -4155,7 +4387,7 @@ impl UltraViewerApp {
 
     pub fn scroll_lines(&mut self, delta: isize) {
         if self.engine.is_some() {
-            let max_line = self.line_index.as_ref().map(|i| i.total_lines()).unwrap_or(usize::MAX).max(1);
+            let max_line = self.get_total_lines();
             let new_line = if delta < 0 {
                 self.current_line.saturating_sub((-delta) as usize).max(1)
             } else {
@@ -4185,40 +4417,55 @@ impl UltraViewerApp {
     }
 
     pub fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.keymapper_modal.is_open {
+            return;
+        }
+
+        let trig_k = ctx.input(|i| {
+            let ctrl = i.modifiers.command || i.modifiers.ctrl;
+            let shift = i.modifiers.shift;
+            let alt = i.modifiers.alt;
+            self.keybindings.is_pressed(ShortcutAction::KeyboardShortcuts, i) || (!shift && !alt && ctrl && i.key_pressed(Key::K))
+        });
+
+        if trig_k {
+            self.keymapper_modal.open();
+        }
+
         let (ctrl_n, ctrl_o, ctrl_w, ctrl_s, ctrl_shift_s, ctrl_z, ctrl_y, ctrl_e, ctrl_f, ctrl_h, ctrl_d, ctrl_g, ctrl_a, ctrl_c, ctrl_x, del_or_backspace, alt_up, alt_down, ctrl_shift_e, ctrl_shift_f, ctrl_shift_t, ctrl_shift_b, ctrl_shift_m, ctrl_shift_a, ctrl_shift_p, ctrl_comma, f1, f3, shift_f3, esc, zoom_in, zoom_out, zoom_reset, up, down, page_up, page_down, home, end, alt_z, tab_pressed) = ctx.input(|i| {
-            let ctrl = i.modifiers.command;
+            let ctrl = i.modifiers.command || i.modifiers.ctrl;
             let shift = i.modifiers.shift;
             let alt = i.modifiers.alt;
             (
-                ctrl && !shift && i.key_pressed(Key::N),
-                ctrl && !shift && i.key_pressed(Key::O),
-                ctrl && !shift && i.key_pressed(Key::W),
-                ctrl && !shift && i.key_pressed(Key::S),
-                ctrl && shift && i.key_pressed(Key::S),
-                ctrl && !shift && i.key_pressed(Key::Z),
-                ctrl && !shift && i.key_pressed(Key::Y),
-                ctrl && !shift && i.key_pressed(Key::E),
-                ctrl && !shift && i.key_pressed(Key::F),
-                ctrl && !shift && i.key_pressed(Key::H),
+                self.keybindings.is_pressed(ShortcutAction::NewFile, i) || (ctrl && !shift && i.key_pressed(Key::N)),
+                self.keybindings.is_pressed(ShortcutAction::OpenFile, i) || (ctrl && !shift && i.key_pressed(Key::O)),
+                self.keybindings.is_pressed(ShortcutAction::CloseFile, i) || (ctrl && !shift && i.key_pressed(Key::W)),
+                self.keybindings.is_pressed(ShortcutAction::Save, i) || (ctrl && !shift && i.key_pressed(Key::S)),
+                self.keybindings.is_pressed(ShortcutAction::SaveAs, i) || (ctrl && shift && i.key_pressed(Key::S)),
+                self.keybindings.is_pressed(ShortcutAction::Undo, i) || (ctrl && !shift && i.key_pressed(Key::Z)),
+                self.keybindings.is_pressed(ShortcutAction::Redo, i) || (ctrl && !shift && i.key_pressed(Key::Y)),
+                self.keybindings.is_pressed(ShortcutAction::ToggleEditMode, i) || (ctrl && !shift && i.key_pressed(Key::E)),
+                self.keybindings.is_pressed(ShortcutAction::Find, i) || (ctrl && !shift && i.key_pressed(Key::F)),
+                self.keybindings.is_pressed(ShortcutAction::Replace, i) || (ctrl && !shift && i.key_pressed(Key::H)),
                 ctrl && !shift && i.key_pressed(Key::D),
-                ctrl && !shift && i.key_pressed(Key::G),
-                ctrl && !shift && i.key_pressed(Key::A),
+                self.keybindings.is_pressed(ShortcutAction::GotoLine, i) || (ctrl && !shift && i.key_pressed(Key::G)),
+                self.keybindings.is_pressed(ShortcutAction::SelectAll, i) || (ctrl && !shift && i.key_pressed(Key::A)),
                 ctrl && !shift && i.key_pressed(Key::C),
                 ctrl && !shift && i.key_pressed(Key::X),
                 (i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)),
                 alt && !ctrl && i.key_pressed(Key::ArrowUp),
                 alt && !ctrl && i.key_pressed(Key::ArrowDown),
-                ctrl && shift && i.key_pressed(Key::E),
+                self.keybindings.is_pressed(ShortcutAction::ToggleExplorer, i) || (ctrl && shift && i.key_pressed(Key::E)),
                 ctrl && shift && i.key_pressed(Key::F),
-                ctrl && shift && i.key_pressed(Key::T),
-                ctrl && shift && i.key_pressed(Key::B),
-                ctrl && shift && i.key_pressed(Key::M),
-                ctrl && shift && i.key_pressed(Key::A),
-                ctrl && shift && i.key_pressed(Key::P),
+                self.keybindings.is_pressed(ShortcutAction::ToggleStructure, i) || (ctrl && shift && i.key_pressed(Key::T)),
+                self.keybindings.is_pressed(ShortcutAction::FormatBeautify, i) || (ctrl && shift && i.key_pressed(Key::B)),
+                self.keybindings.is_pressed(ShortcutAction::FormatMinify, i) || (ctrl && shift && i.key_pressed(Key::M)),
+                self.keybindings.is_pressed(ShortcutAction::ToggleAnalyzer, i) || (ctrl && shift && i.key_pressed(Key::A)),
+                self.keybindings.is_pressed(ShortcutAction::CommandPalette, i) || (ctrl && shift && i.key_pressed(Key::P)),
                 ctrl && !shift && i.key_pressed(Key::Comma),
-                i.key_pressed(Key::F1),
-                i.key_pressed(Key::F3) && !shift,
-                i.key_pressed(Key::F3) && shift,
+                self.keybindings.is_pressed(ShortcutAction::AboutDialog, i) || i.key_pressed(Key::F1),
+                self.keybindings.is_pressed(ShortcutAction::FindNext, i) || (i.key_pressed(Key::F3) && !shift),
+                self.keybindings.is_pressed(ShortcutAction::FindPrev, i) || (i.key_pressed(Key::F3) && shift),
                 i.key_pressed(Key::Escape),
                 ctrl && (i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals)),
                 ctrl && i.key_pressed(Key::Minus),
@@ -4229,7 +4476,7 @@ impl UltraViewerApp {
                 i.key_pressed(Key::PageDown),
                 i.key_pressed(Key::Home),
                 i.key_pressed(Key::End),
-                alt && !ctrl && i.key_pressed(Key::Z),
+                self.keybindings.is_pressed(ShortcutAction::ToggleWordWrap, i) || (alt && !ctrl && i.key_pressed(Key::Z)),
                 i.key_pressed(Key::Tab),
             )
         });
@@ -4254,6 +4501,26 @@ impl UltraViewerApp {
         }
         if del_or_backspace && (has_multiline_selection || has_whole_line_gutter_selection) {
             self.delete_selection();
+        }
+        let in_modal_or_overlay = self.show_search_bar || self.command_palette.is_open || self.show_query_bar || self.url_modal_state.is_open;
+        if !in_modal_or_overlay && self.engine.is_some() {
+            let paste_text = ctx.input_mut(|i| {
+                let mut text = None;
+                i.events.retain(|e| {
+                    if let egui::Event::Paste(ref t) = e {
+                        if text.is_none() {
+                            text = Some(t.clone());
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+                text
+            });
+            if let Some(text) = paste_text {
+                self.paste_text_at_cursor(&text);
+            }
         }
         let shift_down_arrow = ctx.input(|i| i.modifiers.shift && !i.modifiers.command && !i.modifiers.alt && i.key_pressed(Key::ArrowDown));
         let shift_up_arrow = ctx.input(|i| i.modifiers.shift && !i.modifiers.command && !i.modifiers.alt && i.key_pressed(Key::ArrowUp));
@@ -4296,15 +4563,26 @@ impl UltraViewerApp {
                 self.indent_selection();
             }
         }
-        let ctrl_shift_u = ctx.input_mut(|i| {
-            let is_pressed = (i.modifiers.command || i.modifiers.ctrl) && i.modifiers.shift && i.key_pressed(Key::U);
+        let is_custom_open_url = ctx.input(|i| self.keybindings.is_pressed(ShortcutAction::OpenUrl, i));
+        let is_custom_upper = ctx.input(|i| self.keybindings.is_pressed(ShortcutAction::TransformUppercase, i));
+        let is_custom_lower = ctx.input(|i| self.keybindings.is_pressed(ShortcutAction::TransformLowercase, i));
+
+        let ctrl_shift_u = is_custom_upper || ctx.input_mut(|i| {
+            let is_pressed = (i.modifiers.command || i.modifiers.ctrl) && i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::U);
             if is_pressed {
                 i.events.retain(|e| !matches!(e, egui::Event::Key { key: Key::U, .. }));
             }
             is_pressed
         });
-        let ctrl_u = ctx.input_mut(|i| {
-            let is_pressed = (i.modifiers.command || i.modifiers.ctrl) && !i.modifiers.shift && i.key_pressed(Key::U);
+        let ctrl_alt_u = is_custom_lower || ctx.input_mut(|i| {
+            let is_pressed = (i.modifiers.command || i.modifiers.ctrl) && i.modifiers.alt && i.key_pressed(Key::U);
+            if is_pressed {
+                i.events.retain(|e| !matches!(e, egui::Event::Key { key: Key::U, .. }));
+            }
+            is_pressed
+        });
+        let ctrl_u = is_custom_open_url || ctx.input_mut(|i| {
+            let is_pressed = (i.modifiers.command || i.modifiers.ctrl) && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::U);
             if is_pressed {
                 i.events.retain(|e| !matches!(e, egui::Event::Key { key: Key::U, .. }));
             }
@@ -4314,8 +4592,31 @@ impl UltraViewerApp {
         if ctrl_shift_u && self.engine.is_some() {
             self.transform_selection_case(ctx, true);
         }
-        if ctrl_u && self.engine.is_some() {
+        if ctrl_alt_u && self.engine.is_some() {
             self.transform_selection_case(ctx, false);
+        }
+        if ctrl_u {
+            self.url_modal_state.open();
+        }
+
+        let (is_next_tab, is_prev_tab) = ctx.input_mut(|i| {
+            let ctrl = i.modifiers.command || i.modifiers.ctrl;
+            let shift = i.modifiers.shift;
+            let alt = i.modifiers.alt;
+            let next = !alt && ctrl && !shift && (i.key_pressed(Key::Tab) || i.key_pressed(Key::PageDown));
+            let prev = !alt && ctrl && ((shift && i.key_pressed(Key::Tab)) || i.key_pressed(Key::PageUp));
+            if next || prev {
+                i.events.retain(|e| !matches!(e, egui::Event::Key { key: Key::Tab | Key::PageDown | Key::PageUp, .. }));
+            }
+            (next, prev)
+        });
+        let custom_next_tab = ctx.input(|i| self.keybindings.is_pressed(ShortcutAction::NextTab, i));
+        let custom_prev_tab = ctx.input(|i| self.keybindings.is_pressed(ShortcutAction::PrevTab, i));
+
+        if is_next_tab || custom_next_tab {
+            self.next_tab();
+        } else if is_prev_tab || custom_prev_tab {
+            self.prev_tab();
         }
         if ctrl_shift_l && self.engine.is_some() {
             self.select_all_occurrences(ctx);
@@ -4343,10 +4644,6 @@ impl UltraViewerApp {
         }
         if ctrl_o {
             self.trigger_file_dialog();
-        }
-        let ctrl_u = ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::U));
-        if ctrl_u {
-            self.url_modal_state.open();
         }
         if ctrl_w {
             self.close_file();
@@ -4398,9 +4695,25 @@ impl UltraViewerApp {
         if alt_z {
             self.word_wrap = !self.word_wrap;
         }
+        let alt_f = ctx.input(|i| self.keybindings.is_pressed(ShortcutAction::ToggleFilterView, i) || (i.modifiers.alt && !i.modifiers.shift && !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(Key::F)));
+        if alt_f && self.engine.is_some() {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| !matches!(e, egui::Event::Key { key: Key::F, .. }));
+            });
+            self.toggle_filter_view();
+        }
+        let ctrl_shift_h = ctx.input(|i| self.keybindings.is_pressed(ShortcutAction::ToggleHexView, i) || (i.modifiers.shift && (i.modifiers.ctrl || i.modifiers.command) && !i.modifiers.alt && i.key_pressed(Key::H)));
+        if ctrl_shift_h && self.engine.is_some() {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| !matches!(e, egui::Event::Key { key: Key::H, .. }));
+            });
+            self.toggle_hex_view();
+        }
         if ctrl_f && self.engine.is_some() {
-            self.show_search_bar = true;
-            self.focus_search_input = true;
+            ctx.input_mut(|i| {
+                i.events.retain(|e| !matches!(e, egui::Event::Key { key: Key::F, .. }));
+            });
+            self.trigger_find_with_selection(ctx);
         }
         if ctrl_shift_f && self.engine.is_some() {
             self.show_search_bar = !self.show_search_bar;
@@ -4411,7 +4724,7 @@ impl UltraViewerApp {
         if ctrl_g && self.engine.is_some() {
             self.show_goto_line_dialog = true;
         }
-        let ctrl_shift_q = ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(Key::Q));
+        let ctrl_shift_q = ctx.input(|i| self.keybindings.is_pressed(ShortcutAction::ToggleQueryBar, i) || (i.modifiers.command && i.modifiers.shift && i.key_pressed(Key::Q)));
         if ctrl_shift_q && self.engine.is_some() {
             self.show_query_bar = !self.show_query_bar;
             if self.show_query_bar && self.query_text.is_empty() {
@@ -4456,7 +4769,9 @@ impl UltraViewerApp {
             self.find_prev();
         }
         if esc {
-            if self.url_modal_state.is_open {
+            if self.keymapper_modal.is_open {
+                self.keymapper_modal.close();
+            } else if self.url_modal_state.is_open {
                 self.url_modal_state.close();
             } else if self.analyzer_state.is_open {
                 self.cancel_analysis();
@@ -4470,7 +4785,7 @@ impl UltraViewerApp {
             } else if self.show_replace_bar {
                 self.show_replace_bar = false;
             } else if self.show_search_bar {
-                self.show_search_bar = false;
+                self.close_search_bar();
             } else if self.show_query_bar {
                 self.show_query_bar = false;
             } else if self.active_slice.is_some() {
@@ -4818,6 +5133,24 @@ impl eframe::App for UltraViewerApp {
             }
         }
 
+        // Sync live search matches to active virtual slice if in Search filter mode
+        if let Some(ref mut slice) = self.active_slice {
+            if let SliceSource::Search(_) = &slice.source {
+                let matches_count = self.search_matches.read().unwrap().len();
+                if matches_count > slice.matching_lines.len() {
+                    let matches = self.search_matches.read().unwrap();
+                    let mut lines: Vec<usize> = matches.iter().map(|m| m.line_number).collect();
+                    drop(matches);
+                    lines.sort_unstable();
+                    lines.dedup();
+                    if lines.len() != slice.matching_lines.len() {
+                        slice.matching_lines = lines;
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+
         // Poll background JSON structure tree builder
         if let Some(ref rx) = self.json_tree_rx {
             match rx.try_recv() {
@@ -5032,10 +5365,7 @@ impl eframe::App for UltraViewerApp {
                     self.word_wrap = !self.word_wrap;
                     self.persist_session();
                 }
-                MenuAction::Find => {
-                    self.show_search_bar = true;
-                    self.focus_search_input = true;
-                }
+                MenuAction::Find => self.trigger_find_with_selection(ctx),
                 MenuAction::FindAndReplace => self.toggle_find_and_replace(ctx),
                 MenuAction::SelectNextOccurrence => self.select_next_occurrence(ctx),
                 MenuAction::SelectAllOccurrences => self.select_all_occurrences(ctx),
@@ -5088,6 +5418,7 @@ impl eframe::App for UltraViewerApp {
                     self.command_palette.query.clear();
                 }
                 MenuAction::ToggleCsvGrid => self.csv_grid.is_enabled = !self.csv_grid.is_enabled,
+                MenuAction::ToggleHexView => self.toggle_hex_view(),
                 MenuAction::OpenDiffViewer => self.diff_viewer.is_open = true,
                 MenuAction::RegisterContextMenu => {
                     match ContextMenuManager::register() {
@@ -5105,6 +5436,7 @@ impl eframe::App for UltraViewerApp {
                 MenuAction::TransformLowercase => self.transform_selection_case(ctx, false),
                 MenuAction::CopyXPath => self.copy_current_xpath(ctx),
                 MenuAction::SetTheme(t) => self.set_theme(t, ctx),
+                MenuAction::OpenKeyboardShortcuts => self.keymapper_modal.open(),
                 MenuAction::About => self.show_about_dialog = true,
                 MenuAction::ToggleAutoSave => {
                     self.auto_save = !self.auto_save;
@@ -5151,6 +5483,7 @@ impl eframe::App for UltraViewerApp {
                         font_size: self.font_size,
                         current_xpath: self.current_xpath.as_deref(),
                         word_wrap: self.word_wrap,
+                        is_hex_mode: self.hex_viewer.is_enabled,
                     },
                 )
             })
@@ -5168,6 +5501,7 @@ impl eframe::App for UltraViewerApp {
                     self.word_wrap = !self.word_wrap;
                     self.persist_session();
                 }
+                StatusBarAction::ToggleHexView => self.toggle_hex_view(),
             }
         }
 
@@ -5381,6 +5715,7 @@ impl eframe::App for UltraViewerApp {
                     is_dirty,
                     is_edit_mode: self.is_edit_mode,
                     word_wrap: self.word_wrap,
+                    is_hex_mode: self.hex_viewer.is_enabled,
                     current_line: self.current_line,
                     total_lines,
                     breadcrumb: None,
@@ -5396,6 +5731,7 @@ impl eframe::App for UltraViewerApp {
                         TabBarAction::ToggleEditMode => action_toggle_edit = true,
                         TabBarAction::SaveFile => action_save = true,
                         TabBarAction::ToggleWrap => self.word_wrap = !self.word_wrap,
+                        TabBarAction::ToggleHexView => self.toggle_hex_view(),
                         TabBarAction::ToggleSearch => action_toggle_search = true,
                         TabBarAction::ToggleTree => {
                             self.active_activity_panel = match self.active_activity_panel {
@@ -5489,6 +5825,7 @@ impl eframe::App for UltraViewerApp {
         let mut exit_slice = false;
         let mut export_slice = false;
         let mut open_slice_tab = false;
+        let mut copy_slice = false;
 
         if let Some(ref slice) = self.active_slice {
             egui::TopBottomPanel::top("virtual_slice_banner")
@@ -5510,6 +5847,9 @@ impl eframe::App for UltraViewerApp {
                             if ui.button("💾 Export Slice...").clicked() {
                                 export_slice = true;
                             }
+                            if ui.button("📋 Copy All").clicked() {
+                                copy_slice = true;
+                            }
                         });
                     });
                 });
@@ -5520,6 +5860,9 @@ impl eframe::App for UltraViewerApp {
         }
         if open_slice_tab {
             self.open_virtual_slice_in_new_tab();
+        }
+        if copy_slice {
+            self.copy_virtual_slice(ctx);
         }
         if export_slice {
             if let Some(p) = rfd::FileDialog::new().set_title("Export Virtual Slice").save_file() {
@@ -5550,9 +5893,10 @@ impl eframe::App for UltraViewerApp {
             self.start_save_in_place();
         }
         if action_toggle_search {
-            self.show_search_bar = !self.show_search_bar;
             if self.show_search_bar {
-                self.focus_search_input = true;
+                self.close_search_bar();
+            } else {
+                self.open_search_bar();
             }
         }
         if action_beautify {
@@ -5759,6 +6103,7 @@ impl eframe::App for UltraViewerApp {
                                 self.show_replace_bar,
                                 &mut self.replace_text,
                                 req_rep_focus,
+                                self.active_slice.is_some(),
                             ) {
                                 match action {
                                     SearchBarAction::FindAll => {
@@ -5767,11 +6112,9 @@ impl eframe::App for UltraViewerApp {
                                     }
                                     SearchBarAction::FindNext => self.find_next(),
                                     SearchBarAction::FindPrev => self.find_prev(),
+                                    SearchBarAction::ToggleFilter => self.toggle_filter_view(),
                                     SearchBarAction::Cancel => self.cancel_search(),
-                                    SearchBarAction::Close => {
-                                        self.show_search_bar = false;
-                                        self.show_replace_bar = false;
-                                    }
+                                    SearchBarAction::Close => self.close_search_bar(),
                                     SearchBarAction::ToggleReplace => {
                                         self.show_replace_bar = !self.show_replace_bar;
                                         if self.show_replace_bar {
@@ -5838,6 +6181,8 @@ impl eframe::App for UltraViewerApp {
                         ui.label(RichText::new("or drag and drop a file anywhere into this window").size(12.0).color(Color32::from_rgb(110, 120, 138)));
                     });
                 });
+            } else if self.hex_viewer.is_enabled {
+                self.render_hex_viewer_view(ui);
             } else if self.csv_grid.is_enabled {
                 self.render_csv_grid_view(ui);
             } else {
@@ -6053,6 +6398,9 @@ impl eframe::App for UltraViewerApp {
                 }
             }
         }
+
+        // Keyboard Shortcuts Mapper Modal
+        render_keymapper_modal(ctx, &mut self.keymapper_modal, &mut self.keybindings, is_dark_mode);
 
         // Field Analyzer & Schema Profiler Panel
         if let Some(act) = render_analyzer_panel(ctx, &mut self.analyzer_state) {
@@ -6298,10 +6646,7 @@ impl UltraViewerApp {
             PaletteAction::CloseAllTabs => self.close_all_tabs(),
             PaletteAction::SaveFile => self.start_save_in_place(),
             PaletteAction::SaveFileAs => self.start_save_as(),
-            PaletteAction::Find => {
-                self.show_search_bar = true;
-                self.focus_search_input = true;
-            }
+            PaletteAction::Find => self.trigger_find_with_selection(ctx),
             PaletteAction::FindAndReplace => self.toggle_find_and_replace(ctx),
             PaletteAction::SelectNextOccurrence => self.select_next_occurrence(ctx),
             PaletteAction::SelectAllOccurrences => self.select_all_occurrences(ctx),
@@ -6316,6 +6661,8 @@ impl UltraViewerApp {
                 self.word_wrap = !self.word_wrap;
                 self.persist_session();
             }
+            PaletteAction::ToggleFilterView => self.toggle_filter_view(),
+            PaletteAction::ToggleHexView => self.toggle_hex_view(),
             PaletteAction::ZoomIn => {
                 self.font_size = (self.font_size + 1.0).min(36.0);
                 self.persist_session();
@@ -6380,6 +6727,7 @@ impl UltraViewerApp {
             PaletteAction::TransformUppercase => self.transform_selection_case(ctx, true),
             PaletteAction::TransformLowercase => self.transform_selection_case(ctx, false),
             PaletteAction::CopyXPath => self.copy_current_xpath(ctx),
+            PaletteAction::KeyboardShortcuts => self.keymapper_modal.open(),
         }
     }
 fn count_exact_xml_tags(line: &str, tag_name: &str) -> (usize, usize) {
@@ -6484,6 +6832,20 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
     None
 }
 
+    fn render_hex_viewer_view(&mut self, ui: &mut Ui) {
+        if let Some(ref engine) = self.engine {
+            let dark_mode = ui.visuals().dark_mode;
+            let action = render_hex_viewer(ui, engine, &mut self.hex_viewer, self.font_size, dark_mode);
+            match action {
+                HexViewerAction::Close => self.toggle_hex_view(),
+                HexViewerAction::CopyText(txt) => {
+                    ui.ctx().copy_text(txt);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn render_csv_grid_view(&mut self, ui: &mut Ui) {
         let available_rect = ui.available_rect_before_wrap();
         let top_padding = 4.0;
@@ -6539,17 +6901,21 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
         {
             let active_match_line = if self.show_query_bar && !self.query_matches.is_empty() && self.query_match_idx > 0 {
                 self.query_matches.get(self.query_match_idx - 1).map(|m| m.line_number)
-            } else {
+            } else if self.show_search_bar {
                 self.active_match_idx.and_then(|idx| {
                     self.search_matches.read().unwrap().get(idx).map(|m| m.line_number)
                 })
+            } else {
+                None
             };
             let matches_guard = self.search_matches.read().unwrap();
+            let empty_matches = Vec::new();
+            let ruler_matches = if self.show_search_bar { &matches_guard } else { &empty_matches };
             let ruler_props = OverviewRulerProps {
                 current_line: self.current_line,
                 visible_lines_count: screen_lines.min(total_lines),
                 total_lines,
-                search_matches: &matches_guard,
+                search_matches: ruler_matches,
                 active_match_line,
             };
             let mut ruler_ui = ui.new_child(
@@ -6583,10 +6949,12 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
 
         let active_match_line = if self.show_query_bar && !self.query_matches.is_empty() && self.query_match_idx > 0 {
             self.query_matches.get(self.query_match_idx - 1).map(|m| m.line_number)
-        } else {
+        } else if self.show_search_bar {
             self.active_match_idx.and_then(|idx| {
                 self.search_matches.read().unwrap().get(idx).map(|m| m.line_number)
             })
+        } else {
+            None
         };
         let query_match_pattern = if self.show_query_bar && !self.query_matches.is_empty() && self.query_match_idx > 0 {
             let match_item = &self.query_matches[self.query_match_idx - 1];
@@ -6610,6 +6978,7 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
         let search_case = self.search_query.case_sensitive;
         let word_wrap = self.word_wrap;
         let mut scroll_target = None;
+        let mut exit_slice_to_line: Option<usize> = None;
         let mut open_inspector_for: Option<(usize, u64)> = None;
 
         let dark_mode = ui.visuals().dark_mode;
@@ -6669,6 +7038,22 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
             self.mouse_drag_start_col = None;
         }
         let mut drag_start_detected = None;
+
+        if self.viewport.lines.is_empty() {
+            let initial_text = self.document.as_ref()
+                .and_then(|d| d.get_line_override(1))
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            self.viewport.lines.push(ViewportLine {
+                line_number: 1,
+                byte_offset: 0,
+                text: initial_text,
+                is_truncated: false,
+            });
+            if self.current_line == 0 {
+                self.current_line = 1;
+            }
+        }
 
         let mut char_sel = self.char_selection_range();
         let mut pending_focus = self.pending_focus_line;
@@ -6760,6 +7145,9 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                                         egui::vec2(num_col_w, line_h),
                                         Sense::click_and_drag(),
                                     );
+                                    if num_resp.double_clicked() && self.active_slice.is_some() {
+                                        exit_slice_to_line = Some(line_no);
+                                    }
                                     if is_selected {
                                         ui.painter().rect_filled(
                                             num_rect,
@@ -6978,6 +7366,9 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                                         .and_then(|state| state.cursor.char_range())
                                         .map(|r| (r.primary.index, r.primary.index != r.secondary.index))
                                         .unwrap_or((line_text.chars().count(), false));
+                                    if self.active_edit_line == Some(line_no) {
+                                        self.active_cursor_col = current_col;
+                                    }
 
                                     if self.active_edit_line == Some(line_no) && enter_pressed {
                                         split_requested = Some((line_no, current_col));
@@ -7138,6 +7529,9 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                                             egui::vec2(num_col_w, line_h),
                                             Sense::click_and_drag(),
                                         );
+                                        if num_resp.double_clicked() && self.active_slice.is_some() {
+                                            exit_slice_to_line = Some(line_no);
+                                        }
                                         if is_selected {
                                             ui.painter().rect_filled(
                                                 num_rect,
@@ -7369,6 +7763,9 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
                                                     .and_then(|state| state.cursor.char_range())
                                                     .map(|r| (r.primary.index, r.primary.index != r.secondary.index))
                                                     .unwrap_or((line_text.chars().count(), false));
+                                                if self.active_edit_line == Some(line_no) {
+                                                    self.active_cursor_col = current_col;
+                                                }
 
                                                 if has_newline {
                                                     line_text.retain(|c| c != '\n' && c != '\r');
@@ -7482,11 +7879,13 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
         // Heatmap Overview Ruler on the right (Option B)
         {
             let matches_guard = self.search_matches.read().unwrap();
+            let empty_matches = Vec::new();
+            let ruler_matches = if self.show_search_bar { &matches_guard } else { &empty_matches };
             let ruler_props = OverviewRulerProps {
                 current_line: self.current_line,
                 visible_lines_count: screen_lines.min(total_lines),
                 total_lines,
-                search_matches: &matches_guard,
+                search_matches: ruler_matches,
                 active_match_line,
             };
             let mut ruler_ui = ui.new_child(egui::UiBuilder::new().max_rect(ruler_rect).layout(egui::Layout::top_down(egui::Align::Min)));
@@ -7529,9 +7928,23 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
             focused_line = None;
             ui.ctx().memory_mut(|m| m.stop_text_input());
         }
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            if primary_pressed && viewport_rect.contains(pos) && focused_line.is_none() && !self.gutter_drag_active && self.active_edit_line.is_none() {
+                let target_line = self.viewport.lines.last().map(|l| l.line_number).unwrap_or(1);
+                let text = self.viewport.lines.iter().find(|l| l.line_number == target_line)
+                    .map(|l| l.text.clone())
+                    .unwrap_or_default();
+                let col = text.chars().count();
+                focused_line = Some((target_line, text, Some(col)));
+                self.pending_focus_line = Some((target_line, col));
+            }
+        }
         if let Some((line_no, text, col)) = focused_line {
             self.active_edit_line = Some(line_no);
             self.current_line = line_no;
+            if let Some(c) = col {
+                self.active_cursor_col = c;
+            }
             self.edit_line_buffer = text.clone();
             self.line_edit_initial_texts.entry(line_no).or_insert(text);
             self.schedule_xpath_resolution(line_no, col, true);
@@ -7611,6 +8024,10 @@ fn find_folding_end(lines: &[crate::editor::ViewportLine], start_idx: usize) -> 
 
         if let Some(target) = scroll_target {
             self.scroll_to_line(target);
+        }
+        if let Some(target) = exit_slice_to_line {
+            self.active_slice = None;
+            self.scroll_to_line_with_headroom(target, 4);
         }
 
         // Handle inspector open request — must be done after the UI borrows above are released.
@@ -8648,5 +9065,374 @@ mod tests {
         app.scroll_accumulator -= lines_smooth as f32 * 12.0;
         assert_eq!(app.scroll_accumulator, -3.0); // clean remainder preserved
     }
+
+    #[test]
+    fn test_trigger_find_with_selection_copies_text_and_focuses() {
+        let ctx = egui::Context::default();
+        let mut app = UltraViewerApp::default();
+        app.engine = Some(Arc::new(FileEngine::empty()));
+        app.viewport.lines.push(ViewportLine {
+            line_number: 1,
+            byte_offset: 0,
+            text: "Hello World searching for test".to_string(),
+            is_truncated: false,
+        });
+
+        // Select "World" (char index 6 to 11)
+        app.selection_anchor = Some(1);
+        app.selection_anchor_col = Some(6);
+        app.selection_head = Some(1);
+        app.selection_head_col = Some(11);
+
+        app.trigger_find_with_selection(&ctx);
+
+        assert_eq!(app.search_query.pattern, "World");
+        assert!(app.show_search_bar);
+        assert!(app.focus_search_input);
+    }
+
+    #[test]
+    fn test_trigger_find_with_selection_no_selection_preserves_query() {
+        let ctx = egui::Context::default();
+        let mut app = UltraViewerApp::default();
+        app.engine = Some(Arc::new(FileEngine::empty()));
+        app.search_query.pattern = "existing_pattern".to_string();
+
+        app.trigger_find_with_selection(&ctx);
+
+        assert_eq!(app.search_query.pattern, "existing_pattern");
+        assert!(app.show_search_bar);
+        assert!(app.focus_search_input);
+    }
+
+    #[test]
+    fn test_trigger_find_with_selection_from_line_editor() {
+        let ctx = egui::Context::default();
+        let mut app = UltraViewerApp::default();
+        app.engine = Some(Arc::new(FileEngine::empty()));
+        let active_line = 1;
+        app.active_edit_line = Some(active_line);
+        let initial = "<title>Special Keyword</title>".to_string();
+        app.viewport.lines.push(ViewportLine {
+            line_number: active_line,
+            byte_offset: 0,
+            text: initial.clone(),
+            is_truncated: false,
+        });
+
+        // Select "Keyword" (chars 15..22)
+        let edit_id = egui::Id::new("line_editor").with(active_line);
+        let mut state = egui::text_edit::TextEditState::default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(15),
+            egui::text::CCursor::new(22),
+        )));
+        state.store(&ctx, edit_id);
+
+        app.trigger_find_with_selection(&ctx);
+
+        assert_eq!(app.search_query.pattern, "Keyword");
+        assert!(app.show_search_bar);
+        assert!(app.focus_search_input);
+    }
+
+    #[test]
+    fn test_toggle_filter_view_activates_and_exits() {
+        let mut app = UltraViewerApp::default();
+        app.engine = Some(Arc::new(FileEngine::empty()));
+        {
+            let mut matches = app.search_matches.write().unwrap();
+            matches.push(SearchResultMatch {
+                line_number: 10,
+                byte_offset: 100,
+                match_length: 5,
+                snippet: "error 1".to_string(),
+            });
+            matches.push(SearchResultMatch {
+                line_number: 25,
+                byte_offset: 250,
+                match_length: 5,
+                snippet: "error 2".to_string(),
+            });
+            matches.push(SearchResultMatch {
+                line_number: 50,
+                byte_offset: 500,
+                match_length: 5,
+                snippet: "error 3".to_string(),
+            });
+        }
+        app.search_query.pattern = "error".to_string();
+
+        assert!(app.active_slice.is_none());
+
+        // Toggle ON
+        app.toggle_filter_view();
+        assert!(app.active_slice.is_some());
+        assert_eq!(app.active_slice.as_ref().unwrap().line_count(), 3);
+        assert_eq!(app.get_total_lines(), 3);
+
+        // Toggle OFF
+        app.toggle_filter_view();
+        assert!(app.active_slice.is_none());
+    }
+
+    #[test]
+    fn test_select_match_in_filtered_view() {
+        let mut app = UltraViewerApp::default();
+        app.engine = Some(Arc::new(FileEngine::empty()));
+        {
+            let mut matches = app.search_matches.write().unwrap();
+            matches.push(SearchResultMatch {
+                line_number: 10,
+                byte_offset: 100,
+                match_length: 5,
+                snippet: "error 1".to_string(),
+            });
+            matches.push(SearchResultMatch {
+                line_number: 25,
+                byte_offset: 250,
+                match_length: 5,
+                snippet: "error 2".to_string(),
+            });
+        }
+        app.search_query.pattern = "error".to_string();
+        app.toggle_filter_view();
+
+        assert!(app.active_slice.is_some());
+        app.select_match(1);
+        assert_eq!(app.active_match_idx, Some(1));
+    }
+
+    #[test]
+    fn test_virtual_slice_open_in_new_tab_and_tab_switching() {
+        let temp_dir = std::env::temp_dir().join(format!("uv_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let orig_file = temp_dir.join("original.txt");
+        let content = "line 1: hello\nline 2: error found\nline 3: world\nline 4: another error\nline 5: done\n";
+        std::fs::write(&orig_file, content).unwrap();
+
+        let mut app = UltraViewerApp::default();
+        app.do_open_file(&orig_file);
+
+        let tab_1_id = app.active_tab_id.expect("tab 1 active");
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.active_slice.is_none());
+
+        // Perform search match for "error"
+        {
+            let mut matches = app.search_matches.write().unwrap();
+            matches.push(SearchResultMatch {
+                line_number: 2,
+                byte_offset: 14,
+                match_length: 5,
+                snippet: "error found".to_string(),
+            });
+            matches.push(SearchResultMatch {
+                line_number: 4,
+                byte_offset: 42,
+                match_length: 5,
+                snippet: "another error".to_string(),
+            });
+        }
+        app.search_query.pattern = "error".to_string();
+        app.toggle_filter_view();
+        assert!(app.active_slice.is_some());
+        assert_eq!(app.get_total_lines(), 2);
+
+        // Open virtual slice in new tab
+        app.open_virtual_slice_in_new_tab();
+
+        // 2 tabs now
+        assert_eq!(app.tabs.len(), 2);
+        let tab_2_id = app.active_tab_id.expect("tab 2 active");
+        assert_ne!(tab_1_id, tab_2_id);
+
+        // Tab 2 must not have active slice; it is a regular document
+        assert!(app.active_slice.is_none());
+        assert_eq!(app.get_total_lines(), 2);
+
+        // Switch back to Tab 1 (the original file)
+        app.switch_to_tab(tab_1_id);
+        assert_eq!(app.active_tab_id, Some(tab_1_id));
+
+        // Tab 1 exited slice when exporting to new tab and restores full file
+        assert!(app.active_slice.is_none());
+        assert_eq!(app.get_total_lines(), 5);
+
+        // Switch to Tab 2 again
+        app.switch_to_tab(tab_2_id);
+        assert_eq!(app.active_tab_id, Some(tab_2_id));
+        assert!(app.active_slice.is_none());
+        assert_eq!(app.get_total_lines(), 2);
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_hex_view_toggle_and_sync() {
+        let temp_dir = std::env::temp_dir().join(format!("uv_test_hex_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let file_path = temp_dir.join("sample.txt");
+        let content = "First Line\nSecond Line\nThird Line\nFourth Line\n";
+        std::fs::write(&file_path, content).unwrap();
+
+        let mut app = UltraViewerApp::default();
+        app.do_open_file(&file_path);
+
+        assert!(!app.hex_viewer.is_enabled);
+        assert_eq!(app.get_total_lines(), 4);
+
+        // Jump to line 2 (1-based index)
+        app.current_line = 2;
+        app.toggle_hex_view();
+
+        assert!(app.hex_viewer.is_enabled);
+        // "First Line\n" is 11 bytes, so line 2 starts at offset 11
+        assert_eq!(app.hex_viewer.selected_offset, Some(11));
+
+        // Now move the selected byte offset in hex viewer to line 3 (starts at offset 23)
+        app.hex_viewer.selected_offset = Some(25); // Inside "Third Line\n"
+
+        // Toggle hex view off -> returns to text editor synced to line 3
+        app.toggle_hex_view();
+        assert!(!app.hex_viewer.is_enabled);
+        assert_eq!(app.current_line, 3);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_close_tab_active_and_inactive() {
+        let temp_dir = std::env::temp_dir().join(format!("uv_test_close_tabs_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let f1 = temp_dir.join("f1.txt");
+        let f2 = temp_dir.join("f2.txt");
+        let f3 = temp_dir.join("f3.txt");
+        std::fs::write(&f1, "file 1 content").unwrap();
+        std::fs::write(&f2, "file 2 content").unwrap();
+        std::fs::write(&f3, "file 3 content").unwrap();
+
+        let mut app = UltraViewerApp::default();
+        app.do_open_file(&f1);
+        let id1 = app.active_tab_id.unwrap();
+
+        app.do_open_file(&f2);
+        let id2 = app.active_tab_id.unwrap();
+
+        app.do_open_file(&f3);
+        let id3 = app.active_tab_id.unwrap();
+
+        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(app.active_tab_id, Some(id3));
+
+        // 1. Close inactive tab id2
+        app.close_tab_by_id(id2);
+        assert_eq!(app.tabs.len(), 2);
+        // Active tab remains id3
+        assert_eq!(app.active_tab_id, Some(id3));
+
+        // 2. Close active tab id3
+        app.close_tab_by_id(id3);
+        assert_eq!(app.tabs.len(), 1);
+        // Active tab falls back to remaining tab id1
+        assert_eq!(app.active_tab_id, Some(id1));
+
+        // 3. Close remaining tab id1
+        app.close_tab_by_id(id1);
+        assert_eq!(app.tabs.len(), 0);
+        assert_eq!(app.active_tab_id, None);
+        assert!(app.engine.is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_close_search_bar_clears_active_match() {
+        let mut app = UltraViewerApp::default();
+        app.show_search_bar = true;
+        app.active_match_idx = Some(2);
+        app.search_matches.write().unwrap().push(crate::search::SearchResultMatch {
+            line_number: 10,
+            byte_offset: 100,
+            match_length: 5,
+            snippet: "test match".to_string(),
+        });
+        assert!(app.show_search_bar);
+        assert_eq!(app.active_match_idx, Some(2));
+        assert_eq!(app.search_matches.read().unwrap().len(), 1);
+
+        app.close_search_bar();
+        assert!(!app.show_search_bar);
+        assert_eq!(app.active_match_idx, None);
+        assert!(app.search_matches.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_tab_navigation_and_cycling() {
+        let temp_dir = std::env::temp_dir().join("ultraviewer_tab_cycle_test");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let f1 = temp_dir.join("tab1.txt");
+        let f2 = temp_dir.join("tab2.txt");
+        let f3 = temp_dir.join("tab3.txt");
+        std::fs::write(&f1, "tab 1 content").unwrap();
+        std::fs::write(&f2, "tab 2 content").unwrap();
+        std::fs::write(&f3, "tab 3 content").unwrap();
+
+        let mut app = UltraViewerApp::default();
+        app.do_open_file(&f1);
+        let id1 = app.active_tab_id.unwrap();
+        app.do_open_file(&f2);
+        let id2 = app.active_tab_id.unwrap();
+        app.do_open_file(&f3);
+        let id3 = app.active_tab_id.unwrap();
+
+        assert_eq!(app.active_tab_id, Some(id3));
+
+        // Next tab cycles from id3 -> id1
+        app.next_tab();
+        assert_eq!(app.active_tab_id, Some(id1));
+
+        // Next tab cycles from id1 -> id2
+        app.next_tab();
+        assert_eq!(app.active_tab_id, Some(id2));
+
+        // Prev tab cycles from id2 -> id1
+        app.prev_tab();
+        assert_eq!(app.active_tab_id, Some(id1));
+
+        // Prev tab cycles from id1 -> id3
+        app.prev_tab();
+        assert_eq!(app.active_tab_id, Some(id3));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_empty_blank_file_editing_and_pasting() {
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+
+        // 1. Should have 1 line initialized
+        assert_eq!(app.get_total_lines(), 1);
+        assert_eq!(app.viewport.lines.len(), 1);
+        assert_eq!(app.viewport.lines[0].line_number, 1);
+        assert_eq!(app.viewport.lines[0].text, "");
+        assert_eq!(app.active_edit_line, Some(1));
+
+        // 2. Typing into line 1
+        app.type_text_at_cursor("hello world");
+        assert_eq!(app.viewport.lines[0].text, "hello world");
+        assert_eq!(app.document.as_ref().unwrap().get_line_override(1), Some("hello world"));
+
+        // 3. Pasting multiline text into the file
+        app.paste_text_at_cursor("\nsecond line\nthird line");
+        assert_eq!(app.get_total_lines(), 3);
+        assert_eq!(app.viewport.lines.len(), 3);
+        assert_eq!(app.viewport.lines[0].text, "hello world");
+        assert_eq!(app.viewport.lines[1].text, "second line");
+        assert_eq!(app.viewport.lines[2].text, "third line");
+    }
 }
+
 

@@ -33,3 +33,5 @@ path = "src/bin/qa_agent.rs"
 name = "ultraviewer"
 path = "src/lib.rs"
 
+[build-dependencies]
+winres = "0.1"

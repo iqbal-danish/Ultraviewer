@@ -17,13 +17,8 @@ pub struct LineIndex {
 impl LineIndex {
     pub fn new(file_size: u64, encoding: Encoding) -> Self {
         let bom_len = encoding.bom_length() as u64;
-        let initial_checkpoints = if file_size > 0 {
-            vec![bom_len]
-        } else {
-            Vec::new()
-        };
-
-        let initial_lines = if file_size > 0 { 1 } else { 0 };
+        let initial_checkpoints = vec![bom_len];
+        let initial_lines = 1;
 
         Self {
             file_size,
@@ -87,11 +82,14 @@ impl LineIndex {
 
     /// Map 1-based line number to its exact byte offset.
     pub fn line_to_byte_offset(&self, engine: &FileEngine, target_line: usize) -> Option<u64> {
-        if target_line == 0 || self.file_size == 0 {
+        if target_line == 0 {
             return None;
         }
         if target_line == 1 {
             return Some(self.encoding.bom_length() as u64);
+        }
+        if self.file_size == 0 {
+            return None;
         }
 
         let cp_idx = (target_line - 1) / CHECKPOINT_INTERVAL;

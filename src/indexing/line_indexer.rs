@@ -25,7 +25,7 @@ impl LineIndexer {
             .spawn(move || {
                 let file_size = engine.size();
                 if file_size == 0 {
-                    index.mark_complete(0);
+                    index.mark_complete(1);
                     return;
                 }
 

@@ -37,6 +37,8 @@ pub enum Icon {
     Cube,
     Sparkle,
     Warning,
+    Filter,
+    Binary,
 }
 
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -553,6 +555,28 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             painter.add(egui::Shape::closed_line(vec![top, bot_right, bot_left], stroke_bold));
             painter.line_segment([Pos2::new(cx, cy - (r * 0.22).round()), Pos2::new(cx, cy + (r * 0.22).round())], stroke_bold);
             painter.circle_filled(Pos2::new(cx, cy + (r * 0.55).round()), 1.1, color);
+        }
+
+        Icon::Filter => {
+            // Funnel icon
+            let p1 = Pos2::new(min_x + 1.5, min_y + 2.5);
+            let p2 = Pos2::new(min_x + w - 1.5, min_y + 2.5);
+            let p3 = Pos2::new(min_x + w * 0.62, min_y + h * 0.52);
+            let p4 = Pos2::new(min_x + w * 0.62, min_y + h - 1.5);
+            let p5 = Pos2::new(min_x + w * 0.38, min_y + h - 3.0);
+            let p6 = Pos2::new(min_x + w * 0.38, min_y + h * 0.52);
+            painter.add(egui::Shape::closed_line(vec![p1, p2, p3, p4, p5, p6], stroke));
+        }
+
+        Icon::Binary => {
+            // Hex/Binary chip icon
+            let pad = 2.5_f32;
+            let chip_rect = Rect::from_min_max(Pos2::new(min_x + pad, min_y + pad), Pos2::new(min_x + w - pad, min_y + h - pad));
+            painter.rect_stroke(chip_rect, 2.0, stroke, egui::StrokeKind::Inside);
+            let half_h = (min_y + h * 0.5).round();
+            let half_w = (min_x + w * 0.5).round();
+            painter.line_segment([Pos2::new(min_x + pad + 2.0, half_h), Pos2::new(min_x + w - pad - 2.0, half_h)], Stroke::new(1.0_f32, color));
+            painter.line_segment([Pos2::new(half_w, min_y + pad + 2.0), Pos2::new(half_w, min_y + h - pad - 2.0)], Stroke::new(1.0_f32, color));
         }
     }
 }

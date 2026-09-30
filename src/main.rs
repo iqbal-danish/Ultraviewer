@@ -5,14 +5,24 @@ use eframe::egui;
 use ultraviewer::UltraViewerApp;
 
 fn main() -> eframe::Result<()> {
+    let icon_data = eframe::icon_data::from_png_bytes(include_bytes!("../Ultraviewer_256.png"))
+        .ok()
+        .map(std::sync::Arc::new);
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("UltraViewer")
+        .with_inner_size([1200.0, 800.0])
+        .with_decorations(false)
+        .with_resizable(true)
+        .with_drag_and_drop(true)
+        .with_maximized(true);
+
+    if let Some(icon) = icon_data {
+        viewport = viewport.with_icon(icon);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("UltraViewer")
-            .with_inner_size([1200.0, 800.0])
-            .with_decorations(false)
-            .with_resizable(true)
-            .with_drag_and_drop(true)
-            .with_maximized(true),
+        viewport,
         ..Default::default()
     };
 

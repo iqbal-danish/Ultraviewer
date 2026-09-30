@@ -7,6 +7,7 @@ pub enum StatusBarAction {
     ResetZoom,
     CopyXPath(String),
     ToggleWrap,
+    ToggleHexView,
 }
 
 pub struct StatusBarProps<'a> {
@@ -29,6 +30,7 @@ pub struct StatusBarProps<'a> {
     pub font_size: f32,
     pub current_xpath: Option<&'a str>,
     pub word_wrap: bool,
+    pub is_hex_mode: bool,
 }
 
 pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) -> Option<StatusBarAction> {
@@ -100,6 +102,17 @@ pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) -> Option<StatusBar
                         action = Some(StatusBarAction::CopyXPath(xpath.to_string()));
                     }
                 }
+            }
+
+            render_status_sep(ui, sep_color);
+            let hex_resp = ui.selectable_label(
+                props.is_hex_mode,
+                RichText::new("01 HEX")
+                    .size(11.0)
+                    .color(if props.is_hex_mode { Color32::from_rgb(152, 195, 121) } else { muted_color }),
+            );
+            if hex_resp.on_hover_text("Toggle Zero-Copy Hex & Binary Inspector (Ctrl+Shift+H)").clicked() {
+                action = Some(StatusBarAction::ToggleHexView);
             }
         }
 

@@ -38,6 +38,7 @@ pub enum MenuAction {
     OpenFolder,
     CommandPalette,
     ToggleCsvGrid,
+    ToggleHexView,
     OpenDiffViewer,
     RegisterContextMenu,
     UnregisterContextMenu,
@@ -45,6 +46,7 @@ pub enum MenuAction {
     TransformLowercase,
     CopyXPath,
     ToggleWordWrap,
+    OpenKeyboardShortcuts,
     SetTheme(super::theme::ColorTheme),
     About,
 }
@@ -253,6 +255,10 @@ pub fn render_menu_bar(
                 ui.close_menu();
             }
             ui.separator();
+            if ui.button("Hex & Binary Inspector (Ctrl+Shift+H)").clicked() {
+                action = Some(MenuAction::ToggleHexView);
+                ui.close_menu();
+            }
             if ui.button("Toggle CSV Grid View").clicked() {
                 action = Some(MenuAction::ToggleCsvGrid);
                 ui.close_menu();
@@ -361,6 +367,11 @@ pub fn render_menu_bar(
 
         ui.menu_button("Help", |ui| {
             style_popup(ui);
+            if ui.button("Keyboard Shortcuts Mapper... (Ctrl+K)").clicked() {
+                action = Some(MenuAction::OpenKeyboardShortcuts);
+                ui.close_menu();
+            }
+            ui.separator();
             if ui.button("About UltraViewer").clicked() {
                 action = Some(MenuAction::About);
                 ui.close_menu();

@@ -7,6 +7,7 @@ pub enum SearchBarAction {
     FindAll,
     FindNext,
     FindPrev,
+    ToggleFilter,
     Cancel,
     Close,
     ToggleReplace,
@@ -25,6 +26,7 @@ pub fn render_search_bar(
     show_replace: bool,
     replace_text: &mut String,
     request_replace_focus: bool,
+    is_filtered: bool,
 ) -> Option<SearchBarAction> {
     let mut action = None;
 
@@ -72,6 +74,14 @@ pub fn render_search_bar(
                             );
                             if request_focus {
                                 input_resp.request_focus();
+                                let char_count = query.pattern.chars().count();
+                                let mut state = egui::text_edit::TextEditState::default();
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    egui::text::CCursor::new(char_count),
+                                )));
+                                state.store(ui.ctx(), input_resp.id);
+                                ui.ctx().request_repaint();
                             }
                             if (input_resp.has_focus() || input_resp.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter)) {
                                 if ui.input(|i| i.modifiers.shift) {
@@ -185,6 +195,20 @@ pub fn render_search_bar(
                 paint_icon(ui.painter(), sel_rect.shrink(3.0), Icon::SelectionLines, sel_color);
                 if sel_resp.on_hover_text("Find All Occurrences (Bottom Panel)").clicked() {
                     action = Some(SearchBarAction::FindAll);
+                }
+
+                // Filter Matching Lines / Grep Mode (funnel icon)
+                let (flt_rect, flt_resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+                if is_filtered {
+                    ui.painter().rect_filled(flt_rect, 3.0, Color32::from_rgb(44, 107, 180));
+                    ui.painter().rect_stroke(flt_rect, 3.0, egui::Stroke::new(1.0_f32, Color32::from_rgb(97, 175, 239)), egui::StrokeKind::Inside);
+                } else if flt_resp.hovered() {
+                    ui.painter().rect_filled(flt_rect, 3.0, Color32::from_rgb(44, 49, 58));
+                }
+                let flt_color = if is_filtered || flt_resp.hovered() { Color32::WHITE } else { Color32::from_rgb(171, 178, 191) };
+                paint_icon(ui.painter(), flt_rect.shrink(3.0), Icon::Filter, flt_color);
+                if flt_resp.on_hover_text(if is_filtered { "Exit Filtered View (Alt+F)" } else { "Filter Matching Lines / Grep Mode (Alt+F)" }).clicked() {
+                    action = Some(SearchBarAction::ToggleFilter);
                 }
 
                 // Close (✕)
