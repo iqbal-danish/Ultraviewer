@@ -10,7 +10,7 @@ use eframe::egui::{self, Color32, FontId, Key, Pos2, Rect, RichText, ScrollArea,
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::editor::{EditorDocument, PieceTableReader, SaveManager, Viewport, ViewportLine};
-use crate::file_engine::{FileEngine, LineIndex, SliceSource, VirtualSlice};
+use crate::file_engine::{CompressedEngine, CompressionType, DecompressStatus, FileEngine, LineIndex, SliceSource, VirtualSlice, ZipEntryInfo};
 use crate::formats::formatter::{FormatAction, FormattingProgress, JsonStreamingFormatter, XmlStreamingFormatter};
 use crate::formats::json::{JsonStructureIndexer, JsonSyntaxHighlighter, JsonTreeNode, JsonValidationResult, JsonValidator};
 use crate::formats::xml::{XmlStructureIndexer, XmlSyntaxHighlighter, XmlTreeNode, XmlValidationResult, XmlValidator};
@@ -44,6 +44,7 @@ use super::keymapper::{KeybindingsConfig, ShortcutAction};
 use super::keymapper_modal::{render_keymapper_modal, KeymapperModalState};
 use super::theme::ColorTheme;
 use super::xml_tree_panel::render_xml_tree_panel;
+use super::zip_modal::{render_zip_modal, ZipModalAction, ZipModalState};
 
 fn apply_modern_theme(ctx: &egui::Context, theme: ColorTheme) {
     theme.apply(ctx);
@@ -113,6 +114,9 @@ pub struct OpenDocState {
     pub current_xpath: Option<String>,
     pub active_slice: Option<VirtualSlice>,
     pub hex_viewer: HexViewerState,
+    pub is_decompressed_temp: bool,
+    pub original_archive_path: Option<PathBuf>,
+    pub display_name_override: Option<String>,
 }
 
 pub struct UltraViewerApp {
@@ -262,6 +266,13 @@ pub struct UltraViewerApp {
     pub auto_save_timer: Option<Instant>,
     pub pending_slice_on_query_complete: bool,
     pub scroll_accumulator: f32,
+
+    // Compressed feeds (.gz / .zip) decompression state
+    pub zip_modal: ZipModalState,
+    pub decompress_cancel: Option<Arc<AtomicBool>>,
+    pub decompress_rx: Option<crossbeam_channel::Receiver<DecompressStatus>>,
+    pub decompress_status: Option<DecompressStatus>,
+    pub pending_zip_extractions: Vec<(PathBuf, usize)>,
 
     system_info: System,
     current_pid: Option<Pid>,
@@ -428,6 +439,12 @@ impl Default for UltraViewerApp {
             auto_save_timer: None,
             pending_slice_on_query_complete: false,
             scroll_accumulator: 0.0,
+
+            zip_modal: ZipModalState::default(),
+            decompress_cancel: None,
+            decompress_rx: None,
+            decompress_status: None,
+            pending_zip_extractions: Vec::new(),
 
             system_info,
             current_pid,
@@ -1746,8 +1763,87 @@ impl UltraViewerApp {
     }
 
     pub fn do_open_file(&mut self, path: &Path) {
+        let comp = CompressedEngine::detect_compression(path);
+        match comp {
+            CompressionType::Gzip => {
+                self.start_decompressing_gzip(path);
+                return;
+            }
+            CompressionType::Zip => {
+                match CompressedEngine::inspect_zip_archive(path) {
+                    Ok(entries) => {
+                        let non_dirs: Vec<&ZipEntryInfo> = entries.iter().filter(|e| !e.is_dir).collect();
+                        if non_dirs.len() == 1 {
+                            self.start_extracting_zip_entry(path, non_dirs[0].index);
+                        } else if !non_dirs.is_empty() {
+                            self.zip_modal.open(path.to_path_buf(), entries);
+                        } else {
+                            self.status_notification = Some(("ZIP archive contains no files".to_string(), Instant::now()));
+                        }
+                    }
+                    Err(e) => {
+                        self.status_notification = Some((format!("Cannot open ZIP archive: {}", e), Instant::now()));
+                    }
+                }
+                return;
+            }
+            CompressionType::None => {}
+        }
+
+        self.do_open_file_internal(path, false, None, None);
+    }
+
+    pub fn do_open_decompressed_file(
+        &mut self,
+        decompressed_path: &Path,
+        original_archive: Option<PathBuf>,
+        display_name: Option<String>,
+    ) {
+        self.do_open_file_internal(decompressed_path, true, original_archive, display_name);
+    }
+
+    pub fn start_decompressing_gzip(&mut self, path: &Path) {
+        if let Some(ref c) = self.decompress_cancel {
+            c.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.decompress_cancel = Some(Arc::clone(&cancel));
+        self.decompress_rx = Some(rx);
+        let name = path.file_name().and_then(|f| f.to_str()).unwrap_or("feed.gz").to_string();
+        self.decompress_status = Some(DecompressStatus::Decompressing {
+            bytes_decompressed: 0,
+            file_name: name,
+        });
+        CompressedEngine::start_decompress_gzip(path, cancel, tx);
+    }
+
+    pub fn start_extracting_zip_entry(&mut self, zip_path: &Path, entry_index: usize) {
+        if let Some(ref c) = self.decompress_cancel {
+            c.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.decompress_cancel = Some(Arc::clone(&cancel));
+        self.decompress_rx = Some(rx);
+        self.decompress_status = Some(DecompressStatus::Decompressing {
+            bytes_decompressed: 0,
+            file_name: format!("Entry #{}", entry_index),
+        });
+        CompressedEngine::start_extract_zip_entry(zip_path, entry_index, cancel, tx);
+    }
+
+    pub fn do_open_file_internal(
+        &mut self,
+        path: &Path,
+        is_decompressed: bool,
+        original_archive: Option<PathBuf>,
+        display_name: Option<String>,
+    ) {
         let path_buf = path.to_path_buf();
-        if let Some(existing) = self.tabs.iter().find(|t| t.path == path_buf) {
+        if let Some(existing) = self.tabs.iter().find(|t| {
+            t.path == path_buf || (original_archive.is_some() && t.original_archive_path == original_archive)
+        }) {
             let id = existing.id;
             self.switch_to_tab(id);
             if self.active_slice.is_some() {
@@ -1768,10 +1864,11 @@ impl UltraViewerApp {
         let start_time = Instant::now();
         match FileEngine::open(path) {
             Ok(raw_engine) => {
-                if let Some(pos) = self.recent_files.iter().position(|p| p == &path_buf) {
+                let track_recent_path = original_archive.as_ref().unwrap_or(&path_buf);
+                if let Some(pos) = self.recent_files.iter().position(|p| p == track_recent_path) {
                     self.recent_files.remove(pos);
                 }
-                self.recent_files.insert(0, path_buf.clone());
+                self.recent_files.insert(0, track_recent_path.clone());
                 if self.recent_files.len() > 10 {
                     self.recent_files.truncate(10);
                 }
@@ -1866,11 +1963,18 @@ impl UltraViewerApp {
                     current_xpath: None,
                     active_slice: None,
                     hex_viewer: HexViewerState::default(),
+                    is_decompressed_temp: is_decompressed,
+                    original_archive_path: original_archive,
+                    display_name_override: display_name.clone(),
                 };
                 self.tabs.push(new_tab);
 
                 // Auto-detect CSV/TSV
-                let ext = path_buf.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                let ext = display_name.as_deref()
+                    .and_then(|d| Path::new(d).extension().and_then(|s| s.to_str()))
+                    .or_else(|| path_buf.extension().and_then(|s| s.to_str()))
+                    .unwrap_or("")
+                    .to_lowercase();
                 if ext == "csv" {
                     self.csv_grid.is_enabled = true;
                     self.csv_grid.delimiter = ',';
@@ -1905,7 +2009,9 @@ impl UltraViewerApp {
     }
 
     pub fn persist_session(&mut self) {
-        self.session.open_files = self.tabs.iter().map(|t| t.path.clone()).collect();
+        self.session.open_files = self.tabs.iter().map(|t| {
+            t.original_archive_path.clone().unwrap_or_else(|| t.path.clone())
+        }).collect();
         self.session.recent_files = self.recent_files.clone();
         self.session.font_size = self.font_size;
         self.session.theme_name = self.current_theme.name().to_string();
@@ -2009,6 +2115,9 @@ impl UltraViewerApp {
             let is_active = self.active_tab_id == Some(tab_id);
             let tab = self.tabs.remove(idx);
             tab.indexer_cancel.store(true, Ordering::Relaxed);
+            if tab.is_decompressed_temp {
+                let _ = std::fs::remove_file(&tab.path);
+            }
 
             if is_active {
                 if let Some(next_tab) = self.tabs.get(idx.min(self.tabs.len().saturating_sub(1))) {
@@ -2027,6 +2136,9 @@ impl UltraViewerApp {
     pub fn close_all_tabs(&mut self) {
         for tab in self.tabs.drain(..) {
             tab.indexer_cancel.store(true, Ordering::Relaxed);
+            if tab.is_decompressed_temp {
+                let _ = std::fs::remove_file(&tab.path);
+            }
         }
         self.active_tab_id = None;
         self.do_close_file();
@@ -4946,10 +5058,15 @@ impl UltraViewerApp {
     }
 
     fn trigger_file_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .set_title("Open Large File - UltraViewer")
-            .pick_file()
-        {
+        let mut dialog = rfd::FileDialog::new().set_title("Open Large File - UltraViewer");
+        dialog = dialog.add_filter(
+            "Supported Feeds & Archives",
+            &["xml", "json", "jsonl", "csv", "tsv", "txt", "gz", "gzip", "zip"],
+        );
+        dialog = dialog.add_filter("Compressed Archives (*.gz, *.zip)", &["gz", "gzip", "zip"]);
+        dialog = dialog.add_filter("All Files (*.*)", &["*"]);
+
+        if let Some(path) = dialog.pick_file() {
             self.open_file(path);
         }
     }
@@ -4970,7 +5087,7 @@ impl eframe::App for UltraViewerApp {
         let is_indexing = self.line_index.as_ref().map_or(false, |i| !i.is_complete());
 
         let is_auto_saving = self.auto_save && self.auto_save_timer.is_some();
-        if is_indexing || is_searching || self.is_query_running || self.field_extract_state.is_running || self.url_modal_state.is_downloading || self.xml_tree_building || self.is_validating_xml || self.json_tree_building || self.is_validating_json || self.active_analysis.is_some() || self.active_saving.is_some() || is_auto_saving {
+        if is_indexing || is_searching || self.is_query_running || self.field_extract_state.is_running || self.url_modal_state.is_downloading || self.xml_tree_building || self.is_validating_xml || self.json_tree_building || self.is_validating_json || self.active_analysis.is_some() || self.active_saving.is_some() || self.decompress_status.is_some() || is_auto_saving {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
 
@@ -5113,6 +5230,48 @@ impl eframe::App for UltraViewerApp {
                     self.field_extract_cancel = None;
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {}
+            }
+        }
+
+        // Poll background decompression / extraction progress
+        let mut decompress_event = None;
+        if let Some(ref rx) = self.decompress_rx {
+            while let Ok(status) = rx.try_recv() {
+                decompress_event = Some(status);
+            }
+        }
+        if let Some(status) = decompress_event {
+            match status {
+                DecompressStatus::Decompressing { bytes_decompressed, file_name } => {
+                    self.decompress_status = Some(DecompressStatus::Decompressing {
+                        bytes_decompressed,
+                        file_name,
+                    });
+                    ctx.request_repaint();
+                }
+                DecompressStatus::Completed { output_path, total_bytes: _, original_archive, display_name } => {
+                    self.decompress_status = None;
+                    self.decompress_rx = None;
+                    self.decompress_cancel = None;
+                    self.do_open_decompressed_file(&output_path, Some(original_archive), Some(display_name));
+                    if !self.pending_zip_extractions.is_empty() {
+                        let (next_archive, next_idx) = self.pending_zip_extractions.remove(0);
+                        self.start_extracting_zip_entry(&next_archive, next_idx);
+                    }
+                }
+                DecompressStatus::Error(err) => {
+                    self.decompress_status = None;
+                    self.decompress_rx = None;
+                    self.decompress_cancel = None;
+                    self.pending_zip_extractions.clear();
+                    self.error_message = Some(format!("Decompression error: {}", err));
+                }
+                DecompressStatus::Cancelled => {
+                    self.decompress_status = None;
+                    self.decompress_rx = None;
+                    self.decompress_cancel = None;
+                    self.pending_zip_extractions.clear();
+                }
             }
         }
 
@@ -5695,8 +5854,9 @@ impl eframe::App for UltraViewerApp {
                 let file_size = self.engine.as_ref().map(|e| e.size()).unwrap_or(0);
 
                 let tab_infos: Vec<TabInfo> = self.tabs.iter().map(|t| {
-                    let name = t.path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-                    let full_path = t.path.to_str().unwrap_or(name);
+                    let default_name = t.path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                    let name = t.display_name_override.as_deref().unwrap_or(default_name);
+                    let full_path = t.original_archive_path.as_ref().and_then(|p| p.to_str()).unwrap_or_else(|| t.path.to_str().unwrap_or(name));
                     let is_dirty = t.document.as_ref().map_or(false, |d| d.is_dirty());
                     let is_active = self.active_tab_id == Some(t.id);
                     TabInfo {
@@ -6397,6 +6557,71 @@ impl eframe::App for UltraViewerApp {
                     self.open_file(&path);
                 }
             }
+        }
+
+        // ZIP Archive Explorer Modal
+        if let Some(act) = render_zip_modal(ctx, &mut self.zip_modal) {
+            match act {
+                ZipModalAction::ExtractAndOpen(entry_index) => {
+                    self.zip_modal.is_open = false;
+                    if let Some(ref archive_path) = self.zip_modal.archive_path.clone() {
+                        self.start_extracting_zip_entry(archive_path, entry_index);
+                    }
+                }
+                ZipModalAction::ExtractAndOpenAllFeeds => {
+                    self.zip_modal.is_open = false;
+                    if let Some(archive_path) = self.zip_modal.archive_path.clone() {
+                        let feed_indices: Vec<usize> = self.zip_modal.entries.iter()
+                            .filter(|e| !e.is_dir && matches!(e.file_type, Some(FileType::Xml | FileType::Json | FileType::Csv)))
+                            .map(|e| e.index)
+                            .collect();
+                        if !feed_indices.is_empty() {
+                            let mut entries = feed_indices;
+                            let first = entries.remove(0);
+                            self.pending_zip_extractions = entries.into_iter().map(|idx| (archive_path.clone(), idx)).collect();
+                            self.start_extracting_zip_entry(&archive_path, first);
+                        }
+                    }
+                }
+                ZipModalAction::Dismiss => {
+                    self.zip_modal.is_open = false;
+                }
+            }
+        }
+
+        // Floating Decompression / Extraction Progress Modal
+        if let Some(ref status) = self.decompress_status {
+            egui::Window::new("Decompressing Feed")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .fixed_size(egui::vec2(360.0, 120.0))
+                .show(ctx, |ui| {
+                    ui.add_space(6.0);
+                    match status {
+                        DecompressStatus::Decompressing { bytes_decompressed, file_name } => {
+                            let mb = *bytes_decompressed as f64 / (1024.0 * 1024.0);
+                            ui.label(egui::RichText::new(format!("Extracting: {}", file_name)).strong());
+                            ui.add_space(4.0);
+                            ui.label(format!("Decompressed: {:.2} MB", mb));
+                            ui.add_space(4.0);
+                            ui.spinner();
+                        }
+                        _ => {
+                            ui.label("Preparing feed...");
+                            ui.spinner();
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            if let Some(cancel) = &self.decompress_cancel {
+                                cancel.store(true, Ordering::Relaxed);
+                            }
+                            self.pending_zip_extractions.clear();
+                        }
+                    });
+                });
         }
 
         // Keyboard Shortcuts Mapper Modal
@@ -9432,6 +9657,87 @@ mod tests {
         assert_eq!(app.viewport.lines[0].text, "hello world");
         assert_eq!(app.viewport.lines[1].text, "second line");
         assert_eq!(app.viewport.lines[2].text, "third line");
+    }
+
+    #[test]
+    fn test_gzip_and_zip_app_flow() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let temp_dir = std::env::temp_dir().join("ultraviewer_app_compressed_test");
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let mut app = UltraViewerApp::default();
+
+        // 1. Test Gzip Feed
+        let gz_path = temp_dir.join("catalog.xml.gz");
+        let sample_xml = b"<catalog><item id=\"1\">Widget</item></catalog>";
+        {
+            let file = std::fs::File::create(&gz_path).unwrap();
+            let mut encoder = GzEncoder::new(file, Compression::default());
+            encoder.write_all(sample_xml).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        app.do_open_file(&gz_path);
+        assert!(app.decompress_rx.is_some());
+        assert!(app.decompress_status.is_some());
+
+        // Drain until completion
+        let rx = app.decompress_rx.take().unwrap();
+        let mut completed_info = None;
+        while let Ok(status) = rx.recv() {
+            if let crate::file_engine::DecompressStatus::Completed { output_path, original_archive, display_name, .. } = status {
+                completed_info = Some((output_path, original_archive, display_name));
+                break;
+            }
+        }
+        let (temp_out, orig_arch, disp_name) = completed_info.expect("Gzip decompression failed");
+        assert!(temp_out.exists());
+        assert_eq!(disp_name, "catalog.xml");
+
+        // Open decompressed tab
+        app.do_open_decompressed_file(&temp_out, Some(orig_arch.clone()), Some(disp_name.clone()));
+        assert_eq!(app.tabs.len(), 1);
+        let tab = &app.tabs[0];
+        assert_eq!(tab.display_name_override.as_deref(), Some("catalog.xml"));
+        assert_eq!(tab.original_archive_path.as_ref(), Some(&orig_arch));
+        assert!(tab.is_decompressed_temp);
+
+        // Wait for indexer to complete
+        let tab_id = tab.id;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Close tab and verify temp file is deleted
+        app.close_tab_by_id(tab_id);
+        assert_eq!(app.tabs.len(), 0);
+        assert!(!temp_out.exists(), "Decompressed temp file must be cleaned up after tab close");
+
+        // 2. Test Multi-file Zip Archive
+        let zip_path = temp_dir.join("multi_feeds.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default();
+            zip.start_file("products.xml", opts).unwrap();
+            zip.write_all(sample_xml).unwrap();
+            zip.start_file("prices.json", opts).unwrap();
+            zip.write_all(b"{\"price\": 19.99}").unwrap();
+            zip.finish().unwrap();
+        }
+
+        app.do_open_file(&zip_path);
+        assert!(app.zip_modal.is_open, "Multi-file ZIP should open ZIP Archive Explorer modal");
+        assert_eq!(app.zip_modal.entries.len(), 2);
+        assert_eq!(app.zip_modal.entries[0].name, "products.xml");
+        assert_eq!(app.zip_modal.entries[1].name, "prices.json");
+
+        // Clean up
+        let _ = std::fs::remove_file(&gz_path);
+        let _ = std::fs::remove_file(&zip_path);
     }
 }
 

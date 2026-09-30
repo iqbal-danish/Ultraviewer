@@ -20,6 +20,7 @@ regex = "1.11"
 quick-xml = "0.37"
 ureq = { version = "2.12", features = ["tls", "gzip"] }
 flate2 = "1.0"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 [[bin]]
 name = "ultraviewer"

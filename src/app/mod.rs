@@ -25,6 +25,7 @@ pub mod theme;
 pub mod url_modal;
 pub mod win32_titlebar;
 pub mod xml_tree_panel;
+pub mod zip_modal;
 
 pub use activity_bar::{render_activity_bar, ActivityBarAction, ActivityBarProps, ActivityPanel};
 pub use analyzer_panel::{render_analyzer_panel, AnalyzerPanelAction, AnalyzerPanelState};
@@ -49,6 +50,7 @@ pub use status_bar::{render_status_bar, StatusBarProps};
 pub use tab_bar::{render_tab_bar, TabBarAction, TabBarProps, TabInfo};
 pub use theme::ColorTheme;
 pub use url_modal::{render_url_modal, UrlModalAction, UrlModalState};
+pub use zip_modal::{render_zip_modal, ZipModalAction, ZipModalState};
 
 
 

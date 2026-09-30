@@ -39,6 +39,7 @@ pub enum Icon {
     Warning,
     Filter,
     Binary,
+    Archive,
 }
 
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -577,6 +578,18 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             let half_w = (min_x + w * 0.5).round();
             painter.line_segment([Pos2::new(min_x + pad + 2.0, half_h), Pos2::new(min_x + w - pad - 2.0, half_h)], Stroke::new(1.0_f32, color));
             painter.line_segment([Pos2::new(half_w, min_y + pad + 2.0), Pos2::new(half_w, min_y + h - pad - 2.0)], Stroke::new(1.0_f32, color));
+        }
+
+        Icon::Archive => {
+            // Archive box with zipper
+            let box_rect = Rect::from_min_max(Pos2::new(min_x + 2.0, min_y + 3.0), Pos2::new(min_x + w - 2.0, min_y + h - 2.0));
+            painter.rect_stroke(box_rect, 2.0, stroke, egui::StrokeKind::Inside);
+            // Lid line
+            painter.line_segment([Pos2::new(box_rect.left(), min_y + 6.0), Pos2::new(box_rect.right(), min_y + 6.0)], stroke);
+            // Zipper teeth down center
+            painter.line_segment([Pos2::new(cx, min_y + 6.0), Pos2::new(cx, box_rect.bottom() - 2.0)], Stroke::new(1.0_f32, color));
+            painter.line_segment([Pos2::new(cx - 2.0, min_y + 9.0), Pos2::new(cx + 2.0, min_y + 9.0)], Stroke::new(1.0_f32, color));
+            painter.line_segment([Pos2::new(cx - 2.0, min_y + 12.0), Pos2::new(cx + 2.0, min_y + 12.0)], Stroke::new(1.0_f32, color));
         }
     }
 }
