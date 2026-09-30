@@ -7,7 +7,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{self, Color32, FontId, Key, Pos2, Rect, RichText, ScrollArea, Sense, TextFormat, Ui, Vec2};
-use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::editor::{EditorDocument, PieceTableReader, SaveManager, Viewport, ViewportLine};
 use crate::file_engine::{CompressedEngine, CompressionType, DecompressStatus, FileEngine, LineIndex, SliceSource, VirtualSlice, ZipEntryInfo};
@@ -274,23 +273,13 @@ pub struct UltraViewerApp {
     pub decompress_status: Option<DecompressStatus>,
     pub pending_zip_extractions: Vec<(PathBuf, usize)>,
 
-    system_info: System,
-    current_pid: Option<Pid>,
     last_sys_refresh: Instant,
-    cached_rss_bytes: u64,
+    cached_memory_metrics: super::process_memory::ProcessMemoryMetrics,
 }
 
 impl Default for UltraViewerApp {
     fn default() -> Self {
-        let current_pid = sysinfo::get_current_pid().ok();
-        let mut system_info = System::new();
-        let mut cached_rss = 0;
-        if let Some(pid) = current_pid {
-            system_info.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-            if let Some(proc) = system_info.process(pid) {
-                cached_rss = proc.memory();
-            }
-        }
+        let cached_memory = super::process_memory::query_memory();
 
         let session = AppSession::load();
         let current_theme = match session.theme_name.as_str() {
@@ -446,10 +435,8 @@ impl Default for UltraViewerApp {
             decompress_status: None,
             pending_zip_extractions: Vec::new(),
 
-            system_info,
-            current_pid,
             last_sys_refresh: Instant::now(),
-            cached_rss_bytes: cached_rss,
+            cached_memory_metrics: cached_memory,
         }
     }
 }
@@ -4520,12 +4507,7 @@ impl UltraViewerApp {
     fn update_memory_metrics(&mut self) {
         if self.last_sys_refresh.elapsed() >= Duration::from_millis(500) {
             self.last_sys_refresh = Instant::now();
-            if let Some(pid) = self.current_pid {
-                self.system_info.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-                if let Some(proc) = self.system_info.process(pid) {
-                    self.cached_rss_bytes = proc.memory();
-                }
-            }
+            self.cached_memory_metrics = super::process_memory::query_memory();
         }
     }
 
@@ -5631,7 +5613,8 @@ impl eframe::App for UltraViewerApp {
                         visible_lines_count: self.viewport.lines.len(),
                         current_line: self.current_line,
                         current_offset: current_byte_offset,
-                        memory_rss_bytes: self.cached_rss_bytes,
+                        memory_private_bytes: self.cached_memory_metrics.private_bytes,
+                        memory_cache_bytes: self.cached_memory_metrics.os_cache_bytes,
                         open_latency: self.open_duration,
                         indexing_pct,
                         is_indexing_complete: is_complete,
@@ -5662,6 +5645,11 @@ impl eframe::App for UltraViewerApp {
                     self.persist_session();
                 }
                 StatusBarAction::ToggleHexView => self.toggle_hex_view(),
+                StatusBarAction::TrimMemory => {
+                    super::process_memory::trim_working_set();
+                    self.cached_memory_metrics = super::process_memory::query_memory();
+                    self.status_notification = Some(("Flushed Windows OS standby file cache".to_string(), Instant::now()));
+                }
             }
         }
 

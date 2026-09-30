@@ -16,6 +16,7 @@ pub mod keymapper;
 pub mod keymapper_modal;
 pub mod menu;
 pub mod overview_ruler;
+pub mod process_memory;
 pub mod query_bar;
 pub mod search_panel;
 pub mod session;

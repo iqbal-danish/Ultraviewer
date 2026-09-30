@@ -8,6 +8,7 @@ pub enum StatusBarAction {
     CopyXPath(String),
     ToggleWrap,
     ToggleHexView,
+    TrimMemory,
 }
 
 pub struct StatusBarProps<'a> {
@@ -18,7 +19,8 @@ pub struct StatusBarProps<'a> {
     pub visible_lines_count: usize,
     pub current_line: usize,
     pub current_offset: u64,
-    pub memory_rss_bytes: u64,
+    pub memory_private_bytes: u64,
+    pub memory_cache_bytes: u64,
     pub open_latency: Option<Duration>,
     pub indexing_pct: Option<f32>,
     pub is_indexing_complete: bool,
@@ -160,9 +162,35 @@ pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) -> Option<StatusBar
 
             render_status_sep(ui, sep_color);
 
-            // Memory RSS badge
-            let ram_str = format_bytes(props.memory_rss_bytes);
-            ui.label(RichText::new(format!("{} RAM", ram_str)).size(11.0).color(muted_color));
+            // Memory Badge: App RAM vs Windows OS Standby File Cache
+            let priv_str = format_bytes(props.memory_private_bytes);
+            let cache_str = format_bytes(props.memory_cache_bytes);
+            let total_str = format_bytes(props.memory_private_bytes + props.memory_cache_bytes);
+
+            let (label_text, badge_color) = if props.memory_cache_bytes >= 20 * 1024 * 1024 {
+                (
+                    format!("App: {} | OS Cache: {}", priv_str, cache_str),
+                    Color32::from_rgb(180, 190, 205),
+                )
+            } else {
+                (
+                    format!("{} RAM", priv_str),
+                    muted_color,
+                )
+            };
+
+            let tooltip = format!(
+                "UltraViewer Private Memory: {}\nWindows OS Standby File Cache: {}\nTotal Resident in RAM: {}\n\n(Click to flush OS file cache)",
+                priv_str, cache_str, total_str
+            );
+
+            let ram_resp = ui.selectable_label(
+                false,
+                RichText::new(label_text).size(11.0).color(badge_color),
+            );
+            if ram_resp.on_hover_text(tooltip).clicked() {
+                action = Some(StatusBarAction::TrimMemory);
+            }
 
             // Indexing throughput bar
             if props.file_size > 0 {
