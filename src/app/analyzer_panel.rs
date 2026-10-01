@@ -82,10 +82,10 @@ pub fn render_analyzer_panel(
     let mut is_open = state.is_open;
 
     let screen = ctx.screen_rect();
-    let modal_w = (screen.width() * 0.78).clamp(640.0, 960.0);
-    let modal_h = (screen.height() * 0.80).clamp(420.0, 680.0);
-    let max_w = (screen.width() * 0.90).clamp(700.0, 1020.0);
-    let max_h = (screen.height() * 0.90).clamp(460.0, 750.0);
+    let modal_w = (screen.width() * 0.82).clamp(700.0, 1200.0);
+    let modal_h = (screen.height() * 0.82).clamp(450.0, 800.0);
+    let max_w = (screen.width() * 0.94).clamp(750.0, 1600.0);
+    let max_h = (screen.height() * 0.92).clamp(480.0, 950.0);
 
     let win_resp = Window::new(RichText::new("📊 Field Analyzer & Schema Profiler").strong().size(15.0))
         .open(&mut is_open)
@@ -93,7 +93,7 @@ pub fn render_analyzer_panel(
         .resizable(true)
         .default_size(Vec2::new(modal_w, modal_h))
         .max_size(Vec2::new(max_w, max_h))
-        .min_size(Vec2::new(520.0, 360.0))
+        .min_size(Vec2::new(560.0, 380.0))
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             // Header summary or progress bar
@@ -179,7 +179,7 @@ pub fn render_analyzer_panel(
             // Main 2-column layout: Left (Field List), Right (Deep Dive)
             let avail_h = ui.available_height();
             let total_w = ui.available_width();
-            let left_w = (total_w * 0.35).clamp(220.0, 320.0);
+            let left_w = (total_w * 0.38).clamp(260.0, 520.0);
 
             ui.horizontal(|ui| {
                 // Left column: Field selector with search
@@ -199,8 +199,11 @@ pub fn render_analyzer_panel(
 
                     // Field table header
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.add_space(2.0);
                         ui.label(RichText::new("Field Name").strong());
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_space(8.0);
                             ui.label(RichText::new("Presence").strong());
                         });
                     });
@@ -223,15 +226,43 @@ pub fn render_analyzer_panel(
                                 }
 
                                 ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
                                     render_type_badge(ui, &f.inferred_type);
-                                    let resp = ui.selectable_label(is_selected, text);
+
+                                    let pct_str = format!("{:.1}%", f.presence_pct);
+                                    let pct_w = 48.0;
+                                    let spacing = ui.spacing().item_spacing.x;
+                                    let avail_for_name = (ui.available_width() - pct_w - spacing).max(40.0);
+
+                                    let btn = egui::Button::new(text)
+                                        .selected(is_selected)
+                                        .frame(is_selected)
+                                        .truncate()
+                                        .corner_radius(3.0);
+                                    let resp = ui.add_sized([avail_for_name, 19.0], btn)
+                                        .on_hover_text(&f.name);
                                     if resp.clicked() {
                                         state.selected_field_index = Some(orig_idx);
                                     }
 
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.label(format!("{:.1}%", f.presence_pct));
-                                    });
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(pct_w, 19.0),
+                                        Layout::right_to_left(Align::Center),
+                                        |ui| {
+                                            let pct_color = if f.presence_pct == 100.0 {
+                                                Color32::from_rgb(152, 195, 121)
+                                            } else if f.presence_pct >= 90.0 {
+                                                Color32::from_rgb(209, 154, 102)
+                                            } else {
+                                                Color32::from_rgb(224, 108, 117)
+                                            };
+                                            let pct_lbl = ui.label(RichText::new(pct_str).color(pct_color));
+                                            let pct_resp = pct_lbl.interact(egui::Sense::click());
+                                            if pct_resp.clicked() {
+                                                state.selected_field_index = Some(orig_idx);
+                                            }
+                                        },
+                                    );
                                 });
                             }
                         });
