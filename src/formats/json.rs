@@ -173,6 +173,11 @@ pub enum JsonValidationResult {
         max_depth: usize,
         elapsed_secs: f64,
     },
+    ValidJolt {
+        operations_count: usize,
+        operations: Vec<String>,
+        elapsed_secs: f64,
+    },
     Invalid {
         line_number: usize,
         byte_offset: u64,
@@ -589,8 +594,12 @@ impl JsonStructureIndexer {
                 children: Vec::new(),
             }),
         };
+        Self::build_tree_from_reader(file, cancel)
+    }
 
-        let mut reader = BufReader::with_capacity(256 * 1024, file);
+    /// Build a compact hierarchical structure tree from an arbitrary Read stream (e.g. File or PieceTableReader).
+    pub fn build_tree_from_reader<R: Read>(read: R, cancel: Arc<AtomicBool>) -> Arc<JsonTreeNode> {
+        let mut reader = BufReader::with_capacity(256 * 1024, read);
         let mut buffer = vec![0u8; 256 * 1024];
 
         let mut root = JsonTreeNode {

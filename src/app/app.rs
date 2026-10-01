@@ -11,14 +11,16 @@ use eframe::egui::{self, Color32, FontId, Key, Pos2, Rect, RichText, ScrollArea,
 use crate::editor::{EditorDocument, PieceTableReader, SaveManager, Viewport, ViewportLine};
 use crate::file_engine::{CompressedEngine, CompressionType, DecompressStatus, FileEngine, LineIndex, SliceSource, VirtualSlice, ZipEntryInfo};
 use crate::formats::formatter::{FormatAction, FormattingProgress, JsonStreamingFormatter, XmlStreamingFormatter};
+use crate::formats::jolt::{JoltValidationResult, JoltValidator};
 use crate::formats::json::{JsonStructureIndexer, JsonSyntaxHighlighter, JsonTreeNode, JsonValidationResult, JsonValidator};
 use crate::formats::xml::{XmlStructureIndexer, XmlSyntaxHighlighter, XmlTreeNode, XmlValidationResult, XmlValidator};
+use crate::formats::xslt::{XsltValidationResult, XsltValidator};
 use crate::analysis::field_analyzer::{AnalysisReport, StreamingFieldAnalyzer};
 use crate::analysis::field_extractor::StreamingFieldExtractor;
 use crate::formats::path_resolver::PathResolver;
 use crate::formats::{FileType, FormatDetector, JsonPathQuery, QueryMatch, StreamingQueryEngine, XPathQuery};
 use crate::indexing::LineIndexer;
-use crate::search::{SearchQuery, SearchResultMatch, SearchStatus, SearchWorker};
+use crate::search::{SearchQuery, SearchResultMatch, SearchStatus, SearchTarget, SearchWorker};
 use super::activity_bar::{render_activity_bar, ActivityBarAction, ActivityBarProps, ActivityPanel};
 use super::analyzer_panel::{render_analyzer_panel, AnalyzerPanelAction, AnalyzerPanelState};
 use super::breadcrumb_bar::{render_breadcrumb_bar, BreadcrumbAction, BreadcrumbBarProps};
@@ -235,6 +237,7 @@ pub struct UltraViewerApp {
     pub untitled_counter: usize,
     pub line_edit_initial_texts: std::collections::HashMap<usize, String>,
     pub active_cursor_col: usize,
+    pub has_shown_window: bool,
 
     // XPath / JSONPath resolution state
     pub current_xpath: Option<String>,
@@ -447,6 +450,7 @@ impl Default for UltraViewerApp {
 
             last_sys_refresh: Instant::now(),
             cached_memory_metrics: cached_memory,
+            has_shown_window: false,
         }
     }
 }
@@ -1176,6 +1180,8 @@ impl UltraViewerApp {
 
             let target_col = last_chunk.chars().count();
             self.set_cursor(last_line_no, target_col);
+            self.active_edit_line = None;
+            self.edit_line_buffer.clear();
         } else {
             let Some(idx) = self.viewport.lines.iter().position(|l| l.line_number == line_no) else {
                 return;
@@ -1207,10 +1213,65 @@ impl UltraViewerApp {
             self.edit_line_buffer = new_text;
             self.set_cursor(line_no, insert_col + text.chars().count());
         }
+        self.auto_detect_and_set_file_type();
     }
 
     pub fn paste_text_at_cursor(&mut self, text: &str) {
         self.type_text_at_cursor(text);
+        self.auto_detect_and_set_file_type();
+    }
+
+    pub fn auto_detect_and_set_file_type(&mut self) -> bool {
+        let is_untitled = self.tabs.get(self.session.active_tab_idx).map_or(false, |t| {
+            t.path.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.starts_with("Untitled-"))
+        });
+        if !is_untitled && self.file_type.is_some() && self.file_type != Some(FileType::PlainText) {
+            return false;
+        }
+
+        let sample = self.viewport.lines.iter()
+            .take(50)
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trimmed = sample.trim_start();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let detected = if trimmed.starts_with("<?xml")
+            || trimmed.starts_with("<!DOCTYPE")
+            || trimmed.starts_with("<!--")
+            || (trimmed.starts_with('<') && trimmed.chars().nth(1).map_or(false, |c| c.is_ascii_alphabetic() || c == '_' || c == '?' || c == '!'))
+        {
+            Some(FileType::Xml)
+        } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            Some(FileType::Json)
+        } else {
+            None
+        };
+
+        if let Some(new_type) = detected {
+            if self.file_type != Some(new_type) {
+                self.set_file_type(new_type);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn set_file_type(&mut self, ft: FileType) {
+        self.file_type = Some(ft);
+        if let Some(tab) = self.tabs.get_mut(self.session.active_tab_idx) {
+            tab.file_type = Some(ft);
+        }
+        let sample = self.viewport.lines.iter()
+            .take(50)
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.discovered_tags = crate::formats::DiscoveredTags::from_sample(sample.as_bytes(), Some(ft));
+        self.status_notification = Some((format!("Language Mode set to {}", ft.name()), Instant::now()));
     }
 
     pub fn backspace_at_cursor(&mut self) {
@@ -2270,6 +2331,25 @@ impl UltraViewerApp {
         self.auto_jump_to_first_match = true;
 
         if let (Some(ref engine), Some(ref index)) = (&self.engine, &self.line_index) {
+            let is_modified = self.document.as_ref().map_or(false, |d| {
+                d.is_dirty() || !d.modified_lines.is_empty()
+            }) || engine.size() == 0;
+
+            let target = if is_modified {
+                if let Some(ref doc) = self.document {
+                    let total_size = doc.piece_table.total_length();
+                    SearchTarget::PieceTable {
+                        piece_table: doc.piece_table.clone(),
+                        engine: Arc::clone(engine),
+                        total_size,
+                    }
+                } else {
+                    SearchTarget::File { engine: Arc::clone(engine) }
+                }
+            } else {
+                SearchTarget::File { engine: Arc::clone(engine) }
+            };
+
             let cancel = Arc::new(AtomicBool::new(false));
             *self.search_status.write().unwrap() = SearchStatus::Searching {
                 progress_pct: 0.0,
@@ -2278,7 +2358,7 @@ impl UltraViewerApp {
             };
 
             let handle = SearchWorker::spawn(
-                Arc::clone(engine),
+                target,
                 Arc::clone(index),
                 self.search_query.clone(),
                 Arc::clone(&self.search_matches),
@@ -2397,11 +2477,8 @@ impl UltraViewerApp {
             self.active_match_idx = Some(idx);
             drop(matches);
             if let Some(ref slice) = self.active_slice {
-                if !self.viewport.lines.iter().any(|l| l.line_number == line) {
-                    if let Some(virt_line) = slice.physical_to_virtual(line) {
-                        let start_line = virt_line.saturating_sub(4).max(1);
-                        self.scroll_to_line(start_line);
-                    }
+                if let Some(virt_line) = slice.physical_to_virtual(line) {
+                    self.scroll_to_line_with_headroom(virt_line, 4);
                 }
                 return;
             }
@@ -3207,10 +3284,21 @@ impl UltraViewerApp {
             let (tx, rx) = crossbeam_channel::bounded(1);
             self.xml_tree_rx = Some(rx);
 
+            let is_modified = self.document.as_ref().map_or(false, |d| {
+                d.is_dirty() || !d.modified_lines.is_empty()
+            }) || engine.size() == 0;
+            let doc_clone = self.document.clone();
+
             std::thread::Builder::new()
                 .name("xml-tree-builder".to_string())
                 .spawn(move || {
-                    let tree = XmlStructureIndexer::build_tree(engine_clone, cancel);
+                    let tree = if let Some(doc) = doc_clone.filter(|_| is_modified) {
+                        let reader = PieceTableReader::new(&doc.piece_table, &engine_clone);
+                        let buf_reader = std::io::BufReader::with_capacity(128 * 1024, reader);
+                        XmlStructureIndexer::build_tree_from_reader(buf_reader, cancel)
+                    } else {
+                        XmlStructureIndexer::build_tree(engine_clone, cancel)
+                    };
                     let _ = tx.send(tree);
                 })
                 .expect("Failed to spawn XML tree builder");
@@ -3241,20 +3329,58 @@ impl UltraViewerApp {
         let line_index_clone = Arc::clone(line_index);
         let file_path = engine.path().to_path_buf();
 
+        let is_xslt_file = file_path.extension().and_then(|e| e.to_str()).map_or(false, |ext| {
+            let ext_lower = ext.to_ascii_lowercase();
+            ext_lower == "xslt" || ext_lower == "xsl"
+        });
+
+        let is_xslt_content = if let Ok(header) = engine.read_range(0, 4096.min(engine.size() as usize)) {
+            let s = String::from_utf8_lossy(header);
+            XsltValidator::is_xslt(&s)
+        } else {
+            false
+        };
+
+        let is_xslt = is_xslt_file || is_xslt_content;
+
         std::thread::Builder::new()
             .name("xml-validator".to_string())
             .spawn(move || {
-                let res = if let Some(doc) = doc_clone.filter(|_| is_modified) {
-                    let reader = PieceTableReader::new(&doc.piece_table, &engine_clone);
-                    XmlValidator::validate(reader, Some(&line_index_clone), Some(&engine_clone), cancel)
+                let res = if is_xslt {
+                    let xslt_res = if let Some(doc) = doc_clone.filter(|_| is_modified) {
+                        let reader = PieceTableReader::new(&doc.piece_table, &engine_clone);
+                        XsltValidator::validate(reader, None, None, cancel)
+                    } else {
+                        match std::fs::File::open(&file_path) {
+                            Ok(f) => XsltValidator::validate(f, Some(&line_index_clone), Some(&engine_clone), cancel),
+                            Err(e) => XsltValidationResult::Invalid {
+                                line_number: 1,
+                                byte_offset: 0,
+                                message: format!("Cannot open file: {}", e),
+                            },
+                        }
+                    };
+                    match xslt_res {
+                        XsltValidationResult::Valid { elements_count, templates_count, version, elapsed_secs } => {
+                            XmlValidationResult::ValidXslt { elements_count, templates_count, version, elapsed_secs }
+                        }
+                        XsltValidationResult::Invalid { line_number, byte_offset, message } => {
+                            XmlValidationResult::Invalid { line_number, byte_offset, message: format!("XSLT: {}", message) }
+                        }
+                    }
                 } else {
-                    match std::fs::File::open(&file_path) {
-                        Ok(f) => XmlValidator::validate(f, Some(&line_index_clone), Some(&engine_clone), cancel),
-                        Err(e) => XmlValidationResult::Invalid {
-                            line_number: 1,
-                            byte_offset: 0,
-                            message: format!("Cannot open file: {}", e),
-                        },
+                    if let Some(doc) = doc_clone.filter(|_| is_modified) {
+                        let reader = PieceTableReader::new(&doc.piece_table, &engine_clone);
+                        XmlValidator::validate(reader, None, None, cancel)
+                    } else {
+                        match std::fs::File::open(&file_path) {
+                            Ok(f) => XmlValidator::validate(f, Some(&line_index_clone), Some(&engine_clone), cancel),
+                            Err(e) => XmlValidationResult::Invalid {
+                                line_number: 1,
+                                byte_offset: 0,
+                                message: format!("Cannot open file: {}", e),
+                            },
+                        }
                     }
                 };
                 let _ = tx.send(res);
@@ -3359,10 +3485,20 @@ impl UltraViewerApp {
             let (tx, rx) = crossbeam_channel::bounded(1);
             self.json_tree_rx = Some(rx);
 
+            let is_modified = self.document.as_ref().map_or(false, |d| {
+                d.is_dirty() || !d.modified_lines.is_empty()
+            }) || engine.size() == 0;
+            let doc_clone = self.document.clone();
+
             std::thread::Builder::new()
                 .name("json-tree-builder".to_string())
                 .spawn(move || {
-                    let tree = JsonStructureIndexer::build_tree(engine_clone, cancel);
+                    let tree = if let Some(doc) = doc_clone.filter(|_| is_modified) {
+                        let reader = PieceTableReader::new(&doc.piece_table, &engine_clone);
+                        JsonStructureIndexer::build_tree_from_reader(reader, cancel)
+                    } else {
+                        JsonStructureIndexer::build_tree(engine_clone, cancel)
+                    };
                     let _ = tx.send(tree);
                 })
                 .expect("Failed to spawn JSON tree builder");
@@ -3390,20 +3526,58 @@ impl UltraViewerApp {
         let engine_clone = Arc::clone(engine);
         let file_path = engine.path().to_path_buf();
 
+        let is_jolt_file = file_path.extension().and_then(|e| e.to_str()).map_or(false, |ext| {
+            let ext_lower = ext.to_ascii_lowercase();
+            ext_lower == "jolt" || file_path.to_string_lossy().to_ascii_lowercase().contains(".jolt.")
+        });
+
+        let is_jolt_content = if let Ok(header) = engine.read_range(0, 4096.min(engine.size() as usize)) {
+            let s = String::from_utf8_lossy(header);
+            JoltValidator::is_jolt_spec(&s)
+        } else {
+            false
+        };
+
+        let is_jolt = is_jolt_file || is_jolt_content;
+
         std::thread::Builder::new()
             .name("json-validator".to_string())
             .spawn(move || {
-                let res = if let Some(doc) = doc_clone.filter(|_| is_modified) {
-                    let reader = PieceTableReader::new(&doc.piece_table, &engine_clone);
-                    JsonValidator::validate(reader, cancel)
+                let res = if is_jolt {
+                    let jolt_res = if let Some(doc) = doc_clone.filter(|_| is_modified) {
+                        let reader = PieceTableReader::new(&doc.piece_table, &engine_clone);
+                        JoltValidator::validate(reader, cancel)
+                    } else {
+                        match std::fs::File::open(&file_path) {
+                            Ok(f) => JoltValidator::validate(f, cancel),
+                            Err(e) => JoltValidationResult::Invalid {
+                                line_number: 1,
+                                byte_offset: 0,
+                                message: format!("Cannot open file: {}", e),
+                            },
+                        }
+                    };
+                    match jolt_res {
+                        JoltValidationResult::Valid { operations_count, operations, elapsed_secs } => {
+                            JsonValidationResult::ValidJolt { operations_count, operations, elapsed_secs }
+                        }
+                        JoltValidationResult::Invalid { line_number, byte_offset, message } => {
+                            JsonValidationResult::Invalid { line_number, byte_offset, message: format!("JOLT: {}", message) }
+                        }
+                    }
                 } else {
-                    match std::fs::File::open(&file_path) {
-                        Ok(f) => JsonValidator::validate(f, cancel),
-                        Err(e) => JsonValidationResult::Invalid {
-                            line_number: 1,
-                            byte_offset: 0,
-                            message: format!("Cannot open file: {}", e),
-                        },
+                    if let Some(doc) = doc_clone.filter(|_| is_modified) {
+                        let reader = PieceTableReader::new(&doc.piece_table, &engine_clone);
+                        JsonValidator::validate(reader, cancel)
+                    } else {
+                        match std::fs::File::open(&file_path) {
+                            Ok(f) => JsonValidator::validate(f, cancel),
+                            Err(e) => JsonValidationResult::Invalid {
+                                line_number: 1,
+                                byte_offset: 0,
+                                message: format!("Cannot open file: {}", e),
+                            },
+                        }
                     }
                 };
                 let _ = tx.send(res);
@@ -3448,36 +3622,95 @@ impl UltraViewerApp {
             _ => "Formatting Document".to_string(),
         };
 
+        let is_modified = self.document.as_ref().map_or(false, |d| {
+            d.is_dirty() || !d.modified_lines.is_empty()
+        }) || engine.size() == 0;
+
+        let total_bytes = if is_modified {
+            self.document.as_ref().map(|d| d.piece_table.total_length()).unwrap_or(engine.size())
+        } else {
+            engine.size()
+        };
+
+        if total_bytes == 0 {
+            return;
+        }
+
         let cancel = Arc::new(AtomicBool::new(false));
-        let progress = Arc::new(RwLock::new(FormattingProgress::new(engine.size())));
+        let progress = Arc::new(RwLock::new(FormattingProgress::new(total_bytes)));
 
         let cancel_thread = Arc::clone(&cancel);
         let progress_thread = Arc::clone(&progress);
         let src_thread = src_path.clone();
         let dst_thread = dst_path.clone();
+        let doc_clone = self.document.clone();
+        let engine_clone = Arc::clone(&engine);
 
         std::thread::Builder::new()
             .name("streaming-formatter".to_string())
             .spawn(move || {
-                let res = match file_type {
-                    FileType::Json => JsonStreamingFormatter::format_file(
-                        src_thread,
-                        dst_thread,
-                        action,
-                        cancel_thread,
-                        Some(progress_thread),
-                    ),
-                    FileType::Xml => XmlStreamingFormatter::format_file(
-                        src_thread,
-                        dst_thread,
-                        action,
-                        cancel_thread,
-                        Some(progress_thread),
-                    ),
-                    _ => Err("Unsupported file format for streaming formatting".to_string()),
+                let res = if let Some(doc) = doc_clone.filter(|_| is_modified) {
+                    let reader = PieceTableReader::new(&doc.piece_table, &engine_clone);
+                    let dst_file = match std::fs::File::create(&dst_thread) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let msg = format!("Failed to create destination file: {}", e);
+                            progress_thread.write().unwrap().error = Some(msg.clone());
+                            return;
+                        }
+                    };
+                    let writer = std::io::BufWriter::with_capacity(256 * 1024, dst_file);
+                    let format_res = match file_type {
+                        FileType::Json => JsonStreamingFormatter::format(
+                            reader,
+                            writer,
+                            action,
+                            cancel_thread,
+                            total_bytes,
+                            Some(Arc::clone(&progress_thread)),
+                        ),
+                        FileType::Xml => XmlStreamingFormatter::format(
+                            reader,
+                            writer,
+                            action,
+                            cancel_thread,
+                            total_bytes,
+                            Some(Arc::clone(&progress_thread)),
+                        ),
+                        _ => Err("Unsupported file format for streaming formatting".to_string()),
+                    };
+                    if let Err(ref err) = format_res {
+                        let _ = std::fs::remove_file(&dst_thread);
+                        progress_thread.write().unwrap().error = Some(err.clone());
+                    }
+                    format_res
+                } else {
+                    let format_res = match file_type {
+                        FileType::Json => JsonStreamingFormatter::format_file(
+                            src_thread,
+                            dst_thread.clone(),
+                            action,
+                            cancel_thread,
+                            Some(Arc::clone(&progress_thread)),
+                        ),
+                        FileType::Xml => XmlStreamingFormatter::format_file(
+                            src_thread,
+                            dst_thread.clone(),
+                            action,
+                            cancel_thread,
+                            Some(Arc::clone(&progress_thread)),
+                        ),
+                        _ => Err("Unsupported file format for streaming formatting".to_string()),
+                    };
+                    if let Err(ref err) = format_res {
+                        let _ = std::fs::remove_file(&dst_thread);
+                        progress_thread.write().unwrap().error = Some(err.clone());
+                    }
+                    format_res
                 };
                 if let Err(e) = res {
                     eprintln!("Formatting error: {}", e);
+                    progress_thread.write().unwrap().error = Some(e);
                 }
             })
             .expect("Failed to spawn formatter thread");
@@ -4876,8 +5109,16 @@ impl UltraViewerApp {
     }
 
     pub fn scroll_to_line_with_headroom(&mut self, target_line: usize, headroom: usize) {
-        if let (Some(first), Some(last)) = (self.viewport.lines.first(), self.viewport.lines.last()) {
-            if target_line >= first.line_number + headroom && target_line + 2 <= last.line_number {
+        let screen_lines = if self.cached_screen_lines > 0 {
+            self.cached_screen_lines
+        } else {
+            25
+        };
+
+        if let Some(pos) = self.viewport.lines.iter().position(|l| l.line_number == target_line) {
+            let safe_top = headroom.min(screen_lines / 4);
+            let safe_bottom = screen_lines.saturating_sub(3);
+            if pos >= safe_top && pos <= safe_bottom {
                 return;
             }
         }
@@ -5520,6 +5761,11 @@ impl eframe::App for UltraViewerApp {
             self.titlebar_applied_frames += 1;
         }
 
+        if !self.has_shown_window {
+            self.has_shown_window = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+
         let is_searching = matches!(*self.search_status.read().unwrap(), SearchStatus::Searching { .. });
         let is_indexing = self.line_index.as_ref().map_or(false, |i| !i.is_complete());
 
@@ -6107,6 +6353,16 @@ impl eframe::App for UltraViewerApp {
                     self.cached_memory_metrics = super::process_memory::query_memory();
                     self.status_notification = Some(("Flushed Windows OS standby file cache".to_string(), Instant::now()));
                 }
+                StatusBarAction::CycleLanguageMode => {
+                    let next_ft = match self.file_type {
+                        Some(FileType::PlainText) | None => FileType::Xml,
+                        Some(FileType::Xml) => FileType::Json,
+                        Some(FileType::Json) => FileType::Csv,
+                        Some(FileType::Csv) => FileType::PlainText,
+                        Some(FileType::Binary) => FileType::Xml,
+                    };
+                    self.set_file_type(next_ft);
+                }
             }
         }
 
@@ -6542,11 +6798,20 @@ impl eframe::App for UltraViewerApp {
                             ui.colored_label(Color32::from_rgb(152, 195, 121), RichText::new("Valid XML Document").strong());
                             ui.label(format!("({} elements, max depth: {}, verified in {:.2}s)", elements_count, max_depth, elapsed_secs));
                         }
+                        XmlValidationResult::ValidXslt { elements_count, templates_count, version, elapsed_secs } => {
+                            let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), egui::Sense::hover());
+                            paint_icon(ui.painter(), icon_rect, Icon::Check, Color32::from_rgb(152, 195, 121));
+                            ui.colored_label(Color32::from_rgb(152, 195, 121), RichText::new("Valid XSLT Stylesheet").strong());
+                            ui.label(format!("(v{}, {} template(s), {} elements, verified in {:.2}s)", version, templates_count, elements_count, elapsed_secs));
+                        }
                         XmlValidationResult::Invalid { line_number, byte_offset, message } => {
                             let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), egui::Sense::hover());
                             paint_icon(ui.painter(), icon_rect, Icon::Close, Color32::from_rgb(224, 108, 117));
-                            ui.colored_label(Color32::from_rgb(224, 108, 117), RichText::new("XML Validation Error:").strong());
-                            ui.label(RichText::new(format!("Line {}, Offset {}: {}", line_number, byte_offset, message)).color(Color32::from_rgb(235, 235, 240)));
+                            let is_xslt_err = message.starts_with("XSLT: ");
+                            let header = if is_xslt_err { "XSLT Validation Error:" } else { "XML Validation Error:" };
+                            let display_msg = if is_xslt_err { message.strip_prefix("XSLT: ").unwrap_or(message) } else { message };
+                            ui.colored_label(Color32::from_rgb(224, 108, 117), RichText::new(header).strong());
+                            ui.label(RichText::new(format!("Line {}, Offset {}: {}", line_number, byte_offset, display_msg)).color(Color32::from_rgb(235, 235, 240)));
                             if ui.button(RichText::new(format!("Jump to Line {}", line_number)).size(11.5).strong()).clicked() {
                                 jump_to_xml_line = Some(*line_number);
                             }
@@ -6603,11 +6868,20 @@ impl eframe::App for UltraViewerApp {
                             ui.colored_label(Color32::from_rgb(152, 195, 121), RichText::new("Valid JSON Document").strong());
                             ui.label(format!("({} objects, {} arrays, max depth: {}, verified in {:.2}s)", objects_count, arrays_count, max_depth, elapsed_secs));
                         }
+                        JsonValidationResult::ValidJolt { operations_count, operations, elapsed_secs } => {
+                            let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), egui::Sense::hover());
+                            paint_icon(ui.painter(), icon_rect, Icon::Check, Color32::from_rgb(152, 195, 121));
+                            ui.colored_label(Color32::from_rgb(152, 195, 121), RichText::new("Valid JOLT Specification").strong());
+                            ui.label(format!("({} operations: [{}], verified in {:.2}s)", operations_count, operations.join(" -> "), elapsed_secs));
+                        }
                         JsonValidationResult::Invalid { line_number, byte_offset, message } => {
                             let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), egui::Sense::hover());
                             paint_icon(ui.painter(), icon_rect, Icon::Close, Color32::from_rgb(224, 108, 117));
-                            ui.colored_label(Color32::from_rgb(224, 108, 117), RichText::new("JSON Validation Error:").strong());
-                            ui.label(RichText::new(format!("Line {}, Offset {}: {}", line_number, byte_offset, message)).color(Color32::from_rgb(235, 235, 240)));
+                            let is_jolt_err = message.starts_with("JOLT: ");
+                            let header = if is_jolt_err { "JOLT Validation Error:" } else { "JSON Validation Error:" };
+                            let display_msg = if is_jolt_err { message.strip_prefix("JOLT: ").unwrap_or(message) } else { message };
+                            ui.colored_label(Color32::from_rgb(224, 108, 117), RichText::new(header).strong());
+                            ui.label(RichText::new(format!("Line {}, Offset {}: {}", line_number, byte_offset, display_msg)).color(Color32::from_rgb(235, 235, 240)));
                             if ui.button(RichText::new(format!("Jump to Line {}", line_number)).size(11.5).strong()).clicked() {
                                 jump_to_json_line = Some(*line_number);
                             }
@@ -6898,17 +7172,12 @@ impl eframe::App for UltraViewerApp {
                         }
                     }
                 } else if active.is_in_place && progress.is_finished {
-                    // Automatically swap in-place once finished!
+                    // Automatically reload in-place once finished!
                     let src = active.src_path.clone();
                     let dst = active.dst_path.clone();
                     self.show_format_modal = false;
                     self.active_formatting = None;
-                    self.close_file();
-                    if let Err(e) = std::fs::rename(&dst, &src) {
-                        self.error_message = Some(format!("Failed to replace formatted file: {}", e));
-                    } else {
-                        self.open_file(src);
-                    }
+                    self.reload_active_tab_from_saved_file(&src, &dst);
                 }
             }
         }
@@ -7356,6 +7625,7 @@ impl UltraViewerApp {
             PaletteAction::SetThemeTokyoNight => self.set_theme(ColorTheme::TokyoNight, ctx),
             PaletteAction::SetThemeLightModern => self.set_theme(ColorTheme::LightModern, ctx),
             PaletteAction::XmlValidate => self.validate_xml_document(),
+            PaletteAction::XsltValidate => self.validate_xml_document(),
             PaletteAction::XmlToggleTree => {
                 self.show_xml_tree = !self.show_xml_tree;
                 if self.show_xml_tree && self.xml_tree_root.is_none() {
@@ -7368,6 +7638,7 @@ impl UltraViewerApp {
                 }
             }
             PaletteAction::JsonValidate => self.validate_json_document(),
+            PaletteAction::JoltValidate => self.validate_json_document(),
             PaletteAction::JsonToggleTree => {
                 self.show_json_tree = !self.show_json_tree;
                 if self.show_json_tree && self.json_tree_root.is_none() {
@@ -7398,6 +7669,10 @@ impl UltraViewerApp {
             }
             PaletteAction::ToggleFoldDescriptions => self.toggle_fold_all_descriptions(),
             PaletteAction::UnfoldAll => self.unfold_all(),
+            PaletteAction::SetLanguageModeXml => self.set_file_type(FileType::Xml),
+            PaletteAction::SetLanguageModeJson => self.set_file_type(FileType::Json),
+            PaletteAction::SetLanguageModeCsv => self.set_file_type(FileType::Csv),
+            PaletteAction::SetLanguageModePlainText => self.set_file_type(FileType::PlainText),
             PaletteAction::About => self.show_about_dialog = true,
             PaletteAction::Undo => self.undo(),
             PaletteAction::Redo => self.redo(),
@@ -10198,6 +10473,11 @@ mod tests {
 
         let mut app = UltraViewerApp::default();
         app.do_open_file(&orig_file);
+        if let Some(ref idx) = app.line_index {
+            while !idx.is_complete() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
 
         let tab_1_id = app.active_tab_id.expect("tab 1 active");
         assert_eq!(app.tabs.len(), 1);
@@ -10505,6 +10785,380 @@ mod tests {
         // Clean up
         let _ = std::fs::remove_file(&gz_path);
         let _ = std::fs::remove_file(&zip_path);
+    }
+
+    #[test]
+    fn test_xslt_validation_flow() {
+        let temp_dir = std::env::temp_dir();
+        let xslt_path = temp_dir.join("test_sheet.xslt");
+        let content = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:output method="xml" indent="yes" />
+            <xsl:template match="/">
+                <root>
+                    <xsl:for-each select="catalog/item">
+                        <item name="{name}">
+                            <xsl:value-of select="title" />
+                        </item>
+                    </xsl:for-each>
+                </root>
+            </xsl:template>
+        </xsl:stylesheet>"#;
+        std::fs::write(&xslt_path, content).unwrap();
+
+        let mut app = UltraViewerApp::default();
+        app.do_open_file(&xslt_path);
+        assert_eq!(app.file_type, Some(FileType::Xml));
+
+        app.validate_xml_document();
+        assert!(app.is_validating_xml);
+
+        // Wait for worker result
+        let rx = app.xml_validation_rx.as_ref().unwrap();
+        let res = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        match res {
+            XmlValidationResult::ValidXslt { templates_count, version, .. } => {
+                assert_eq!(templates_count, 1);
+                assert_eq!(version, "1.0");
+            }
+            _ => panic!("Expected ValidXslt, got {:?}", res),
+        }
+
+        let _ = std::fs::remove_file(&xslt_path);
+    }
+
+    #[test]
+    fn test_jolt_validation_flow() {
+        let temp_dir = std::env::temp_dir();
+        let jolt_path = temp_dir.join("test_spec.jolt");
+        let content = r#"[
+            {
+                "operation": "shift",
+                "spec": {
+                    "foo": "bar"
+                }
+            },
+            {
+                "operation": "default",
+                "spec": {
+                    "timestamp": 12345
+                }
+            }
+        ]"#;
+        std::fs::write(&jolt_path, content).unwrap();
+
+        let mut app = UltraViewerApp::default();
+        app.do_open_file(&jolt_path);
+        assert_eq!(app.file_type, Some(FileType::Json));
+
+        app.validate_json_document();
+        assert!(app.is_validating_json);
+
+        // Wait for worker result
+        let rx = app.json_validation_rx.as_ref().unwrap();
+        let res = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        match res {
+            JsonValidationResult::ValidJolt { operations_count, operations, .. } => {
+                assert_eq!(operations_count, 2);
+                assert_eq!(operations, vec!["shift", "default"]);
+            }
+            _ => panic!("Expected ValidJolt, got {:?}", res),
+        }
+
+        let _ = std::fs::remove_file(&jolt_path);
+    }
+
+    #[test]
+    fn test_scroll_to_line_with_headroom_scrolls_when_target_beyond_screen() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("test_scroll.txt");
+        let lines: Vec<String> = (1..=200).map(|i| format!("Line {}", i)).collect();
+        std::fs::write(&file_path, lines.join("\n")).unwrap();
+
+        let mut app = UltraViewerApp::default();
+        app.do_open_file(&file_path);
+        if let Some(ref idx) = app.line_index {
+            while !idx.is_complete() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        app.cached_screen_lines = 30; // 30 lines visible on screen
+
+        // Initially viewport starts at line 1, buffer has up to 120 lines
+        assert_eq!(app.viewport.lines.first().unwrap().line_number, 1);
+
+        // When navigating to line 65 (which is in the 120-line buffer, but OFF the 30-line screen):
+        app.scroll_to_line_with_headroom(65, 4);
+
+        // Viewport must have scrolled so that line 65 is on-screen with headroom
+        let top = app.viewport.lines.first().unwrap().line_number;
+        assert_eq!(top, 61); // 65 - 4 headroom = 61
+        assert!(app.viewport.lines.iter().position(|l| l.line_number == 65).unwrap() == 4);
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_paste_in_blank_document_detects_xml_and_json() {
+        // Test XML paste in blank file
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+        assert_eq!(app.file_type, Some(FileType::PlainText));
+
+        let sample_xml = "<catalog>\n  <book id=\"1\">\n    <title>Rust</title>\n  </book>\n</catalog>";
+        app.paste_text_at_cursor(sample_xml);
+        assert_eq!(app.file_type, Some(FileType::Xml), "Pasting XML in blank doc should promote file_type to XML");
+
+        // Test JSON paste in blank file
+        let mut app_json = UltraViewerApp::default();
+        app_json.new_blank_file();
+        assert_eq!(app_json.file_type, Some(FileType::PlainText));
+
+        let sample_json = "[\n  {\n    \"operation\": \"shift\",\n    \"spec\": { \"a\": \"b\" }\n  }\n]";
+        app_json.paste_text_at_cursor(sample_json);
+        assert_eq!(app_json.file_type, Some(FileType::Json), "Pasting JSON in blank doc should promote file_type to JSON");
+    }
+
+    #[test]
+    fn test_validate_xml_in_blank_document_reports_exact_line_number() {
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+
+        let mut lines = Vec::new();
+        lines.push("<?xml version=\"1.0\" encoding=\"UTF-8\"?>".to_string());
+        lines.push("<root>".to_string());
+        for i in 3..=125 {
+            lines.push(format!("  <item id=\"{}\">Item {}</item>", i, i));
+        }
+        // Line 126 has a syntax error: missing closing >
+        lines.push("  <broken-tag attr=\"value\"/".to_string());
+        lines.push("  <next-item>Data</next-item>".to_string());
+        lines.push("</root>".to_string());
+
+        let content = lines.join("\n");
+        app.paste_text_at_cursor(&content);
+
+        app.validate_xml_document();
+        assert!(app.is_validating_xml);
+
+        let rx = app.xml_validation_rx.as_ref().unwrap();
+        let res = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        match res {
+            XmlValidationResult::Invalid { line_number, byte_offset, message } => {
+                assert!(
+                    line_number >= 126 && line_number <= 127,
+                    "Expected line 126 or 127, got line {} (offset {}, msg: {})",
+                    line_number, byte_offset, message
+                );
+                assert!(byte_offset > 0);
+            }
+            _ => panic!("Expected XmlValidationResult::Invalid, got {:?}", res),
+        }
+    }
+
+    #[test]
+    fn test_search_in_blank_unsaved_document_finds_and_navigates_matches() {
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+
+        let content = "Line 1: first error\nLine 2: normal line\nLine 3: second error\nLine 4: third error\nLine 5: end of file";
+        app.paste_text_at_cursor(content);
+        // Verify file is 0 bytes on disk but has in-memory piece table content
+        assert_eq!(app.engine.as_ref().unwrap().size(), 0);
+        assert!(app.document.as_ref().unwrap().piece_table.total_length() > 0);
+
+        // Search for "error"
+        app.search_query.pattern = "error".to_string();
+        app.search_query.case_sensitive = true;
+        app.search_query.is_regex = false;
+        app.start_search();
+
+        if let Some(handle) = app.search_handle.take() {
+            handle.join().unwrap();
+        }
+
+        let matches = app.search_matches.read().unwrap().clone();
+        assert_eq!(matches.len(), 3, "Expected 3 occurrences of 'error'");
+        assert_eq!(matches[0].line_number, 1);
+        assert_eq!(matches[1].line_number, 3);
+        assert_eq!(matches[2].line_number, 4);
+
+        // Test navigation
+        app.find_next();
+        assert_eq!(app.active_match_idx, Some(0));
+        app.find_next();
+        assert_eq!(app.active_match_idx, Some(1));
+        app.find_next();
+        assert_eq!(app.active_match_idx, Some(2));
+        app.find_next();
+        assert_eq!(app.active_match_idx, Some(0)); // wraps around
+
+        app.find_prev();
+        assert_eq!(app.active_match_idx, Some(2)); // wraps backwards
+
+        // Test regex search in the same blank unsaved document
+        app.search_query.pattern = "normal\\s+line".to_string();
+        app.search_query.is_regex = true;
+        app.start_search();
+
+        if let Some(handle) = app.search_handle.take() {
+            handle.join().unwrap();
+        }
+
+        let regex_matches = app.search_matches.read().unwrap().clone();
+        assert_eq!(regex_matches.len(), 1, "Expected 1 regex match");
+        assert_eq!(regex_matches[0].line_number, 2);
+    }
+
+    #[test]
+    fn test_xml_structure_tree_in_blank_unsaved_document() {
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+
+        let sample_xml = "<catalog>\n  <book id=\"bk101\">\n    <title>Rust</title>\n  </book>\n  <book id=\"bk102\">\n    <title>Go</title>\n  </book>\n</catalog>";
+        app.paste_text_at_cursor(sample_xml);
+
+        app.trigger_build_xml_tree();
+        assert!(app.xml_tree_building);
+
+        let rx = app.xml_tree_rx.as_ref().unwrap();
+        let tree_opt = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(tree_opt.is_some(), "Expected XML structure tree to be built from in-memory content");
+        let root = tree_opt.unwrap();
+        assert_eq!(root.name, "catalog");
+        assert_eq!(root.children.len(), 2);
+        assert_eq!(root.children[0].name, "book");
+        assert_eq!(root.children[1].name, "book");
+    }
+
+    #[test]
+    fn test_json_structure_tree_in_blank_unsaved_document() {
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+
+        let sample_json = "{\n  \"app\": \"UltraViewer\",\n  \"version\": \"1.0\",\n  \"features\": [\"search\", \"tree\"]\n}";
+        app.paste_text_at_cursor(sample_json);
+
+        app.trigger_build_json_tree();
+        assert!(app.json_tree_building);
+
+        let rx = app.json_tree_rx.as_ref().unwrap();
+        let root = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(root.name == "object" || root.name == "root");
+        assert!(!root.children.is_empty(), "Expected JSON structure tree children to be extracted");
+        let names: Vec<String> = root.children.iter().map(|c| c.name.clone()).collect();
+        assert!(names.contains(&"features".to_string()));
+    }
+
+    #[test]
+    fn test_format_json_in_blank_unsaved_document() {
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+
+        let raw_json = "{\"title\":\"UltraViewer\",\"nested\":{\"enabled\":true}}";
+        app.paste_text_at_cursor(raw_json);
+
+        let temp_dst = std::env::temp_dir().join(format!("uv_format_test_{}.json", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        app.start_formatting(
+            FormatAction::Beautify { indent_size: 2, use_tabs: false },
+            false,
+            Some(temp_dst.clone()),
+        );
+
+        assert!(app.active_formatting.is_some());
+        let active = app.active_formatting.as_ref().unwrap();
+        let progress = Arc::clone(&active.progress);
+
+        // Wait for formatting to complete
+        let start = Instant::now();
+        while !progress.read().unwrap().is_finished && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(progress.read().unwrap().is_finished, "Expected JSON formatting to finish");
+        assert!(progress.read().unwrap().error.is_none());
+
+        let formatted = std::fs::read_to_string(&temp_dst).unwrap();
+        let _ = std::fs::remove_file(&temp_dst);
+        assert!(formatted.contains("{\n"));
+        assert!(formatted.contains("\"title\": \"UltraViewer\""));
+    }
+
+    #[test]
+    fn test_format_xml_in_blank_unsaved_document() {
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+
+        let raw_xml = "<catalog><book id=\"1\"><title>Rust</title></book></catalog>";
+        app.paste_text_at_cursor(raw_xml);
+
+        let temp_dst = std::env::temp_dir().join(format!("uv_format_test_{}.xml", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        app.start_formatting(
+            FormatAction::Beautify { indent_size: 2, use_tabs: false },
+            false,
+            Some(temp_dst.clone()),
+        );
+
+        assert!(app.active_formatting.is_some());
+        let active = app.active_formatting.as_ref().unwrap();
+        let progress = Arc::clone(&active.progress);
+
+        // Wait for formatting to complete
+        let start = Instant::now();
+        while !progress.read().unwrap().is_finished && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(progress.read().unwrap().is_finished, "Expected formatting to finish");
+        assert!(progress.read().unwrap().error.is_none());
+
+        let formatted = std::fs::read_to_string(&temp_dst).unwrap();
+        let _ = std::fs::remove_file(&temp_dst);
+        assert!(formatted.contains("<catalog>"));
+        assert!(formatted.contains("  <book id=\"1\">"));
+        assert!(formatted.contains("    <title>Rust</title>"));
+    }
+
+    #[test]
+    fn test_format_xml_in_place_in_blank_unsaved_document_reloads_without_unsaved_dialog() {
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+
+        let raw_xml = "<catalog><book id=\"1\"><title>Rust</title></book></catalog>";
+        app.paste_text_at_cursor(raw_xml);
+
+        // Start in-place formatting
+        app.start_formatting(
+            FormatAction::Beautify { indent_size: 2, use_tabs: false },
+            true,
+            None,
+        );
+
+        assert!(app.active_formatting.is_some());
+        let active = app.active_formatting.as_ref().unwrap();
+        let src = active.src_path.clone();
+        let dst = active.dst_path.clone();
+        let progress = Arc::clone(&active.progress);
+
+        // Wait for formatting to complete
+        let start = Instant::now();
+        while !progress.read().unwrap().is_finished && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(progress.read().unwrap().is_finished, "Expected formatting to finish");
+        assert!(progress.read().unwrap().error.is_none());
+
+        // Perform in-place reload as done in the app loop
+        let reloaded = app.reload_active_tab_from_saved_file(&src, &dst);
+        assert!(reloaded, "Expected reload_active_tab_from_saved_file to succeed");
+        assert!(!app.show_unsaved_dialog, "In-place formatting must NOT trigger unsaved changes confirmation");
+
+        // Verify the viewport lines now contain the formatted XML
+        let all_text = app.viewport.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(all_text.contains("<catalog>"));
+        assert!(all_text.contains("  <book id=\"1\">"));
+        assert!(all_text.contains("    <title>Rust</title>"));
     }
 }
 

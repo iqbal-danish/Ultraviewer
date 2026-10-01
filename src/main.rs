@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![windows_subsystem = "windows"]
 
 use std::path::PathBuf;
 use eframe::egui;
@@ -15,7 +15,8 @@ fn main() -> eframe::Result<()> {
         .with_decorations(false)
         .with_resizable(true)
         .with_drag_and_drop(true)
-        .with_maximized(true);
+        .with_maximized(true)
+        .with_visible(false);
 
     if let Some(icon) = icon_data {
         viewport = viewport.with_icon(icon);

@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use crate::editor::PieceTable;
 use crate::file_engine::{FileEngine, LineIndex};
 use super::regex_search::RegexSearcher;
 use super::text_search::LiteralSearcher;
@@ -14,11 +15,32 @@ const SEARCH_CHUNK_SIZE: usize = 1024 * 1024; // 1 MB streaming chunks
 const OVERLAP_SIZE: usize = 512;               // Overlap across chunk borders
 const MAX_STORED_MATCHES: usize = 15_000_000;  // Store up to 15,000,000 navigable matches in memory (~240 MB)
 
+#[derive(Clone)]
+pub enum SearchTarget {
+    File {
+        engine: Arc<FileEngine>,
+    },
+    PieceTable {
+        piece_table: PieceTable,
+        engine: Arc<FileEngine>,
+        total_size: u64,
+    },
+}
+
+impl SearchTarget {
+    pub fn size(&self) -> u64 {
+        match self {
+            SearchTarget::File { engine } => engine.size(),
+            SearchTarget::PieceTable { total_size, .. } => *total_size,
+        }
+    }
+}
+
 pub struct SearchWorker;
 
 impl SearchWorker {
     pub fn spawn(
-        engine: Arc<FileEngine>,
+        target: SearchTarget,
         _line_index: Arc<LineIndex>,
         query: SearchQuery,
         matches_out: Arc<RwLock<Vec<SearchResultMatch>>>,
@@ -28,7 +50,7 @@ impl SearchWorker {
         thread::Builder::new()
             .name("search-worker".to_string())
             .spawn(move || {
-                let file_size = engine.size();
+                let file_size = target.size();
                 if file_size == 0 || query.is_empty() {
                     *status_out.write().unwrap() = SearchStatus::Completed {
                         matches_found: 0,
@@ -41,12 +63,15 @@ impl SearchWorker {
                 let mut last_progress_time = Instant::now();
                 let mut matches_count = 0;
 
-                let mut file = match File::open(engine.path()) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        *status_out.write().unwrap() = SearchStatus::Error(format!("Cannot open file: {}", e));
-                        return;
-                    }
+                let mut file = match &target {
+                    SearchTarget::File { engine } => match File::open(engine.path()) {
+                        Ok(f) => Some(f),
+                        Err(e) => {
+                            *status_out.write().unwrap() = SearchStatus::Error(format!("Cannot open file: {}", e));
+                            return;
+                        }
+                    },
+                    SearchTarget::PieceTable { .. } => None,
                 };
 
                 let regex_searcher = if query.is_regex || !query.case_sensitive || query.whole_word {
@@ -69,7 +94,8 @@ impl SearchWorker {
                 };
 
                 let mut current_offset: u64 = 0;
-                let mut buffer = vec![0u8; SEARCH_CHUNK_SIZE + OVERLAP_SIZE];
+                let mut file_buffer = vec![0u8; SEARCH_CHUNK_SIZE + OVERLAP_SIZE];
+                let mut pt_buffer = Vec::with_capacity(SEARCH_CHUNK_SIZE + OVERLAP_SIZE);
                 let mut last_match_end: u64 = 0;
                 let mut current_line: usize = 1;
 
@@ -85,14 +111,27 @@ impl SearchWorker {
                     let remaining_file = (file_size - current_offset) as usize;
                     let to_read = read_target.min(remaining_file);
 
-                    let _ = file.seek(SeekFrom::Start(current_offset));
-                    let bytes_read = match file.read(&mut buffer[..to_read]) {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(_) => break,
+                    let (bytes_read, active_slice): (usize, &[u8]) = match &target {
+                        SearchTarget::File { .. } => {
+                            let f = file.as_mut().unwrap();
+                            let _ = f.seek(SeekFrom::Start(current_offset));
+                            let n = match f.read(&mut file_buffer[..to_read]) {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
+                            (n, &file_buffer[..n])
+                        }
+                        SearchTarget::PieceTable { piece_table, engine, .. } => {
+                            if piece_table.read_range(engine, current_offset, to_read, &mut pt_buffer).is_err() {
+                                break;
+                            }
+                            if pt_buffer.is_empty() {
+                                break;
+                            }
+                            (pt_buffer.len(), &pt_buffer[..])
+                        }
                     };
-
-                    let active_slice = &buffer[..bytes_read];
 
                     let advance = if bytes_read > OVERLAP_SIZE && current_offset + (bytes_read as u64) < file_size {
                         bytes_read - OVERLAP_SIZE

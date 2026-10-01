@@ -6,4 +6,4 @@ pub mod worker;
 pub use regex_search::RegexSearcher;
 pub use text_search::LiteralSearcher;
 pub use types::{SearchQuery, SearchResultMatch, SearchStatus};
-pub use worker::SearchWorker;
+pub use worker::{SearchTarget, SearchWorker};

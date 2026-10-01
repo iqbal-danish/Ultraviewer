@@ -13,20 +13,20 @@ use crate::file_engine::line_index::LineIndex;
 struct LineTrackingReader<R: Read> {
     inner: R,
     current_byte: u64,
-    current_line: usize,
-    checkpoints: Arc<Mutex<Vec<(u64, usize)>>>,
-    last_checkpoint_byte: u64,
+    line_starts: Arc<Mutex<Vec<u64>>>,
 }
 
 impl<R: Read> LineTrackingReader<R> {
-    fn new(inner: R, checkpoints: Arc<Mutex<Vec<(u64, usize)>>>) -> Self {
-        checkpoints.lock().unwrap().push((0, 1));
+    fn new(inner: R, line_starts: Arc<Mutex<Vec<u64>>>) -> Self {
+        {
+            let mut ls = line_starts.lock().unwrap();
+            ls.clear();
+            ls.push(0); // Line 1 starts at byte 0
+        }
         Self {
             inner,
             current_byte: 0,
-            current_line: 1,
-            checkpoints,
-            last_checkpoint_byte: 0,
+            line_starts,
         }
     }
 }
@@ -35,29 +35,21 @@ impl<R: Read> Read for LineTrackingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         if n > 0 {
-            let mut line = self.current_line;
             let mut byte = self.current_byte;
-            let mut last_cp = self.last_checkpoint_byte;
-            let mut new_cps = Vec::new();
+            let mut new_starts = Vec::new();
 
             for &b in &buf[..n] {
                 byte += 1;
                 if b == b'\n' {
-                    line += 1;
-                    if byte - last_cp >= 65536 {
-                        new_cps.push((byte, line));
-                        last_cp = byte;
-                    }
+                    new_starts.push(byte);
                 }
             }
 
-            self.current_line = line;
             self.current_byte = byte;
-            self.last_checkpoint_byte = last_cp;
 
-            if !new_cps.is_empty() {
-                if let Ok(mut cps) = self.checkpoints.lock() {
-                    cps.extend(new_cps);
+            if !new_starts.is_empty() {
+                if let Ok(mut ls) = self.line_starts.lock() {
+                    ls.extend(new_starts);
                 }
             }
         }
@@ -284,6 +276,12 @@ pub enum XmlValidationResult {
         max_depth: usize,
         elapsed_secs: f64,
     },
+    ValidXslt {
+        elements_count: usize,
+        templates_count: usize,
+        version: String,
+        elapsed_secs: f64,
+    },
     Invalid {
         line_number: usize,
         byte_offset: u64,
@@ -303,8 +301,8 @@ impl XmlValidator {
         cancel: Arc<AtomicBool>,
     ) -> XmlValidationResult {
         let start = Instant::now();
-        let checkpoints = Arc::new(Mutex::new(Vec::with_capacity(512)));
-        let tracking_reader = LineTrackingReader::new(reader, Arc::clone(&checkpoints));
+        let line_starts = Arc::new(Mutex::new(Vec::with_capacity(1024)));
+        let tracking_reader = LineTrackingReader::new(reader, Arc::clone(&line_starts));
         let buf_reader = BufReader::with_capacity(512 * 1024, tracking_reader);
         let mut xml_reader = Reader::from_reader(buf_reader);
         xml_reader.config_mut().expand_empty_elements = false;
@@ -341,19 +339,17 @@ impl XmlValidator {
         let mut root_closed = false;
 
         let get_line_num = |offset: u64| -> usize {
-            if let (Some(idx), Some(eng)) = (line_index, engine) {
-                return idx.byte_offset_to_line(eng, offset);
+            if let Ok(ls) = line_starts.lock() {
+                if !ls.is_empty() {
+                    return match ls.binary_search(&offset) {
+                        Ok(i) => i + 1,
+                        Err(i) => i.max(1),
+                    };
+                }
             }
-            if let Ok(cps) = checkpoints.lock() {
-                if !cps.is_empty() {
-                    match cps.binary_search_by_key(&offset, |&(b, _)| b) {
-                        Ok(i) => return cps[i].1,
-                        Err(i) => {
-                            if i > 0 {
-                                return cps[i - 1].1;
-                            }
-                        }
-                    }
+            if let (Some(idx), Some(eng)) = (line_index, engine) {
+                if eng.size() > 0 && offset <= eng.size() {
+                    return idx.byte_offset_to_line(eng, offset);
                 }
             }
             1
@@ -655,6 +651,11 @@ impl XmlStructureIndexer {
     pub fn build_tree(engine: Arc<FileEngine>, cancel: Arc<AtomicBool>) -> Option<XmlTreeNode> {
         let file = File::open(engine.path()).ok()?;
         let buf_reader = BufReader::with_capacity(128 * 1024, file);
+        Self::build_tree_from_reader(buf_reader, cancel)
+    }
+
+    /// Builds a structure tree from an arbitrary BufRead stream (e.g. File or PieceTableReader).
+    pub fn build_tree_from_reader<R: std::io::BufRead>(buf_reader: R, cancel: Arc<AtomicBool>) -> Option<XmlTreeNode> {
         let mut reader = Reader::from_reader(buf_reader);
         reader.config_mut().expand_empty_elements = false;
 
@@ -771,7 +772,7 @@ mod tests {
                 assert!(message.contains("category"), "Expected error to mention 'category', got: {}", message);
                 assert!(message.contains("job") || message.contains("expected"), "Expected error to mention mismatched tag, got: {}", message);
             }
-            XmlValidationResult::Valid { .. } => {
+            _ => {
                 panic!("Expected XML to be invalid due to missing </category> closing tag!");
             }
         }
@@ -794,8 +795,8 @@ mod tests {
                 assert_eq!(elements_count, 5);
                 assert_eq!(max_depth, 3);
             }
-            XmlValidationResult::Invalid { message, .. } => {
-                panic!("Expected XML to be valid, but got: {}", message);
+            _ => {
+                panic!("Expected XML to be valid, but got: {:?}", res);
             }
         }
     }

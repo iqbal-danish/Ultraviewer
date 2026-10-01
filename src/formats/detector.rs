@@ -85,8 +85,8 @@ impl FormatDetector {
         if let Some(path) = path {
             if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                 match ext.to_ascii_lowercase().as_str() {
-                    "xml" => return FileType::Xml,
-                    "json" => return FileType::Json,
+                    "xml" | "xslt" | "xsl" => return FileType::Xml,
+                    "json" | "jolt" => return FileType::Json,
                     "csv" | "tsv" => return FileType::Csv,
                     "txt" | "log" | "md" | "rs" | "c" | "cpp" | "h" | "py" | "js" | "html" => {
                         return FileType::PlainText

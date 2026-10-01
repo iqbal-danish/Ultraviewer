@@ -1,4 +1,4 @@
-use eframe::egui::{Color32, Pos2, Rect, RichText, Sense, Ui, Vec2};
+use eframe::egui::{Button, Color32, Pos2, Rect, RichText, Sense, Ui, Vec2};
 use crate::file_engine::Encoding;
 use crate::formats::FileType;
 use std::time::Duration;
@@ -9,6 +9,7 @@ pub enum StatusBarAction {
     ToggleWrap,
     ToggleHexView,
     TrimMemory,
+    CycleLanguageMode,
 }
 
 pub struct StatusBarProps<'a> {
@@ -68,7 +69,10 @@ pub fn render_status_bar(ui: &mut Ui, props: StatusBarProps) -> Option<StatusBar
                 FileType::Json => Color32::from_rgb(229, 192, 123),
                 _ => Color32::from_rgb(97, 175, 239),
             };
-            ui.label(RichText::new(ft.name()).size(11.0).color(ft_color));
+            let resp = ui.add(Button::new(RichText::new(ft.name()).size(11.0).color(ft_color)).frame(false));
+            if resp.on_hover_text("Language Mode (Click to switch between XML, JSON, CSV, Plain Text)").clicked() {
+                action = Some(StatusBarAction::CycleLanguageMode);
+            }
         }
 
         if props.file_size > 0 {

@@ -295,7 +295,7 @@ pub fn render_menu_bar(
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Validate XML Document").clicked() {
+                if ui.button("Validate XML / XSLT Document (Ctrl+Shift+V)").clicked() {
                     action = Some(MenuAction::XmlValidate);
                     ui.close_menu();
                 }
@@ -314,7 +314,7 @@ pub fn render_menu_bar(
         if is_json {
             ui.menu_button("JSON", |ui| {
                 style_popup(ui);
-                if ui.button("Validate JSON Document").clicked() {
+                if ui.button("Validate JSON / JOLT Document (Ctrl+Shift+V)").clicked() {
                     action = Some(MenuAction::JsonValidate);
                     ui.close_menu();
                 }
