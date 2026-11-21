@@ -58,6 +58,8 @@ pub enum ShortcutAction {
     SelectAll,
     TransformUppercase,
     TransformLowercase,
+    RunPython,
+    StopPython,
 }
 
 impl ShortcutAction {
@@ -99,6 +101,8 @@ impl ShortcutAction {
             ShortcutAction::SelectAll,
             ShortcutAction::TransformUppercase,
             ShortcutAction::TransformLowercase,
+            ShortcutAction::RunPython,
+            ShortcutAction::StopPython,
         ]
     }
 
@@ -136,7 +140,9 @@ impl ShortcutAction {
             | Self::FormatMinify
             | Self::SelectAll
             | Self::TransformUppercase
-            | Self::TransformLowercase => ActionCategory::Editing,
+            | Self::TransformLowercase
+            | Self::RunPython
+            | Self::StopPython => ActionCategory::Editing,
         }
     }
 
@@ -175,6 +181,8 @@ impl ShortcutAction {
             Self::SelectAll => "Select All",
             Self::TransformUppercase => "Transform Selection to Uppercase",
             Self::TransformLowercase => "Transform Selection to Lowercase",
+            Self::RunPython => "Run Python Buffer (without saving)",
+            Self::StopPython => "Stop Python Process",
         }
     }
 
@@ -213,6 +221,8 @@ impl ShortcutAction {
             Self::SelectAll => "Select entire line index range",
             Self::TransformUppercase => "Convert highlighted text to UPPERCASE",
             Self::TransformLowercase => "Convert highlighted text to lowercase",
+            Self::RunPython => "Execute active buffer or selected code via Python stdin without saving",
+            Self::StopPython => "Terminate running Python child process immediately",
         }
     }
 
@@ -251,6 +261,8 @@ impl ShortcutAction {
             Self::SelectAll => "select_all",
             Self::TransformUppercase => "transform_uppercase",
             Self::TransformLowercase => "transform_lowercase",
+            Self::RunPython => "run_python",
+            Self::StopPython => "stop_python",
         }
     }
 
@@ -289,6 +301,8 @@ impl ShortcutAction {
             "select_all" => Some(Self::SelectAll),
             "transform_uppercase" => Some(Self::TransformUppercase),
             "transform_lowercase" => Some(Self::TransformLowercase),
+            "run_python" => Some(Self::RunPython),
+            "stop_python" => Some(Self::StopPython),
             _ => None,
         }
     }
@@ -328,6 +342,8 @@ impl ShortcutAction {
             Self::SelectAll => Some(KeyChord::ctrl(Key::A)),
             Self::TransformUppercase => Some(KeyChord::ctrl_shift(Key::U)),
             Self::TransformLowercase => Some(KeyChord::ctrl_alt(Key::U)),
+            Self::RunPython => Some(KeyChord::plain(Key::F5)),
+            Self::StopPython => Some(KeyChord::shift(Key::F5)),
         }
     }
 }

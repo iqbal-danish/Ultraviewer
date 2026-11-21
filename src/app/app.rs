@@ -13,6 +13,7 @@ use crate::file_engine::{CompressedEngine, CompressionType, DecompressStatus, Fi
 use crate::formats::formatter::{FormatAction, FormattingProgress, JsonStreamingFormatter, XmlStreamingFormatter};
 use crate::formats::jolt::{JoltValidationResult, JoltValidator};
 use crate::formats::json::{JsonStructureIndexer, JsonSyntaxHighlighter, JsonTreeNode, JsonValidationResult, JsonValidator};
+use crate::formats::python::{PythonStreamingFormatter, PythonSyntaxHighlighter};
 use crate::formats::xml::{XmlStructureIndexer, XmlSyntaxHighlighter, XmlTreeNode, XmlValidationResult, XmlValidator};
 use crate::formats::xslt::{XsltValidationResult, XsltValidator};
 use crate::analysis::field_analyzer::{AnalysisReport, StreamingFieldAnalyzer};
@@ -36,6 +37,7 @@ use super::icons::{paint_icon, Icon};
 use super::json_tree_panel::render_json_tree_panel;
 use super::menu::{render_menu_bar, MenuAction};
 use super::overview_ruler::{render_overview_ruler, OverviewRulerProps};
+use super::python_drawer::{render_python_drawer, PythonDrawerAction};
 use super::search_panel::{render_search_bar, render_search_results_panel, SearchBarAction};
 use super::session::AppSession;
 use super::status_bar::{format_number, render_status_bar, StatusBarAction, StatusBarProps};
@@ -46,6 +48,7 @@ use super::keymapper_modal::{render_keymapper_modal, KeymapperModalState};
 use super::theme::ColorTheme;
 use super::xml_tree_panel::render_xml_tree_panel;
 use super::zip_modal::{render_zip_modal, ZipModalAction, ZipModalState};
+use crate::scripting::PythonRunnerState;
 
 fn apply_modern_theme(ctx: &egui::Context, theme: ColorTheme) {
     theme.apply(ctx);
@@ -277,6 +280,7 @@ pub struct UltraViewerApp {
 
     // Compressed feeds (.gz / .zip) decompression state
     pub zip_modal: ZipModalState,
+    pub python_runner: PythonRunnerState,
     pub decompress_cancel: Option<Arc<AtomicBool>>,
     pub decompress_rx: Option<crossbeam_channel::Receiver<DecompressStatus>>,
     pub decompress_status: Option<DecompressStatus>,
@@ -443,6 +447,7 @@ impl Default for UltraViewerApp {
             scroll_accumulator: 0.0,
 
             zip_modal: ZipModalState::default(),
+            python_runner: PythonRunnerState::default(),
             decompress_cancel: None,
             decompress_rx: None,
             decompress_status: None,
@@ -471,12 +476,15 @@ impl UltraViewerApp {
     }
 
     pub fn new_blank_file(&mut self) {
+        static GLOBAL_BLANK_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+        let count = GLOBAL_BLANK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
         self.untitled_counter += 1;
         let temp_dir = std::env::temp_dir().join("UltraViewer");
         if !temp_dir.exists() {
             let _ = std::fs::create_dir_all(&temp_dir);
         }
-        let blank_path = temp_dir.join(format!("Untitled-{}.txt", self.untitled_counter));
+        let blank_path = temp_dir.join(format!("Untitled-{}-{}.txt", pid, count));
         let _ = std::fs::File::create(&blank_path);
         self.do_open_file(&blank_path);
     }
@@ -1222,9 +1230,10 @@ impl UltraViewerApp {
     }
 
     pub fn auto_detect_and_set_file_type(&mut self) -> bool {
-        let is_untitled = self.tabs.get(self.session.active_tab_idx).map_or(false, |t| {
-            t.path.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.starts_with("Untitled-"))
-        });
+        let is_untitled = self.engine.as_ref().map(|eng| {
+            eng.path().file_name().and_then(|n| n.to_str()).map_or(false, |s| s.starts_with("Untitled-"))
+        }).unwrap_or(true);
+
         if !is_untitled && self.file_type.is_some() && self.file_type != Some(FileType::PlainText) {
             return false;
         }
@@ -1247,6 +1256,8 @@ impl UltraViewerApp {
             Some(FileType::Xml)
         } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
             Some(FileType::Json)
+        } else if crate::formats::detector::FormatDetector::is_python_text(&sample) {
+            Some(FileType::Python)
         } else {
             None
         };
@@ -1262,8 +1273,10 @@ impl UltraViewerApp {
 
     pub fn set_file_type(&mut self, ft: FileType) {
         self.file_type = Some(ft);
-        if let Some(tab) = self.tabs.get_mut(self.session.active_tab_idx) {
-            tab.file_type = Some(ft);
+        if let Some(active_id) = self.active_tab_id {
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
+                tab.file_type = Some(ft);
+            }
         }
         let sample = self.viewport.lines.iter()
             .take(50)
@@ -3585,6 +3598,253 @@ impl UltraViewerApp {
             .expect("Failed to spawn JSON validator thread");
     }
 
+    pub fn get_python_code_to_run(&self) -> Option<Vec<u8>> {
+        // 1. If text is selected in the active document, run only that snippet!
+        if let Some(selected) = self.get_selected_text() {
+            if !selected.trim().is_empty() {
+                return Some(selected.into_bytes());
+            }
+        }
+
+        // 2. Otherwise run the active tab/document content directly from in-memory piece table or engine
+        if let Some(ref engine) = self.engine {
+            if let Some(ref doc) = self.document {
+                let is_modified = doc.is_dirty() || !doc.modified_lines.is_empty() || engine.size() == 0;
+                if is_modified {
+                    use std::io::Read;
+                    let mut reader = PieceTableReader::new(&doc.piece_table, engine);
+                    let mut buf = Vec::new();
+                    if reader.read_to_end(&mut buf).is_ok() {
+                        return Some(buf);
+                    }
+                }
+            }
+            let slice = engine.get_slice();
+            return Some(slice.to_vec());
+        }
+        None
+    }
+
+    pub fn run_python(&mut self) {
+        if self.python_runner.is_running() {
+            return;
+        }
+
+        let code_bytes = match self.get_python_code_to_run() {
+            Some(bytes) if !bytes.is_empty() => bytes,
+            _ => {
+                self.python_runner.is_drawer_open = true;
+                self.python_runner.output_lines.push(crate::scripting::OutputLine {
+                    kind: crate::scripting::OutputChunkKind::Stderr,
+                    text: "No Python code found to run. Please open a file or paste Python code into a blank tab.".to_string(),
+                    timestamp: std::time::Instant::now(),
+                });
+                return;
+            }
+        };
+
+        let (working_dir, env_vars) = self.collect_python_interop_env();
+        self.python_runner.run(code_bytes, working_dir, env_vars);
+    }
+
+    pub fn collect_python_interop_env(&self) -> (Option<PathBuf>, Vec<(String, String)>) {
+        let mut env_vars = Vec::new();
+
+        // 1. Resolve target data file:
+        // If current tab is a real file (not Untitled scratchpad), use it.
+        // If current tab is Untitled, find the most relevant open data tab.
+        let target_tab = if let Some(ref eng) = self.engine {
+            let p = eng.path();
+            let is_untitled = p.file_name().and_then(|n| n.to_str()).map_or(false, |s| s.starts_with("Untitled-"));
+            if !is_untitled && p.exists() {
+                Some((p.to_path_buf(), self.file_type, self.line_index.as_ref().map(|li| li.total_lines())))
+            } else {
+                // Look through other open tabs for a real file
+                self.tabs.iter().rev().find_map(|t| {
+                    let is_u = t.path.file_name().and_then(|n| n.to_str()).map_or(false, |s| s.starts_with("Untitled-"));
+                    if !is_u && t.path.exists() {
+                        Some((t.path.clone(), t.file_type, Some(t.line_index.total_lines())))
+                    } else {
+                        None
+                    }
+                })
+            }
+        } else {
+            None
+        };
+
+        let mut working_dir = None;
+
+        if let Some((target_path, file_type, total_lines)) = target_tab {
+            if let Some(parent) = target_path.parent() {
+                if parent.exists() {
+                    working_dir = Some(parent.to_path_buf());
+                    env_vars.push(("ULTRAVIEWER_FILE_DIR".to_string(), parent.to_string_lossy().to_string()));
+                }
+            }
+            if let Some(file_name) = target_path.file_name() {
+                env_vars.push(("ULTRAVIEWER_FILE_NAME".to_string(), file_name.to_string_lossy().to_string()));
+            }
+            env_vars.push(("ULTRAVIEWER_FILE_PATH".to_string(), target_path.to_string_lossy().to_string()));
+
+            if let Some(ft) = file_type {
+                let ft_str = match ft {
+                    FileType::Xml => "xml",
+                    FileType::Json => "json",
+                    FileType::Csv => "csv",
+                    FileType::PlainText => "txt",
+                    FileType::Python => "py",
+                    FileType::Binary => "bin",
+                };
+                env_vars.push(("ULTRAVIEWER_FILE_TYPE".to_string(), ft_str.to_string()));
+            }
+
+            if let Some(lines) = total_lines {
+                env_vars.push(("ULTRAVIEWER_TOTAL_LINES".to_string(), lines.to_string()));
+            }
+        } else if let Some(ref eng) = self.engine {
+            let p = eng.path();
+            if p.exists() {
+                if let Some(parent) = p.parent() {
+                    if parent.exists() {
+                        working_dir = Some(parent.to_path_buf());
+                        env_vars.push(("ULTRAVIEWER_FILE_DIR".to_string(), parent.to_string_lossy().to_string()));
+                    }
+                }
+            }
+        }
+
+        // Avoid defaulting scratchpads/untitled files to AppData\Local\Temp
+        let temp_dir = std::env::temp_dir();
+        let is_in_temp = working_dir.as_ref().map_or(true, |d| d.starts_with(&temp_dir));
+
+        if is_in_temp {
+            let fallback_dir = if let Some(ref p) = self.folder_explorer.root_path {
+                if p.exists() && p.is_dir() { Some(p.clone()) } else { None }
+            } else {
+                None
+            }
+            .or_else(|| std::env::current_dir().ok())
+            .or_else(|| {
+                #[cfg(windows)] { std::env::var_os("USERPROFILE").map(PathBuf::from) }
+                #[cfg(not(windows))] { std::env::var_os("HOME").map(PathBuf::from) }
+            });
+
+            if let Some(dir) = fallback_dir {
+                working_dir = Some(dir.clone());
+                if let Some(pos) = env_vars.iter().position(|(k, _)| k == "ULTRAVIEWER_FILE_DIR") {
+                    env_vars[pos].1 = dir.to_string_lossy().to_string();
+                } else {
+                    env_vars.push(("ULTRAVIEWER_FILE_DIR".to_string(), dir.to_string_lossy().to_string()));
+                }
+            }
+        }
+
+        // If there is highlighted selection in the active editor, provide it
+        if let Some(sel) = self.get_selected_text() {
+            if sel.len() <= 65536 && !sel.is_empty() {
+                env_vars.push(("ULTRAVIEWER_SELECTION".to_string(), sel));
+            }
+        }
+
+        (working_dir, env_vars)
+    }
+
+    pub fn open_python_output_in_new_tab(&mut self) {
+        let spool_path = self.python_runner.spool_path.clone();
+        // If a background spool file exists, open it directly using UltraViewer's memory-mapped engine!
+        if let Some(ref spool) = spool_path {
+            if spool.exists() {
+                if let Ok(meta) = std::fs::metadata(spool) {
+                    if meta.len() > 0 {
+                        self.do_open_file(spool);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fallback: paste collected stdout lines
+        let stdout_lines: Vec<&str> = self.python_runner.output_lines
+            .iter()
+            .filter(|l| l.kind == crate::scripting::OutputChunkKind::Stdout)
+            .map(|l| l.text.as_str())
+            .collect();
+
+        let text = if !stdout_lines.is_empty() {
+            stdout_lines.join("\n")
+        } else {
+            self.python_runner.output_lines
+                .iter()
+                .filter(|l| l.kind != crate::scripting::OutputChunkKind::System)
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        if !text.is_empty() {
+            self.new_blank_file();
+            self.paste_text_at_cursor(&text);
+        }
+    }
+
+    pub fn save_python_spool_output_to_file(&mut self) {
+        let spool_path = match self.python_runner.spool_path {
+            Some(ref p) if p.exists() => p.clone(),
+            _ => return,
+        };
+
+        if let Some(dest_path) = rfd::FileDialog::new()
+            .set_title("Save Complete Python Output")
+            .set_file_name("output.txt")
+            .save_file()
+        {
+            match std::fs::copy(&spool_path, &dest_path) {
+                Ok(bytes) => {
+                    let mb = (bytes as f64) / (1024.0 * 1024.0);
+                    let msg = if mb >= 0.1 {
+                        format!("Saved complete output ({:.1} MB) to {}", mb, dest_path.display())
+                    } else {
+                        format!("Saved complete output ({} bytes) to {}", bytes, dest_path.display())
+                    };
+                    self.status_notification = Some((msg, std::time::Instant::now()));
+                }
+                Err(e) => {
+                    self.status_notification = Some((format!("Failed to save output: {}", e), std::time::Instant::now()));
+                }
+            }
+        }
+    }
+
+    pub fn stop_python(&mut self) {
+        self.python_runner.stop();
+    }
+
+    pub fn toggle_python_drawer(&mut self) {
+        self.python_runner.is_drawer_open = !self.python_runner.is_drawer_open;
+    }
+
+    pub fn apply_python_template(&mut self, template_id: &str) {
+        if let Some(tmpl) = crate::scripting::get_template_by_id(template_id) {
+            let is_untitled = self.engine.as_ref().map(|eng| {
+                eng.path().file_name().and_then(|n| n.to_str()).map_or(false, |s| s.starts_with("Untitled-"))
+            }).unwrap_or(false);
+
+            let is_empty = self.get_total_lines() <= 1 
+                && self.viewport.lines.first().map_or(true, |l| l.text.trim().is_empty())
+                && !self.document.as_ref().map_or(false, |d| d.is_dirty());
+
+            if !is_untitled || !is_empty {
+                self.new_blank_file();
+            }
+
+            self.paste_text_at_cursor(tmpl.code);
+            self.set_file_type(FileType::Python);
+            self.enable_syntax_highlighting = true;
+            self.status_notification = Some((format!("Loaded Template: {}", tmpl.title), std::time::Instant::now()));
+        }
+    }
+
     pub fn start_formatting(&mut self, action: FormatAction, in_place: bool, custom_dst: Option<PathBuf>) {
         if self.active_formatting.is_some() {
             return;
@@ -3619,6 +3879,9 @@ impl UltraViewerApp {
                 format!("Beautifying XML Document ({} Spaces)", indent_size)
             }
             (FileType::Xml, FormatAction::Minify) => "Minifying XML Document (Compact)".to_string(),
+            (FileType::Python, FormatAction::Beautify { indent_size, .. }) => {
+                format!("Formatting Python Document ({} Spaces)", indent_size)
+            }
             _ => "Formatting Document".to_string(),
         };
 
@@ -3677,6 +3940,14 @@ impl UltraViewerApp {
                             total_bytes,
                             Some(Arc::clone(&progress_thread)),
                         ),
+                        FileType::Python => PythonStreamingFormatter::format(
+                            reader,
+                            writer,
+                            action,
+                            cancel_thread,
+                            total_bytes,
+                            Some(Arc::clone(&progress_thread)),
+                        ),
                         _ => Err("Unsupported file format for streaming formatting".to_string()),
                     };
                     if let Err(ref err) = format_res {
@@ -3694,6 +3965,13 @@ impl UltraViewerApp {
                             Some(Arc::clone(&progress_thread)),
                         ),
                         FileType::Xml => XmlStreamingFormatter::format_file(
+                            src_thread,
+                            dst_thread.clone(),
+                            action,
+                            cancel_thread,
+                            Some(Arc::clone(&progress_thread)),
+                        ),
+                        FileType::Python => PythonStreamingFormatter::format_file(
                             src_thread,
                             dst_thread.clone(),
                             action,
@@ -5250,6 +5528,28 @@ impl UltraViewerApp {
             )
         });
 
+        let (run_python_key, stop_python_key, toggle_drawer_key) = ctx.input(|i| {
+            let ctrl = i.modifiers.ctrl || i.modifiers.command;
+            let shift = i.modifiers.shift;
+            let run = self.keybindings.is_pressed(ShortcutAction::RunPython, i) 
+                || (i.key_pressed(Key::F5) && !shift)
+                || (ctrl && !shift && i.key_pressed(Key::Enter));
+            let stop = self.keybindings.is_pressed(ShortcutAction::StopPython, i)
+                || (i.key_pressed(Key::F5) && shift);
+            let toggle = i.key_pressed(Key::F4);
+            (run, stop, toggle)
+        });
+
+        if run_python_key {
+            self.run_python();
+        }
+        if stop_python_key {
+            self.stop_python();
+        }
+        if toggle_drawer_key {
+            self.toggle_python_drawer();
+        }
+
         if ctrl_n {
             self.new_blank_file();
         }
@@ -5766,11 +6066,13 @@ impl eframe::App for UltraViewerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
 
+        self.python_runner.poll();
+
         let is_searching = matches!(*self.search_status.read().unwrap(), SearchStatus::Searching { .. });
         let is_indexing = self.line_index.as_ref().map_or(false, |i| !i.is_complete());
 
         let is_auto_saving = self.auto_save && self.auto_save_timer.is_some();
-        if is_indexing || is_searching || self.is_query_running || self.field_extract_state.is_running || self.url_modal_state.is_downloading || self.xml_tree_building || self.is_validating_xml || self.json_tree_building || self.is_validating_json || self.active_analysis.is_some() || self.active_saving.is_some() || self.decompress_status.is_some() || is_auto_saving {
+        if is_indexing || is_searching || self.is_query_running || self.field_extract_state.is_running || self.url_modal_state.is_downloading || self.xml_tree_building || self.is_validating_xml || self.json_tree_building || self.is_validating_json || self.active_analysis.is_some() || self.active_saving.is_some() || self.decompress_status.is_some() || is_auto_saving || self.python_runner.is_running() {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
 
@@ -6151,6 +6453,7 @@ impl eframe::App for UltraViewerApp {
         let has_file = self.engine.is_some();
         let is_xml = self.file_type == Some(FileType::Xml);
         let is_json = self.file_type == Some(FileType::Json);
+        let is_python = self.file_type == Some(FileType::Python);
         let is_dirty = self.document.as_ref().map_or(false, |d| d.is_dirty() || !d.modified_lines.is_empty()) || self.active_edit_line.is_some();
         let can_undo = self.document.as_ref().map_or(false, |d| d.can_undo());
         let can_redo = self.document.as_ref().map_or(false, |d| d.can_redo());
@@ -6172,6 +6475,7 @@ impl eframe::App for UltraViewerApp {
                     has_file,
                     is_xml,
                     is_json,
+                    is_python,
                     is_dirty,
                     can_undo,
                     can_redo,
@@ -6283,6 +6587,11 @@ impl eframe::App for UltraViewerApp {
                 MenuAction::SetTheme(t) => self.set_theme(t, ctx),
                 MenuAction::OpenKeyboardShortcuts => self.keymapper_modal.open(),
                 MenuAction::About => self.show_about_dialog = true,
+                MenuAction::RunPython => self.run_python(),
+                MenuAction::StopPython => self.stop_python(),
+                MenuAction::TogglePythonDrawer => self.toggle_python_drawer(),
+                MenuAction::ClearPythonOutput => self.python_runner.clear_output(),
+                MenuAction::InsertPythonTemplate(id) => self.apply_python_template(id),
                 MenuAction::ToggleAutoSave => {
                     self.auto_save = !self.auto_save;
                     self.session.auto_save = self.auto_save;
@@ -6358,7 +6667,8 @@ impl eframe::App for UltraViewerApp {
                         Some(FileType::PlainText) | None => FileType::Xml,
                         Some(FileType::Xml) => FileType::Json,
                         Some(FileType::Json) => FileType::Csv,
-                        Some(FileType::Csv) => FileType::PlainText,
+                        Some(FileType::Csv) => FileType::Python,
+                        Some(FileType::Python) => FileType::PlainText,
                         Some(FileType::Binary) => FileType::Xml,
                     };
                     self.set_file_type(next_ft);
@@ -6373,12 +6683,22 @@ impl eframe::App for UltraViewerApp {
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(30, 34, 39)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 26, 31))))
             .show(ctx, |ui| {
                 let search_matches_count = self.search_matches_count();
+                let is_untitled = self.engine.as_ref().map(|eng| {
+                    eng.path().file_name().and_then(|n| n.to_str()).map_or(false, |s| s.starts_with("Untitled-"))
+                }).unwrap_or(false);
+                let is_python = self.file_type == Some(FileType::Python)
+                    || (is_untitled && {
+                        let sample = self.viewport.lines.iter().take(40).map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+                        crate::formats::detector::FormatDetector::is_python_text(&sample)
+                    });
+
                 let props = ActivityBarProps {
                     active_panel: self.active_activity_panel,
                     has_file,
                     is_xml_or_json: is_xml || is_json,
                     is_xml,
                     is_json,
+                    is_python,
                     search_match_count: search_matches_count,
                     is_expanded: false,
                     is_search_open: self.show_search_bar,
@@ -6422,6 +6742,7 @@ impl eframe::App for UltraViewerApp {
                                 self.validate_json_document();
                             }
                         }
+                        ActivityBarAction::RunPython => self.run_python(),
                         ActivityBarAction::ToggleSettings => self.show_about_dialog = true,
                         ActivityBarAction::ToggleHelp => self.show_about_dialog = true,
                         ActivityBarAction::ToggleExpanded => {},
@@ -6571,6 +6892,15 @@ impl eframe::App for UltraViewerApp {
                     }
                 }).collect();
 
+                let is_untitled = self.engine.as_ref().map(|eng| {
+                    eng.path().file_name().and_then(|n| n.to_str()).map_or(false, |s| s.starts_with("Untitled-"))
+                }).unwrap_or(false);
+                let is_python = self.file_type == Some(FileType::Python)
+                    || (is_untitled && {
+                        let sample = self.viewport.lines.iter().take(40).map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+                        crate::formats::detector::FormatDetector::is_python_text(&sample)
+                    });
+
                 let tab_props = TabBarProps {
                     tabs: tab_infos,
                     file_size,
@@ -6579,7 +6909,9 @@ impl eframe::App for UltraViewerApp {
                     word_wrap: self.word_wrap,
                     is_hex_mode: self.hex_viewer.is_enabled,
                     is_xml,
+                    is_python,
                     fold_all_descriptions: self.fold_all_descriptions,
+                    is_python_running: self.python_runner.is_running(),
                     current_line: self.current_line,
                     total_lines,
                     breadcrumb: None,
@@ -6611,6 +6943,9 @@ impl eframe::App for UltraViewerApp {
                         }
                         TabBarAction::FormatBeautify => action_beautify = true,
                         TabBarAction::FormatMinify => action_minify = true,
+                        TabBarAction::RunPython => self.run_python(),
+                        TabBarAction::StopPython => self.stop_python(),
+                        TabBarAction::InsertPythonTemplate(id) => self.apply_python_template(id),
                     }
                 }
             });
@@ -6939,6 +7274,31 @@ impl eframe::App for UltraViewerApp {
             }
             if close_panel {
                 self.show_search_results = false;
+            }
+        }
+
+        // Python Output Console (docked to bottom of main editor area)
+        if self.python_runner.is_drawer_open {
+            let mut drawer_action = None;
+            egui::TopBottomPanel::bottom("python_output_panel")
+                .resizable(true)
+                .default_height(200.0)
+                .height_range(100.0..=600.0)
+                .frame(egui::Frame::NONE.fill(Color32::from_rgb(26, 30, 36)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(24, 26, 31))))
+                .show(ctx, |ui| {
+                    drawer_action = render_python_drawer(ui, &mut self.python_runner, self.font_size);
+                });
+
+            if let Some(act) = drawer_action {
+                match act {
+                    PythonDrawerAction::Run => self.run_python(),
+                    PythonDrawerAction::Stop => self.stop_python(),
+                    PythonDrawerAction::Clear => self.python_runner.clear_output(),
+                    PythonDrawerAction::Close => self.python_runner.is_drawer_open = false,
+                    PythonDrawerAction::ToggleWrap => {},
+                    PythonDrawerAction::OpenInNewTab => self.open_python_output_in_new_tab(),
+                    PythonDrawerAction::SaveToFile => self.save_python_spool_output_to_file(),
+                }
             }
         }
 
@@ -7673,6 +8033,12 @@ impl UltraViewerApp {
             PaletteAction::SetLanguageModeJson => self.set_file_type(FileType::Json),
             PaletteAction::SetLanguageModeCsv => self.set_file_type(FileType::Csv),
             PaletteAction::SetLanguageModePlainText => self.set_file_type(FileType::PlainText),
+            PaletteAction::SetLanguageModePython => self.set_file_type(FileType::Python),
+            PaletteAction::RunPython => self.run_python(),
+            PaletteAction::StopPython => self.stop_python(),
+            PaletteAction::TogglePythonDrawer => self.toggle_python_drawer(),
+            PaletteAction::ClearPythonOutput => self.python_runner.clear_output(),
+            PaletteAction::InsertPythonTemplate(id) => self.apply_python_template(id),
             PaletteAction::About => self.show_about_dialog = true,
             PaletteAction::Undo => self.undo(),
             PaletteAction::Redo => self.redo(),
@@ -9245,6 +9611,10 @@ fn build_line_layout_job(
                 .map(|s| (s.text, s.color))
                 .collect(),
             Some(FileType::Json) => JsonSyntaxHighlighter::highlight_line_themed(line, dark_mode)
+                .into_iter()
+                .map(|s| (s.text, s.color))
+                .collect(),
+            Some(FileType::Python) => PythonSyntaxHighlighter::highlight_line_themed(line, dark_mode)
                 .into_iter()
                 .map(|s| (s.text, s.color))
                 .collect(),
@@ -11159,6 +11529,168 @@ mod tests {
         assert!(all_text.contains("<catalog>"));
         assert!(all_text.contains("  <book id=\"1\">"));
         assert!(all_text.contains("    <title>Rust</title>"));
+    }
+
+    #[test]
+    fn test_python_runner_in_blank_unsaved_document() {
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+
+        let py_code = "a = 20\nb = 30\nprint(f'SUM={a + b}')";
+        app.paste_text_at_cursor(py_code);
+
+        app.run_python();
+        assert!(app.python_runner.is_drawer_open);
+
+        let start = Instant::now();
+        while app.python_runner.is_running() && start.elapsed() < Duration::from_secs(5) {
+            app.python_runner.poll();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(!app.python_runner.is_running());
+        let stdout_texts: Vec<_> = app.python_runner.output_lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(stdout_texts.iter().any(|t| t.contains("SUM=50")), "Expected SUM=50 in python output");
+    }
+
+    #[test]
+    fn test_python_runner_selected_text_snippet() {
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+
+        let full_text = "print('IGNORED_LINE')\nprint('SELECTED_CODE_RAN')\nprint('ANOTHER_IGNORED')";
+        app.paste_text_at_cursor(full_text);
+
+        // Highlight line 2 only
+        app.selection_anchor = Some(2);
+        app.selection_anchor_col = Some(0);
+        app.selection_head = Some(2);
+        app.selection_head_col = Some(usize::MAX);
+
+        app.run_python();
+        assert!(app.python_runner.is_drawer_open);
+
+        let start = Instant::now();
+        while app.python_runner.is_running() && start.elapsed() < Duration::from_secs(5) {
+            app.python_runner.poll();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(!app.python_runner.is_running());
+        let stdout_texts: Vec<_> = app.python_runner.output_lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(stdout_texts.iter().any(|t| t.contains("SELECTED_CODE_RAN")), "Expected selected code to run");
+        assert!(!stdout_texts.iter().any(|t| t.contains("IGNORED_LINE")), "Ignored line should not run");
+    }
+
+    #[test]
+    fn test_python_runner_data_interop_and_open_new_tab() {
+        let mut app = UltraViewerApp::default();
+        let temp_dir = std::env::temp_dir().join("ultraviewer_interop_test");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let csv_path = temp_dir.join("employees.csv");
+        std::fs::write(&csv_path, "id,name\n1,Alice\n2,Bob\n").unwrap();
+
+        // 1. Open CSV data file in tab 1
+        app.do_open_file(&csv_path);
+        assert_eq!(app.file_type, Some(FileType::Csv));
+
+        // 2. Open new blank scratchpad in tab 2
+        app.new_blank_file();
+
+        // 3. Python script uses Data Interop environment variable to process the CSV data file
+        let py_code = r#"import os
+path = os.environ.get("ULTRAVIEWER_FILE_PATH", "")
+with open(path, "r", encoding="utf-8") as f:
+    lines = [line.strip() for line in f if line.strip()]
+print(f'{{"record_count": {len(lines) - 1}}}')
+"#;
+        app.paste_text_at_cursor(py_code);
+        app.run_python();
+
+        let start = Instant::now();
+        while app.python_runner.is_running() && start.elapsed() < Duration::from_secs(5) {
+            app.python_runner.poll();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(!app.python_runner.is_running());
+        let stdout_texts: Vec<_> = app.python_runner.output_lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(stdout_texts.iter().any(|t| t.contains(r#"{"record_count": 2}"#)), "Expected JSON record count from CSV");
+
+        // 4. Test "Open in New Tab" drawer feature
+        let prev_tabs_count = app.tabs.len();
+        app.open_python_output_in_new_tab();
+        assert_eq!(app.tabs.len(), prev_tabs_count + 1);
+        assert_eq!(app.file_type, Some(FileType::Json));
+        assert_eq!(app.viewport.lines[0].text, r#"{"record_count": 2}"#);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_python_blank_file_with_docstring_detects_and_runs() {
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+
+        let code = r#""""
+Production Full-Catalog Async Ingestion Crawler
+Target ATS: Wisestep
+"""
+
+import sys
+print("CRAWLER_SCRIPT_LOADED")
+"#;
+        app.paste_text_at_cursor(code);
+        assert_eq!(app.file_type, Some(FileType::Python));
+
+        app.run_python();
+        assert!(app.python_runner.is_drawer_open);
+
+        let start = Instant::now();
+        while app.python_runner.is_running() && start.elapsed() < Duration::from_secs(5) {
+            app.python_runner.poll();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(!app.python_runner.is_running());
+        let stdout_texts: Vec<_> = app.python_runner.output_lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(stdout_texts.iter().any(|t| t.contains("CRAWLER_SCRIPT_LOADED")));
+    }
+
+    #[test]
+    fn test_python_runner_cwd_does_not_default_to_appdata_temp() {
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+
+        let (cwd, envs) = app.collect_python_interop_env();
+        let sys_temp = std::env::temp_dir();
+
+        if let Some(dir) = cwd {
+            assert!(!dir.starts_with(&sys_temp), "Working directory must NOT be in temp/appdata: {:?}", dir);
+        }
+        if let Some((_, val)) = envs.iter().find(|(k, _)| k == "ULTRAVIEWER_FILE_DIR") {
+            assert!(!val.starts_with(&sys_temp.to_string_lossy().to_string()), "ULTRAVIEWER_FILE_DIR must not be in temp");
+        }
+    }
+
+    #[test]
+    fn test_python_template_application_and_tab_safety() {
+        let mut app = UltraViewerApp::default();
+        app.new_blank_file();
+
+        // Apply XML template into empty blank tab
+        app.apply_python_template("xml_tag_extractor");
+        assert_eq!(app.file_type, Some(FileType::Python));
+        assert!(app.enable_syntax_highlighting);
+        assert!(app.viewport.lines.iter().any(|l| l.text.contains("UltraViewer XML Tag Extractor")));
+        assert!(app.viewport.lines.iter().any(|l| l.text.contains("TARGET_TAG")));
+
+        // Now with a non-empty tab, applying another template should safely spawn a new tab
+        let prev_tabs_count = app.tabs.len();
+        app.apply_python_template("json_streaming_extractor");
+        assert_eq!(app.tabs.len(), prev_tabs_count + 1);
+        assert_eq!(app.file_type, Some(FileType::Python));
+        assert!(app.viewport.lines.iter().any(|l| l.text.contains("UltraViewer JSON / JSONL Streaming Key Extractor")));
     }
 }
 

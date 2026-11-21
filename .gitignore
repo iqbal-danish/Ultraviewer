@@ -5,6 +5,7 @@
 
 # Executables & Shortcuts
 *.exe
+*.old
 *.lnk
 
 # Large sample and test data files

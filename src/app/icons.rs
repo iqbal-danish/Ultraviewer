@@ -40,6 +40,8 @@ pub enum Icon {
     Filter,
     Binary,
     Archive,
+    Play,
+    Stop,
 }
 
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -590,6 +592,32 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             painter.line_segment([Pos2::new(cx, min_y + 6.0), Pos2::new(cx, box_rect.bottom() - 2.0)], Stroke::new(1.0_f32, color));
             painter.line_segment([Pos2::new(cx - 2.0, min_y + 9.0), Pos2::new(cx + 2.0, min_y + 9.0)], Stroke::new(1.0_f32, color));
             painter.line_segment([Pos2::new(cx - 2.0, min_y + 12.0), Pos2::new(cx + 2.0, min_y + 12.0)], Stroke::new(1.0_f32, color));
+        }
+
+        Icon::Play => {
+            // Right-pointing triangle
+            let pad_x = (w * 0.22).round();
+            let pad_y = (h * 0.18).round();
+            let points = [
+                Pos2::new(min_x + pad_x, min_y + pad_y),
+                Pos2::new(min_x + w - pad_x + 1.0, cy),
+                Pos2::new(min_x + pad_x, min_y + h - pad_y),
+            ];
+            painter.add(egui::epaint::PathShape::convex_polygon(
+                points.to_vec(),
+                color,
+                Stroke::NONE,
+            ));
+        }
+
+        Icon::Stop => {
+            // Square stop icon
+            let pad = (w * 0.22).round();
+            let sq = Rect::from_min_max(
+                Pos2::new(min_x + pad, min_y + pad),
+                Pos2::new(min_x + w - pad, min_y + h - pad),
+            );
+            painter.rect_filled(sq, 2.0, color);
         }
     }
 }

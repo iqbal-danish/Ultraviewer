@@ -51,6 +51,11 @@ pub enum MenuAction {
     OpenKeyboardShortcuts,
     SetTheme(super::theme::ColorTheme),
     About,
+    RunPython,
+    StopPython,
+    TogglePythonDrawer,
+    ClearPythonOutput,
+    InsertPythonTemplate(&'static str),
 }
 
 pub fn render_menu_bar(
@@ -58,6 +63,7 @@ pub fn render_menu_bar(
     file_is_open: bool,
     is_xml: bool,
     is_json: bool,
+    is_python: bool,
     is_dirty: bool,
     can_undo: bool,
     can_redo: bool,
@@ -330,7 +336,7 @@ pub fn render_menu_bar(
             });
         }
 
-        if is_xml || is_json {
+        if is_xml || is_json || is_python {
             ui.menu_button("Format", |ui| {
                 style_popup(ui);
                 if ui.button("Beautify Document (2 Spaces)").clicked() {
@@ -341,10 +347,12 @@ pub fn render_menu_bar(
                     action = Some(MenuAction::FormatBeautify4);
                     ui.close_menu();
                 }
-                ui.separator();
-                if ui.button("Minify Document (Compact)").clicked() {
-                    action = Some(MenuAction::FormatMinify);
-                    ui.close_menu();
+                if !is_python {
+                    ui.separator();
+                    if ui.button("Minify Document (Compact)").clicked() {
+                        action = Some(MenuAction::FormatMinify);
+                        ui.close_menu();
+                    }
                 }
                 ui.separator();
                 if ui.button("Save Formatted Copy As...").clicked() {
@@ -380,6 +388,38 @@ pub fn render_menu_bar(
                 action = Some(MenuAction::UnregisterContextMenu);
                 ui.close_menu();
             }
+        });
+
+        ui.menu_button("Run", |ui| {
+            style_popup(ui);
+            if ui.button("▶ Run Python Buffer (F5)").clicked() {
+                action = Some(MenuAction::RunPython);
+                ui.close_menu();
+            }
+            if ui.button("⏹ Stop Execution (Shift+F5)").clicked() {
+                action = Some(MenuAction::StopPython);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("Toggle Output Console (Ctrl+`)").clicked() {
+                action = Some(MenuAction::TogglePythonDrawer);
+                ui.close_menu();
+            }
+            if ui.button("Clear Console Output").clicked() {
+                action = Some(MenuAction::ClearPythonOutput);
+                ui.close_menu();
+            }
+            ui.separator();
+            ui.menu_button("⚡ Python Templates", |ui| {
+                style_popup(ui);
+                for tmpl in crate::scripting::ALL_TEMPLATES {
+                    let label = format!("{} {}", tmpl.icon, tmpl.title);
+                    if ui.button(label).on_hover_text(tmpl.description).clicked() {
+                        action = Some(MenuAction::InsertPythonTemplate(tmpl.id));
+                        ui.close_menu();
+                    }
+                }
+            });
         });
 
         ui.menu_button("Help", |ui| {

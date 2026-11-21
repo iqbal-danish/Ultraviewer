@@ -16,6 +16,7 @@ pub struct ActivityBarProps {
     pub is_xml_or_json: bool,
     pub is_xml: bool,
     pub is_json: bool,
+    pub is_python: bool,
     pub search_match_count: usize,
     pub is_expanded: bool,
     pub is_search_open: bool,
@@ -27,6 +28,7 @@ pub enum ActivityBarAction {
     FormatBeautify,
     FormatMinify,
     Validate,
+    RunPython,
     ToggleSettings,
     ToggleHelp,
     ToggleExpanded,
@@ -118,7 +120,15 @@ pub fn render_activity_bar(
                 ui.add_space(4.0);
             }
 
-            // 7. Bottom Pinned Section (Settings, Help)
+            // 7. Run Python Buffer (F5) - only displayed for Python files
+            if props.is_python {
+                if render_rail_icon_button(ui, Icon::Play, "Run Python (F5)", "F5", false, None).clicked() {
+                    action = Some(ActivityBarAction::RunPython);
+                }
+                ui.add_space(4.0);
+            }
+
+            // 8. Bottom Pinned Section (Settings, Help)
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
                 if render_rail_icon_button(ui, Icon::Gear, "Settings", "Ctrl+,", false, None).clicked() {

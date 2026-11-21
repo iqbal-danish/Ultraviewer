@@ -4,6 +4,7 @@ pub mod editor;
 pub mod file_engine;
 pub mod formats;
 pub mod indexing;
+pub mod scripting;
 pub mod search;
 
 pub use analysis::{AnalysisProgress, AnalysisReport, FieldStats, InferredType, StreamingFieldAnalyzer, ValueFrequency};
@@ -12,4 +13,5 @@ pub use editor::{EditOperation, EditorDocument, PieceTable, PieceTableReader, Sa
 pub use file_engine::{Encoding, FileEngine, LineIndex};
 pub use formats::{FileType, FormatDetector};
 pub use indexing::LineIndexer;
+pub use scripting::{OutputChunkKind, OutputLine, PythonEnvironment, PythonRunStatus, PythonRunnerState};
 

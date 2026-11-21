@@ -1,4 +1,4 @@
-use eframe::egui::{self, Color32, Layout, Pos2, Rect, Sense, Ui, Vec2};
+use eframe::egui::{self, Color32, Layout, Pos2, Rect, RichText, Sense, Ui, Vec2};
 use crate::formats::FileType;
 use super::icons::{paint_icon, Icon};
 
@@ -20,7 +20,9 @@ pub struct TabBarProps<'a> {
     pub word_wrap: bool,
     pub is_hex_mode: bool,
     pub is_xml: bool,
+    pub is_python: bool,
     pub fold_all_descriptions: bool,
+    pub is_python_running: bool,
     pub current_line: usize,
     pub total_lines: usize,
     pub breadcrumb: Option<&'a str>,
@@ -41,6 +43,9 @@ pub enum TabBarAction {
     ToggleTree,
     FormatBeautify,
     FormatMinify,
+    RunPython,
+    StopPython,
+    InsertPythonTemplate(&'static str),
 }
 
 pub fn render_tab_bar(
@@ -111,6 +116,7 @@ pub fn render_tab_bar(
             let (type_icon, icon_color) = match tab.file_type {
                 Some(FileType::Xml) => (Icon::XmlCode, Color32::from_rgb(56, 189, 248)),
                 Some(FileType::Json) => (Icon::JsonBraces, Color32::from_rgb(250, 204, 21)),
+                Some(FileType::Python) => (Icon::Play, Color32::from_rgb(56, 189, 248)),
                 _ => (Icon::File, Color32::from_rgb(148, 163, 184)),
             };
             paint_icon(ui.painter(), icon_rect, type_icon, icon_color);
@@ -191,9 +197,61 @@ pub fn render_tab_bar(
             action = Some(TabBarAction::NewBlankFile);
         }
 
-        // Right-aligned quick action buttons (Word Wrap, Hex View toggle, etc.)
+        // Right-aligned quick action buttons (Run Python, Word Wrap, Hex View toggle, etc.)
         ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
+
+            // Python Execution Button (F5 / Shift+F5) - only shown when working with a Python file or when actively running
+            if props.is_python || props.is_python_running {
+                if props.is_python_running {
+                    let (py_rect, py_resp) = ui.allocate_exact_size(Vec2::new(76.0, 26.0), Sense::click());
+                    let py_hovered = py_resp.hovered();
+                    let py_bg = if py_hovered { Color32::from_rgb(220, 70, 70) } else { Color32::from_rgb(180, 50, 50) };
+                    ui.painter().rect_filled(py_rect, 4.0, py_bg);
+                    ui.painter().text(
+                        py_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "⏹ Stop",
+                        egui::FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                    if py_resp.on_hover_text("Stop running Python script (Shift+F5)").clicked() {
+                        action = Some(TabBarAction::StopPython);
+                    }
+                } else {
+                    let (py_rect, py_resp) = ui.allocate_exact_size(Vec2::new(76.0, 26.0), Sense::click());
+                    let py_hovered = py_resp.hovered();
+                    let py_bg = if py_hovered { Color32::from_rgb(46, 160, 67) } else { Color32::from_rgb(35, 134, 54) };
+                    ui.painter().rect_filled(py_rect, 4.0, py_bg);
+                    ui.painter().text(
+                        py_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "▶ Run",
+                        egui::FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                    if py_resp.on_hover_text("Run Python script without saving (F5)").clicked() {
+                        action = Some(TabBarAction::RunPython);
+                    }
+                }
+                ui.add_space(4.0);
+            }
+
+            // Quick Python Templates Dropdown Button
+            ui.menu_button(
+                RichText::new("⚡ Templates").size(12.0).color(Color32::from_rgb(220, 225, 235)),
+                |ui| {
+                    ui.style_mut().spacing.button_padding = egui::vec2(10.0, 6.0);
+                    for tmpl in crate::scripting::ALL_TEMPLATES {
+                        let btn_text = format!("{} {}", tmpl.icon, tmpl.title);
+                        if ui.button(RichText::new(btn_text).size(13.0).strong()).on_hover_text(tmpl.description).clicked() {
+                            action = Some(TabBarAction::InsertPythonTemplate(tmpl.id));
+                            ui.close_menu();
+                        }
+                    }
+                },
+            );
+            ui.add_space(4.0);
             let wrap_text = if props.word_wrap { "Wrap: ON" } else { "Wrap: OFF" };
             let wrap_color = if props.word_wrap {
                 Color32::from_rgb(97, 175, 239)

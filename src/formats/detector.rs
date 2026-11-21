@@ -6,6 +6,7 @@ pub enum FileType {
     Xml,
     Json,
     Csv,
+    Python,
     PlainText,
     Binary,
 }
@@ -16,6 +17,7 @@ impl FileType {
             FileType::Xml => "XML",
             FileType::Json => "JSON",
             FileType::Csv => "CSV",
+            FileType::Python => "Python",
             FileType::PlainText => "Plain Text",
             FileType::Binary => "Binary",
         }
@@ -81,6 +83,11 @@ impl FormatDetector {
             }
         }
 
+        // Python detection: shebang or common Python constructs (import, def, async def, class, etc.)
+        if Self::is_python_text(&snippet) {
+            return FileType::Python;
+        }
+
         // Check path extension hint as fallback
         if let Some(path) = path {
             if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
@@ -88,7 +95,8 @@ impl FormatDetector {
                     "xml" | "xslt" | "xsl" => return FileType::Xml,
                     "json" | "jolt" => return FileType::Json,
                     "csv" | "tsv" => return FileType::Csv,
-                    "txt" | "log" | "md" | "rs" | "c" | "cpp" | "h" | "py" | "js" | "html" => {
+                    "py" | "pyw" => return FileType::Python,
+                    "txt" | "log" | "md" | "rs" | "c" | "cpp" | "h" | "js" | "html" => {
                         return FileType::PlainText
                     }
                     _ => {}
@@ -97,5 +105,73 @@ impl FormatDetector {
         }
 
         FileType::PlainText
+    }
+
+    /// Detects if text content represents a Python script (handles docstrings, imports, defs, classes).
+    pub fn is_python_text(text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        // Shebang
+        if trimmed.starts_with("#!/usr/bin/env python") || trimmed.starts_with("#!/usr/bin/python") {
+            return true;
+        }
+
+        // Skip leading docstrings (""" ... """ or ''' ... ''')
+        let mut check_slice = trimmed;
+        if check_slice.starts_with("\"\"\"") {
+            if let Some(end_idx) = check_slice[3..].find("\"\"\"") {
+                check_slice = check_slice[3 + end_idx + 3..].trim();
+            }
+        } else if check_slice.starts_with("'''") {
+            if let Some(end_idx) = check_slice[3..].find("'''") {
+                check_slice = check_slice[3 + end_idx + 3..].trim();
+            }
+        }
+
+        for line in check_slice.lines().take(60) {
+            let l = line.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            if l.starts_with("import ")
+                || l.starts_with("from ")
+                || l.starts_with("def ")
+                || l.starts_with("async def ")
+                || l.starts_with("class ")
+                || l.starts_with("if __name__ ==")
+                || l.starts_with("if __name__ == '__main__':")
+                || l.starts_with("if __name__ == \"__main__\":")
+                || l.starts_with("@")
+                || l.starts_with("print(")
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_python_detection_with_leading_docstring() {
+        let code = r#""""
+Production Full-Catalog Async Ingestion Crawler
+Target ATS: Wisestep
+"""
+
+import asyncio
+import httpx
+
+async def fetch_page():
+    pass
+"#;
+        assert_eq!(FormatDetector::detect(code.as_bytes(), crate::file_engine::encoding::Encoding::Utf8, None), FileType::Python);
+        assert!(FormatDetector::is_python_text(code));
     }
 }

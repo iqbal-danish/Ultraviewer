@@ -17,6 +17,7 @@ pub mod keymapper_modal;
 pub mod menu;
 pub mod overview_ruler;
 pub mod process_memory;
+pub mod python_drawer;
 pub mod query_bar;
 pub mod search_panel;
 pub mod session;
@@ -45,6 +46,7 @@ pub use keymapper::{ActionCategory, KeyChord, KeybindingsConfig, ShortcutAction}
 pub use keymapper_modal::{render_keymapper_modal, KeymapperModalState};
 pub use menu::{render_menu_bar, MenuAction};
 pub use overview_ruler::{render_overview_ruler, OverviewRulerProps};
+pub use python_drawer::{render_python_drawer, PythonDrawerAction};
 pub use query_bar::{render_query_bar, QueryBarAction, QueryBarProps};
 pub use session::AppSession;
 pub use status_bar::{render_status_bar, StatusBarProps};
