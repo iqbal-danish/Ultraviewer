@@ -61,6 +61,36 @@ pub struct ActiveAnalysis {
     pub rx: crossbeam_channel::Receiver<Result<AnalysisReport, String>>,
 }
 
+pub type ReloadedEngineResult = Result<(FileEngine, Option<std::fs::File>), String>;
+
+pub const ASYNC_OPEN_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+
+pub enum OpenBackgroundOutcome {
+    Ready {
+        path_buf: PathBuf,
+        engine: FileEngine,
+        file: std::fs::File,
+        duration: Duration,
+        is_decompressed: bool,
+        original_archive: Option<PathBuf>,
+        display_name: Option<String>,
+    },
+    Compressed {
+        path_buf: PathBuf,
+        compression: CompressionType,
+    },
+    Error(String),
+}
+
+pub struct ActiveOpening {
+    pub path: PathBuf,
+    pub display_name: String,
+    pub file_size: u64,
+    pub started_at: Instant,
+    pub rx: crossbeam_channel::Receiver<OpenBackgroundOutcome>,
+    pub cancel: Arc<AtomicBool>,
+}
+
 pub struct ActiveFormatting {
     pub title: String,
     pub action: FormatAction,
@@ -69,6 +99,9 @@ pub struct ActiveFormatting {
     pub is_in_place: bool,
     pub progress: Arc<RwLock<FormattingProgress>>,
     pub cancel: Arc<AtomicBool>,
+    pub handles_released: Arc<AtomicBool>,
+    pub handles_released_sent: bool,
+    pub reloaded_engine: Arc<std::sync::Mutex<Option<ReloadedEngineResult>>>,
 }
 
 pub struct ActiveSaving {
@@ -182,6 +215,8 @@ pub struct UltraViewerApp {
 
     pub show_about_dialog: bool,
     pub show_goto_line_dialog: bool,
+    pub active_opening: Option<ActiveOpening>,
+    pub pending_open_queue: std::collections::VecDeque<PathBuf>,
     pub active_formatting: Option<ActiveFormatting>,
     pub show_format_modal: bool,
     pub analyzer_state: AnalyzerPanelState,
@@ -237,8 +272,10 @@ pub struct UltraViewerApp {
     pub pending_focus_line: Option<(usize, usize)>,
     pub editor_viewport_rect: Option<egui::Rect>,
     pub cached_screen_lines: usize,
+    pub cached_visible_end_line: usize,
     pub untitled_counter: usize,
     pub line_edit_initial_texts: std::collections::HashMap<usize, String>,
+    pub last_inline_selection: Option<(usize, String)>,
     pub active_cursor_col: usize,
     pub has_shown_window: bool,
 
@@ -288,6 +325,7 @@ pub struct UltraViewerApp {
 
     last_sys_refresh: Instant,
     cached_memory_metrics: super::process_memory::ProcessMemoryMetrics,
+    galley_cache: std::cell::RefCell<std::collections::HashMap<u64, Arc<egui::Galley>>>,
 }
 
 impl Default for UltraViewerApp {
@@ -359,6 +397,8 @@ impl Default for UltraViewerApp {
 
             show_about_dialog: false,
             show_goto_line_dialog: false,
+            active_opening: None,
+            pending_open_queue: std::collections::VecDeque::new(),
             active_formatting: None,
             show_format_modal: false,
             analyzer_state: AnalyzerPanelState::default(),
@@ -409,8 +449,10 @@ impl Default for UltraViewerApp {
             pending_focus_line: None,
             editor_viewport_rect: None,
             cached_screen_lines: 30,
+            cached_visible_end_line: 0,
             untitled_counter: 0,
             line_edit_initial_texts: std::collections::HashMap::new(),
+            last_inline_selection: None,
             active_cursor_col: 0,
             current_xpath: None,
             last_resolved_line: 0,
@@ -456,6 +498,7 @@ impl Default for UltraViewerApp {
             last_sys_refresh: Instant::now(),
             cached_memory_metrics: cached_memory,
             has_shown_window: false,
+            galley_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -569,6 +612,31 @@ impl UltraViewerApp {
     pub fn copy_selection(&self, ctx: &egui::Context) {
         if let Some(text) = self.get_selected_text() {
             ctx.copy_text(text);
+            return;
+        }
+        if let Some(line_no) = self.active_edit_line {
+            let edit_id = egui::Id::new("line_editor").with(line_no);
+            if let Some(state) = egui::text_edit::TextEditState::load(ctx, edit_id) {
+                if let Some(r) = state.cursor.char_range() {
+                    let s = r.primary.index.min(r.secondary.index);
+                    let e = r.primary.index.max(r.secondary.index);
+                    if s < e {
+                        if let Some(line_text) = self.get_line_text_for_resolver(line_no) {
+                            let chars: Vec<char> = line_text.chars().collect();
+                            if e <= chars.len() {
+                                let snippet: String = chars[s..e].iter().collect();
+                                ctx.copy_text(snippet);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((_, ref snippet)) = self.last_inline_selection {
+            if !snippet.is_empty() {
+                ctx.copy_text(snippet.clone());
+            }
         }
     }
 
@@ -1833,12 +1901,11 @@ impl UltraViewerApp {
         self.do_open_file(&path_buf);
     }
 
-    pub fn do_open_file(&mut self, path: &Path) {
-        let comp = CompressedEngine::detect_compression(path);
+    fn handle_compressed_open(&mut self, path: &Path, comp: CompressionType) -> bool {
         match comp {
             CompressionType::Gzip => {
                 self.start_decompressing_gzip(path);
-                return;
+                true
             }
             CompressionType::Zip => {
                 match CompressedEngine::inspect_zip_archive(path) {
@@ -1856,12 +1923,165 @@ impl UltraViewerApp {
                         self.status_notification = Some((format!("Cannot open ZIP archive: {}", e), Instant::now()));
                     }
                 }
+                true
+            }
+            CompressionType::None => false,
+        }
+    }
+
+    pub fn do_open_file(&mut self, path: &Path) {
+        let path_buf = path.to_path_buf();
+        if let Some(existing) = self.tabs.iter().find(|t| t.path == path_buf) {
+            let id = existing.id;
+            self.switch_to_tab(id);
+            if self.active_slice.is_some() {
+                self.exit_virtual_slice();
+            }
+            return;
+        }
+
+        // For large files (>= 64 MB) in interactive UI mode, open off the UI thread so
+        // cold Windows Defender scans on first open never freeze the window or block startup.
+        if !cfg!(test) {
+            let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if file_size >= ASYNC_OPEN_THRESHOLD_BYTES {
+                self.start_async_open_file(path, file_size);
                 return;
             }
-            CompressionType::None => {}
+        }
+
+        let comp = CompressedEngine::detect_compression(path);
+        if self.handle_compressed_open(path, comp) {
+            return;
         }
 
         self.do_open_file_internal(path, false, None, None);
+    }
+
+    pub fn start_async_open_file(&mut self, path: &Path, file_size: u64) {
+        let path_buf = path.to_path_buf();
+        if self.active_opening.is_some() {
+            if !self.pending_open_queue.contains(&path_buf) {
+                self.pending_open_queue.push_back(path_buf);
+            }
+            return;
+        }
+
+        let display_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_thread = Arc::clone(&cancel);
+        let path_thread = path_buf.clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        std::thread::Builder::new()
+            .name("file-opener".to_string())
+            .spawn(move || {
+                let start_time = Instant::now();
+                let comp = CompressedEngine::detect_compression(&path_thread);
+                if cancel_thread.load(Ordering::SeqCst) {
+                    return;
+                }
+                if comp != CompressionType::None {
+                    let _ = tx.send(OpenBackgroundOutcome::Compressed {
+                        path_buf: path_thread,
+                        compression: comp,
+                    });
+                    return;
+                }
+
+                match FileEngine::open_with_handle(&path_thread) {
+                    Ok((engine, file)) => {
+                        if cancel_thread.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let _ = tx.send(OpenBackgroundOutcome::Ready {
+                            path_buf: path_thread,
+                            engine,
+                            file,
+                            duration: start_time.elapsed(),
+                            is_decompressed: false,
+                            original_archive: None,
+                            display_name: None,
+                        });
+                    }
+                    Err(err) => {
+                        if !cancel_thread.load(Ordering::SeqCst) {
+                            let _ = tx.send(OpenBackgroundOutcome::Error(format!(
+                                "Failed to open file: {}",
+                                err
+                            )));
+                        }
+                    }
+                }
+            })
+            .expect("Failed to spawn file-opener thread");
+
+        self.active_opening = Some(ActiveOpening {
+            path: path_buf,
+            display_name,
+            file_size,
+            started_at: Instant::now(),
+            rx,
+            cancel,
+        });
+    }
+
+    pub fn poll_active_opening(&mut self) -> bool {
+        let outcome = match self.active_opening {
+            Some(ref opening) => match opening.rx.try_recv() {
+                Ok(msg) => Some(msg),
+                Err(crossbeam_channel::TryRecvError::Empty) => return false,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    Some(OpenBackgroundOutcome::Error("File open worker terminated unexpectedly".to_string()))
+                }
+            },
+            None => return false,
+        };
+
+        self.active_opening = None;
+        let mut opened = false;
+        if let Some(msg) = outcome {
+            match msg {
+                OpenBackgroundOutcome::Ready {
+                    path_buf,
+                    engine,
+                    file,
+                    duration,
+                    is_decompressed,
+                    original_archive,
+                    display_name,
+                } => {
+                    self.prepare_state_for_open();
+                    self.finish_opening_prepared_file(
+                        path_buf,
+                        engine,
+                        Some(file),
+                        duration,
+                        is_decompressed,
+                        original_archive,
+                        display_name,
+                    );
+                    opened = true;
+                }
+                OpenBackgroundOutcome::Compressed { path_buf, compression } => {
+                    self.handle_compressed_open(&path_buf, compression);
+                }
+                OpenBackgroundOutcome::Error(err) => {
+                    self.error_message = Some(err);
+                }
+            }
+        }
+
+        if let Some(next_path) = self.pending_open_queue.pop_front() {
+            let next_size = std::fs::metadata(&next_path).map(|m| m.len()).unwrap_or(0);
+            self.start_async_open_file(&next_path, next_size);
+        }
+
+        opened
     }
 
     pub fn do_open_decompressed_file(
@@ -1904,6 +2124,17 @@ impl UltraViewerApp {
         CompressedEngine::start_extract_zip_entry(zip_path, entry_index, cancel, tx);
     }
 
+    fn prepare_state_for_open(&mut self) {
+        self.sync_active_tab_state();
+        self.cancel_active_indexer();
+        self.cancel_search();
+        self.cancel_tree_builders();
+        self.cancel_analysis();
+        self.analyzer_state = AnalyzerPanelState::default();
+        self.active_slice = None;
+        self.hex_viewer = HexViewerState::default();
+    }
+
     pub fn do_open_file_internal(
         &mut self,
         path: &Path,
@@ -1923,162 +2154,184 @@ impl UltraViewerApp {
             return;
         }
 
-        self.sync_active_tab_state();
-        self.cancel_active_indexer();
-        self.cancel_search();
-        self.cancel_tree_builders();
-        self.cancel_analysis();
-        self.analyzer_state = AnalyzerPanelState::default();
-        self.active_slice = None;
-        self.hex_viewer = HexViewerState::default();
+        self.prepare_state_for_open();
 
         let start_time = Instant::now();
-        match FileEngine::open(path) {
-            Ok(raw_engine) => {
-                let track_recent_path = original_archive.as_ref().unwrap_or(&path_buf);
-                if let Some(pos) = self.recent_files.iter().position(|p| p == track_recent_path) {
-                    self.recent_files.remove(pos);
-                }
-                self.recent_files.insert(0, track_recent_path.clone());
-                if self.recent_files.len() > 10 {
-                    self.recent_files.truncate(10);
-                }
-
+        match FileEngine::open_with_handle(path) {
+            Ok((raw_engine, open_file)) => {
                 let dur = start_time.elapsed();
-                let engine = Arc::new(raw_engine);
-                let header = engine.read_range(0, 65536).unwrap_or(&[]);
-                let file_type = FormatDetector::detect(header, engine.detect_encoding(), Some(engine.path()));
-
-                let line_index = Arc::new(LineIndex::new(engine.size(), engine.detect_encoding()));
-                let cancel = Arc::new(AtomicBool::new(false));
-
-                // Spawn background indexer thread
-                let handle = LineIndexer::spawn(Arc::clone(&engine), Arc::clone(&line_index), Arc::clone(&cancel));
-
-                self.current_line = 1;
-                self.viewport.load_lines_indexed(&engine, &line_index, 1, VISIBLE_LINE_BUFFER);
-
-                self.document = Some(EditorDocument::new(engine.size()));
-                self.is_edit_mode = true;
-                if engine.is_empty() {
-                    self.active_edit_line = Some(1);
-                    self.pending_focus_line = Some((1, 0));
-                    self.active_cursor_col = 0;
-                    self.line_edit_initial_texts.insert(1, String::new());
-                } else {
-                    self.active_edit_line = None;
-                }
-                self.edit_line_buffer.clear();
-                self.folded_lines.clear();
-                self.selection_anchor = None;
-                self.selection_head = None;
-
-                self.engine = Some(Arc::clone(&engine));
-                self.line_index = Some(Arc::clone(&line_index));
-                self.indexer_cancel = Some(Arc::clone(&cancel));
-                self.indexer_handle = Some(handle);
-                self.file_type = Some(file_type);
-                self.open_duration = Some(dur);
-                let sample_len = (engine.size().min(524288)) as usize;
-                let sample = engine.read_range(0, sample_len).unwrap_or(&[]);
-                self.discovered_tags = crate::formats::DiscoveredTags::from_sample(sample, Some(file_type));
-                self.show_query_suggestions = false;
-                self.error_message = None;
-                self.jump_line_input = "1".to_string();
-                self.jump_offset_input = "0".to_string();
-
-                self.search_matches.write().unwrap().clear();
-                *self.search_status.write().unwrap() = SearchStatus::Idle;
-                self.active_match_idx = None;
-                self.last_executed_query = None;
-                self.auto_jump_to_first_match = false;
-
-                self.xml_tree_root = None;
-                self.xml_tree_building = false;
-                self.xml_tree_rx = None;
-                self.xml_tree_cancel = None;
-                self.xml_validation_result = None;
-                self.is_validating_xml = false;
-
-                self.json_tree_root = None;
-                self.json_tree_building = false;
-                self.json_tree_rx = None;
-                self.json_tree_cancel = None;
-                self.json_validation_result = None;
-                self.is_validating_json = false;
-
-                let tab_id = self.next_tab_id;
-                self.next_tab_id += 1;
-                self.active_tab_id = Some(tab_id);
-
-                let new_tab = OpenDocState {
-                    id: tab_id,
-                    path: path_buf.clone(),
-                    engine: Arc::clone(&engine),
-                    line_index: Arc::clone(&line_index),
-                    indexer_cancel: Arc::clone(&cancel),
-                    indexer_handle: None,
-                    viewport: self.viewport.clone(),
-                    file_type: Some(file_type),
-                    open_duration: Some(dur),
-                    current_line: 1,
-                    document: self.document.clone(),
-                    is_edit_mode: true,
-                    active_edit_line: None,
-                    edit_line_buffer: String::new(),
-                    xml_tree_root: None,
-                    json_tree_root: None,
-                    folded_lines: HashSet::new(),
-                    fold_all_descriptions: false,
-                    unfolded_lines_override: HashSet::new(),
-                    selection_anchor: None,
-                    selection_head: None,
-                    current_xpath: None,
-                    active_slice: None,
-                    hex_viewer: HexViewerState::default(),
-                    is_decompressed_temp: is_decompressed,
-                    original_archive_path: original_archive,
-                    display_name_override: display_name.clone(),
-                };
-                self.tabs.push(new_tab);
-
-                // Auto-detect CSV/TSV
-                let ext = display_name.as_deref()
-                    .and_then(|d| Path::new(d).extension().and_then(|s| s.to_str()))
-                    .or_else(|| path_buf.extension().and_then(|s| s.to_str()))
-                    .unwrap_or("")
-                    .to_lowercase();
-                if ext == "csv" {
-                    self.csv_grid.is_enabled = true;
-                    self.csv_grid.delimiter = ',';
-                    self.csv_grid.headers = self.viewport.lines.first()
-                        .map(|l| split_delimited(&l.text, ','))
-                        .unwrap_or_default();
-                } else if ext == "tsv" {
-                    self.csv_grid.is_enabled = true;
-                    self.csv_grid.delimiter = '\t';
-                    self.csv_grid.headers = self.viewport.lines.first()
-                        .map(|l| split_delimited(&l.text, '\t'))
-                        .unwrap_or_default();
-                } else {
-                    self.csv_grid.is_enabled = false;
-                    self.csv_grid.headers.clear();
-                }
-
-                // Auto-build compact structure tree if size <= 2GB
-                if file_type == FileType::Xml {
-                    self.fix_malformed_xml_declaration();
-                    self.trigger_build_xml_tree();
-                } else if file_type == FileType::Json {
-                    self.trigger_build_json_tree();
-                }
-
-                self.persist_session();
+                self.finish_opening_prepared_file(
+                    path_buf,
+                    raw_engine,
+                    Some(open_file),
+                    dur,
+                    is_decompressed,
+                    original_archive,
+                    display_name,
+                );
             }
             Err(err) => {
                 self.error_message = Some(format!("Failed to open file: {}", err));
             }
         }
+    }
+
+    fn finish_opening_prepared_file(
+        &mut self,
+        path_buf: PathBuf,
+        raw_engine: FileEngine,
+        preopened_file: Option<std::fs::File>,
+        dur: Duration,
+        is_decompressed: bool,
+        original_archive: Option<PathBuf>,
+        display_name: Option<String>,
+    ) {
+        let track_recent_path = original_archive.as_ref().unwrap_or(&path_buf);
+        if let Some(pos) = self.recent_files.iter().position(|p| p == track_recent_path) {
+            self.recent_files.remove(pos);
+        }
+        self.recent_files.insert(0, track_recent_path.clone());
+        if self.recent_files.len() > 10 {
+            self.recent_files.truncate(10);
+        }
+
+        let engine = Arc::new(raw_engine);
+        let header = engine.read_range(0, 65536).unwrap_or(&[]);
+        let file_type = FormatDetector::detect(header, engine.detect_encoding(), Some(engine.path()));
+
+        let line_index = Arc::new(LineIndex::new(engine.size(), engine.detect_encoding()));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // Reuse the open File handle so LineIndexer starts scanning without a duplicate File::open call.
+        let handle = LineIndexer::spawn_with_file(
+            Arc::clone(&engine),
+            Arc::clone(&line_index),
+            Arc::clone(&cancel),
+            preopened_file,
+        );
+
+        self.current_line = 1;
+        self.viewport.load_lines_indexed(&engine, &line_index, 1, VISIBLE_LINE_BUFFER);
+
+        self.document = Some(EditorDocument::new(engine.size()));
+        self.is_edit_mode = true;
+        if engine.is_empty() {
+            self.active_edit_line = Some(1);
+            self.pending_focus_line = Some((1, 0));
+            self.active_cursor_col = 0;
+            self.line_edit_initial_texts.insert(1, String::new());
+        } else {
+            self.active_edit_line = None;
+        }
+        self.edit_line_buffer.clear();
+        self.folded_lines.clear();
+        self.selection_anchor = None;
+        self.selection_head = None;
+
+        self.engine = Some(Arc::clone(&engine));
+        self.line_index = Some(Arc::clone(&line_index));
+        self.indexer_cancel = Some(Arc::clone(&cancel));
+        self.indexer_handle = Some(handle);
+        self.file_type = Some(file_type);
+        self.open_duration = Some(dur);
+        let sample_len = (engine.size().min(524288)) as usize;
+        let sample = engine.read_range(0, sample_len).unwrap_or(&[]);
+        self.discovered_tags = crate::formats::DiscoveredTags::from_sample(sample, Some(file_type));
+        self.show_query_suggestions = false;
+        self.error_message = None;
+        self.jump_line_input = "1".to_string();
+        self.jump_offset_input = "0".to_string();
+
+        self.search_matches.write().unwrap().clear();
+        *self.search_status.write().unwrap() = SearchStatus::Idle;
+        self.active_match_idx = None;
+        self.last_executed_query = None;
+        self.auto_jump_to_first_match = false;
+
+        self.xml_tree_root = None;
+        self.xml_tree_building = false;
+        self.xml_tree_rx = None;
+        self.xml_tree_cancel = None;
+        self.xml_validation_result = None;
+        self.is_validating_xml = false;
+
+        self.json_tree_root = None;
+        self.json_tree_building = false;
+        self.json_tree_rx = None;
+        self.json_tree_cancel = None;
+        self.json_validation_result = None;
+        self.is_validating_json = false;
+
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.active_tab_id = Some(tab_id);
+
+        let new_tab = OpenDocState {
+            id: tab_id,
+            path: path_buf.clone(),
+            engine: Arc::clone(&engine),
+            line_index: Arc::clone(&line_index),
+            indexer_cancel: Arc::clone(&cancel),
+            indexer_handle: None,
+            viewport: self.viewport.clone(),
+            file_type: Some(file_type),
+            open_duration: Some(dur),
+            current_line: 1,
+            document: self.document.clone(),
+            is_edit_mode: true,
+            active_edit_line: None,
+            edit_line_buffer: String::new(),
+            xml_tree_root: None,
+            json_tree_root: None,
+            folded_lines: HashSet::new(),
+            fold_all_descriptions: false,
+            unfolded_lines_override: HashSet::new(),
+            selection_anchor: None,
+            selection_head: None,
+            current_xpath: None,
+            active_slice: None,
+            hex_viewer: HexViewerState::default(),
+            is_decompressed_temp: is_decompressed,
+            original_archive_path: original_archive,
+            display_name_override: display_name.clone(),
+        };
+        self.tabs.push(new_tab);
+
+        // Auto-detect CSV/TSV
+        let ext = display_name.as_deref()
+            .and_then(|d| Path::new(d).extension().and_then(|s| s.to_str()))
+            .or_else(|| path_buf.extension().and_then(|s| s.to_str()))
+            .unwrap_or("")
+            .to_lowercase();
+        if ext == "csv" {
+            self.csv_grid.is_enabled = true;
+            self.csv_grid.delimiter = ',';
+            self.csv_grid.headers = self.viewport.lines.first()
+                .map(|l| split_delimited(&l.text, ','))
+                .unwrap_or_default();
+        } else if ext == "tsv" {
+            self.csv_grid.is_enabled = true;
+            self.csv_grid.delimiter = '\t';
+            self.csv_grid.headers = self.viewport.lines.first()
+                .map(|l| split_delimited(&l.text, '\t'))
+                .unwrap_or_default();
+        } else {
+            self.csv_grid.is_enabled = false;
+            self.csv_grid.headers.clear();
+        }
+
+        // Auto-build compact structure tree if size <= 512MB (avoid double full-file disk scan on 4GB+ files)
+        const AUTO_TREE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+        if file_type == FileType::Xml {
+            self.fix_malformed_xml_declaration();
+            if engine.size() <= AUTO_TREE_MAX_BYTES {
+                self.trigger_build_xml_tree();
+            }
+        } else if file_type == FileType::Json && engine.size() <= AUTO_TREE_MAX_BYTES {
+            self.trigger_build_json_tree();
+        }
+
+        self.persist_session();
     }
 
     pub fn persist_session(&mut self) {
@@ -3901,94 +4154,140 @@ impl UltraViewerApp {
 
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(RwLock::new(FormattingProgress::new(total_bytes)));
+        if is_in_place {
+            progress.write().unwrap().defer_finish = true;
+        }
+        let handles_released = Arc::new(AtomicBool::new(false));
+        let reloaded_engine: Arc<std::sync::Mutex<Option<ReloadedEngineResult>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        if is_in_place {
+            self.cancel_tree_builders();
+            self.cancel_search();
+            self.cancel_analysis();
+        }
 
         let cancel_thread = Arc::clone(&cancel);
         let progress_thread = Arc::clone(&progress);
+        let handles_released_thread = Arc::clone(&handles_released);
+        let reloaded_engine_thread = Arc::clone(&reloaded_engine);
         let src_thread = src_path.clone();
         let dst_thread = dst_path.clone();
-        let doc_clone = self.document.clone();
+        let doc_clone = if is_modified { self.document.clone() } else { None };
         let engine_clone = Arc::clone(&engine);
 
         std::thread::Builder::new()
             .name("streaming-formatter".to_string())
             .spawn(move || {
-                let res = if let Some(doc) = doc_clone.filter(|_| is_modified) {
-                    let reader = PieceTableReader::new(&doc.piece_table, &engine_clone);
-                    let dst_file = match std::fs::File::create(&dst_thread) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            let msg = format!("Failed to create destination file: {}", e);
-                            progress_thread.write().unwrap().error = Some(msg.clone());
-                            return;
+                struct MmapReader {
+                    engine: Arc<FileEngine>,
+                    pos: u64,
+                }
+                impl std::io::Read for MmapReader {
+                    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                        let remaining = self.engine.size().saturating_sub(self.pos);
+                        if remaining == 0 {
+                            return Ok(0);
                         }
-                    };
-                    let writer = std::io::BufWriter::with_capacity(256 * 1024, dst_file);
-                    let format_res = match file_type {
-                        FileType::Json => JsonStreamingFormatter::format(
-                            reader,
-                            writer,
-                            action,
-                            cancel_thread,
-                            total_bytes,
-                            Some(Arc::clone(&progress_thread)),
-                        ),
-                        FileType::Xml => XmlStreamingFormatter::format(
-                            reader,
-                            writer,
-                            action,
-                            cancel_thread,
-                            total_bytes,
-                            Some(Arc::clone(&progress_thread)),
-                        ),
-                        FileType::Python => PythonStreamingFormatter::format(
-                            reader,
-                            writer,
-                            action,
-                            cancel_thread,
-                            total_bytes,
-                            Some(Arc::clone(&progress_thread)),
-                        ),
-                        _ => Err("Unsupported file format for streaming formatting".to_string()),
-                    };
-                    if let Err(ref err) = format_res {
-                        let _ = std::fs::remove_file(&dst_thread);
-                        progress_thread.write().unwrap().error = Some(err.clone());
+                        let to_read = (buf.len() as u64).min(remaining) as usize;
+                        let chunk = self.engine.read_range(self.pos, to_read)?;
+                        buf[..chunk.len()].copy_from_slice(chunk);
+                        self.pos += chunk.len() as u64;
+                        Ok(chunk.len())
                     }
-                    format_res
-                } else {
-                    let format_res = match file_type {
-                        FileType::Json => JsonStreamingFormatter::format_file(
-                            src_thread,
-                            dst_thread.clone(),
-                            action,
-                            cancel_thread,
-                            Some(Arc::clone(&progress_thread)),
-                        ),
-                        FileType::Xml => XmlStreamingFormatter::format_file(
-                            src_thread,
-                            dst_thread.clone(),
-                            action,
-                            cancel_thread,
-                            Some(Arc::clone(&progress_thread)),
-                        ),
-                        FileType::Python => PythonStreamingFormatter::format_file(
-                            src_thread,
-                            dst_thread.clone(),
-                            action,
-                            cancel_thread,
-                            Some(Arc::clone(&progress_thread)),
-                        ),
-                        _ => Err("Unsupported file format for streaming formatting".to_string()),
-                    };
-                    if let Err(ref err) = format_res {
-                        let _ = std::fs::remove_file(&dst_thread);
-                        progress_thread.write().unwrap().error = Some(err.clone());
+                }
+
+                let dst_file = match Self::open_rw_share_all(&dst_thread) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let msg = format!("Failed to create destination file: {}", e);
+                        let mut p = progress_thread.write().unwrap();
+                        p.error = Some(msg);
+                        p.is_finalizing = false;
+                        return;
                     }
-                    format_res
                 };
-                if let Err(e) = res {
-                    eprintln!("Formatting error: {}", e);
-                    progress_thread.write().unwrap().error = Some(e);
+
+                let res = if let Some(doc) = doc_clone {
+                    let reader = PieceTableReader::new(&doc.piece_table, &engine_clone);
+                    let writer = std::io::BufWriter::with_capacity(1024 * 1024, &dst_file);
+                    Self::stream_format_reader(
+                        file_type,
+                        reader,
+                        writer,
+                        action,
+                        Arc::clone(&cancel_thread),
+                        total_bytes,
+                        Some(Arc::clone(&progress_thread)),
+                    )
+                } else {
+                    let reader = MmapReader {
+                        engine: engine_clone,
+                        pos: 0,
+                    };
+                    let writer = std::io::BufWriter::with_capacity(1024 * 1024, &dst_file);
+                    Self::stream_format_reader(
+                        file_type,
+                        reader,
+                        writer,
+                        action,
+                        Arc::clone(&cancel_thread),
+                        total_bytes,
+                        Some(Arc::clone(&progress_thread)),
+                    )
+                };
+
+                match res {
+                    Err(e) => {
+                        drop(dst_file);
+                        let _ = std::fs::remove_file(&dst_thread);
+                        eprintln!("Formatting error: {}", e);
+                        let mut p = progress_thread.write().unwrap();
+                        p.error = Some(e);
+                        p.is_finalizing = false;
+                    }
+                    Ok(_) if is_in_place => {
+                        // Wait for the UI thread to release open file/mmap handles on src_thread (< 1ms)
+                        while !handles_released_thread.load(Ordering::Acquire) {
+                            if cancel_thread.load(Ordering::SeqCst)
+                                || Arc::strong_count(&handles_released_thread) <= 1
+                            {
+                                drop(dst_file);
+                                let _ = std::fs::remove_file(&dst_thread);
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+
+                        // Swap using non-replacing MFT renames while keeping `dst_file` open and
+                        // memory-mapping it directly via `from_open_file` (avoids ~15-20s Windows
+                        // Defender synchronous re-open scan and superseding-rename overhead).
+                        let finalize_res = Self::swap_and_map_open_handle(
+                            &dst_thread,
+                            &src_thread,
+                            dst_file,
+                        );
+
+                        match finalize_res {
+                            Ok(new_engine) => {
+                                *reloaded_engine_thread.lock().unwrap() = Some(Ok(new_engine));
+                                let mut p = progress_thread.write().unwrap();
+                                p.is_finalizing = false;
+                                p.is_finished = true;
+                            }
+                            Err(e) => {
+                                let _ = std::fs::remove_file(&dst_thread);
+                                *reloaded_engine_thread.lock().unwrap() = Some(Err(e.clone()));
+                                let mut p = progress_thread.write().unwrap();
+                                p.error = Some(e);
+                                p.is_finalizing = false;
+                                p.is_finished = true;
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        drop(dst_file);
+                    }
                 }
             })
             .expect("Failed to spawn formatter thread");
@@ -4001,6 +4300,9 @@ impl UltraViewerApp {
             is_in_place,
             progress,
             cancel,
+            handles_released,
+            handles_released_sent: false,
+            reloaded_engine,
         });
         self.show_format_modal = true;
     }
@@ -4852,89 +5154,369 @@ impl UltraViewerApp {
         self.show_save_modal = show_modal;
     }
 
-    pub fn reload_active_tab_from_saved_file(&mut self, orig_path: &Path, tmp_path: &Path) -> bool {
+    fn open_rw_share_all(path: &Path) -> std::io::Result<std::fs::File> {
+        let mut oo = std::fs::OpenOptions::new();
+        oo.read(true).write(true).create(true).truncate(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x1;
+            const FILE_SHARE_WRITE: u32 = 0x2;
+            const FILE_SHARE_DELETE: u32 = 0x4;
+            oo.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        }
+        oo.open(path)
+    }
+
+    fn stream_format_reader<R: std::io::Read, W: std::io::Write>(
+        file_type: FileType,
+        reader: R,
+        writer: W,
+        action: FormatAction,
+        cancel: Arc<AtomicBool>,
+        total_bytes: u64,
+        progress: Option<Arc<RwLock<FormattingProgress>>>,
+    ) -> Result<u64, String> {
+        match file_type {
+            FileType::Json => JsonStreamingFormatter::format(
+                reader,
+                writer,
+                action,
+                cancel,
+                total_bytes,
+                progress,
+            ),
+            FileType::Xml => XmlStreamingFormatter::format(
+                reader,
+                writer,
+                action,
+                cancel,
+                total_bytes,
+                progress,
+            ),
+            FileType::Python => PythonStreamingFormatter::format(
+                reader,
+                writer,
+                action,
+                cancel,
+                total_bytes,
+                progress,
+            ),
+            _ => Err("Unsupported file format for streaming formatting".to_string()),
+        }
+    }
+
+    fn swap_and_map_open_handle(
+        tmp_path: &Path,
+        orig_path: &Path,
+        open_tmp_file: std::fs::File,
+    ) -> ReloadedEngineResult {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            extern "system" {
+                fn MoveFileExW(
+                    lpExistingFileName: *const u16,
+                    lpNewFileName: *const u16,
+                    dwFlags: u32,
+                ) -> i32;
+            }
+            const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+            const MOVEFILE_COPY_ALLOWED: u32 = 0x2;
+
+            let wide = |p: &Path| -> Vec<u16> {
+                p.as_os_str().encode_wide().chain(Some(0)).collect()
+            };
+
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let bak_path = PathBuf::from(format!("{}.{}.uv_bak", orig_path.display(), nanos));
+            let bak_w = wide(&bak_path);
+            let orig_w = wide(orig_path);
+            let tmp_w = wide(tmp_path);
+
+            let orig_existed = orig_path.exists();
+            let mut moved_orig_to_bak = false;
+            if orig_existed {
+                for _ in 0..10 {
+                    let ok = unsafe {
+                        MoveFileExW(
+                            orig_w.as_ptr(),
+                            bak_w.as_ptr(),
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED,
+                        )
+                    };
+                    if ok != 0 {
+                        moved_orig_to_bak = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+
+            // If orig couldn't move out of the way (or didn't exist), try fast non-replacing move
+            let can_non_replacing_move = !orig_existed || moved_orig_to_bak;
+            if can_non_replacing_move {
+                let mut moved_tmp = false;
+                for _ in 0..10 {
+                    // Non-replacing rename while `open_tmp_file` stays open avoids NTFS
+                    // superseding-rename flush & Windows Defender synchronous close/open scan.
+                    let ok = unsafe {
+                        MoveFileExW(tmp_w.as_ptr(), orig_w.as_ptr(), MOVEFILE_COPY_ALLOWED)
+                    };
+                    if ok != 0 {
+                        moved_tmp = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+
+                if moved_tmp {
+                    let engine = FileEngine::from_open_file(orig_path, &open_tmp_file)
+                        .map_err(|e| format!("Failed to map formatted file: {}", e))?;
+                    if moved_orig_to_bak {
+                        std::thread::spawn(move || {
+                            let _ = std::fs::remove_file(&bak_path);
+                        });
+                    }
+                    // Hand the still-open handle straight to `LineIndexer::spawn_with_file`
+                    // so indexing starts in <1ms without hitting Windows Defender's `File::open` delay.
+                    return Ok((engine, Some(open_tmp_file)));
+                }
+
+                // Rollback orig if non-replacing move failed
+                if moved_orig_to_bak {
+                    let _ = unsafe {
+                        MoveFileExW(
+                            bak_w.as_ptr(),
+                            orig_w.as_ptr(),
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED,
+                        )
+                    };
+                }
+            }
+        }
+
+        // Safe fallback (non-Windows or locked directory): close RW handle, replace, reopen
+        drop(open_tmp_file);
+        Self::replace_file_atomic(tmp_path, orig_path)?;
+        let engine = FileEngine::open(orig_path)
+            .map_err(|e| format!("Failed to re-read saved file: {}", e))?;
+        Ok((engine, None))
+    }
+
+    fn replace_file_atomic(tmp_path: &Path, orig_path: &Path) -> Result<(), String> {
+        let mut replaced = false;
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            extern "system" {
+                fn MoveFileExW(
+                    lpExistingFileName: *const u16,
+                    lpNewFileName: *const u16,
+                    dwFlags: u32,
+                ) -> i32;
+            }
+            const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+            const MOVEFILE_COPY_ALLOWED: u32 = 0x2;
+
+            let mut src_w: Vec<u16> = tmp_path.as_os_str().encode_wide().collect();
+            src_w.push(0);
+            let mut dst_w: Vec<u16> = orig_path.as_os_str().encode_wide().collect();
+            dst_w.push(0);
+
+            for _ in 0..40 {
+                let ok = unsafe {
+                    MoveFileExW(
+                        src_w.as_ptr(),
+                        dst_w.as_ptr(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED,
+                    )
+                };
+                if ok != 0 {
+                    replaced = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            for _ in 0..15 {
+                if std::fs::rename(tmp_path, orig_path).is_ok() {
+                    replaced = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        if !replaced {
+            // Fallback for cross-volume moves
+            std::fs::copy(tmp_path, orig_path)
+                .map_err(|e| format!("Failed to finalize save: {}", e))?;
+            let _ = std::fs::remove_file(tmp_path);
+        }
+
+        Ok(())
+    }
+
+    pub fn release_active_file_handles(&mut self) {
+        // Cancel active background workers & join indexer so all OS file/mmap handles on orig_path are released.
+        // Keep `self.engine` populated with `FileEngine::empty()` so the editor stays rendered behind modals.
+        self.cancel_tree_builders();
+        self.cancel_search();
+        self.cancel_analysis();
+        if let Some(cancel) = self.indexer_cancel.take() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        if let Some(handle) = self.indexer_handle.take() {
+            let _ = handle.join();
+        }
+        let empty_engine = Arc::new(FileEngine::empty());
+        if let Some(active_id) = self.active_tab_id {
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
+                tab.indexer_cancel.store(true, Ordering::SeqCst);
+                tab.engine = Arc::clone(&empty_engine);
+            }
+        }
+        self.engine = Some(empty_engine);
+        self.galley_cache.borrow_mut().clear();
+    }
+
+    fn apply_reloaded_engine(
+        &mut self,
+        new_raw_engine: FileEngine,
+        preopened_file: Option<std::fs::File>,
+    ) {
         let saved_active_edit = self.active_edit_line;
         let saved_buffer = self.edit_line_buffer.clone();
         let saved_scroll_line = self.current_line;
 
-        // Release file handle locks on orig_path before renaming/copying on Windows
+        let engine = Arc::new(new_raw_engine);
+
         if let Some(active_id) = self.active_tab_id {
             if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
-                tab.engine = Arc::new(FileEngine::empty());
-            }
-        }
-        self.engine = None;
-
-        // Atomic replace with Windows copy fallback
-        let mut save_success = true;
-        if let Err(e) = std::fs::rename(tmp_path, orig_path) {
-            if let Err(e2) = std::fs::copy(tmp_path, orig_path) {
-                self.error_message = Some(format!("Failed to finalize save: rename ({}), copy ({})", e, e2));
-                save_success = false;
-            } else {
-                let _ = std::fs::remove_file(tmp_path);
-            }
-        }
-
-        // Reopen saved file cleanly
-        match FileEngine::open(orig_path) {
-            Ok(new_raw_engine) => {
-                let engine = Arc::new(new_raw_engine);
-
-                // Update active tab and app file engines seamlessly without disrupting viewport or cursor
-                if let Some(active_id) = self.active_tab_id {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
-                        tab.engine = Arc::clone(&engine);
-                        if let Some(ref mut doc) = tab.document {
-                            doc.piece_table = crate::editor::PieceTable::new(engine.size());
-                            doc.mark_saved();
-                            doc.modified_lines.clear();
-                        }
-                    }
-                }
-
-                self.engine = Some(Arc::clone(&engine));
-                if let Some(ref mut doc) = self.document {
+                tab.engine = Arc::clone(&engine);
+                if let Some(ref mut doc) = tab.document {
                     doc.piece_table = crate::editor::PieceTable::new(engine.size());
                     doc.mark_saved();
                     doc.modified_lines.clear();
                 }
-
-                // Re-spawn line indexer for new engine size
-                let line_index = Arc::new(LineIndex::new(engine.size(), engine.detect_encoding()));
-                let cancel = Arc::new(AtomicBool::new(false));
-                let _ = LineIndexer::spawn(Arc::clone(&engine), Arc::clone(&line_index), cancel);
-                self.line_index = Some(Arc::clone(&line_index));
-                if let Some(active_id) = self.active_tab_id {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
-                        tab.line_index = Arc::clone(&line_index);
-                    }
-                }
-
-                // Restore active edit and scroll positions seamlessly (like VS Code)
-                self.active_edit_line = saved_active_edit;
-                self.edit_line_buffer = saved_buffer.clone();
-                if let Some(line_no) = saved_active_edit {
-                    self.line_edit_initial_texts.insert(line_no, saved_buffer);
-                }
-                self.current_line = saved_scroll_line;
-
-                // Re-read lines from newly opened engine so byte offsets and line texts are 100% up-to-date
-                self.scroll_to_line(saved_scroll_line);
-                self.sync_active_tab_state();
-
-                if self.xml_validation_result.is_some() && self.file_type == Some(FileType::Xml) {
-                    self.validate_xml_document();
-                } else if self.json_validation_result.is_some() && self.file_type == Some(FileType::Json) {
-                    self.validate_json_document();
-                }
-            }
-            Err(e) => {
-                self.error_message = Some(format!("Failed to re-read saved file: {}", e));
             }
         }
 
-        save_success
+        self.engine = Some(Arc::clone(&engine));
+        if let Some(ref mut doc) = self.document {
+            doc.piece_table = crate::editor::PieceTable::new(engine.size());
+            doc.mark_saved();
+            doc.modified_lines.clear();
+        }
+
+        // Re-spawn line indexer using the still-open handle so indexing starts immediately
+        let line_index = Arc::new(LineIndex::new(engine.size(), engine.detect_encoding()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = LineIndexer::spawn_with_file(
+            Arc::clone(&engine),
+            Arc::clone(&line_index),
+            Arc::clone(&cancel),
+            preopened_file,
+        );
+        self.line_index = Some(Arc::clone(&line_index));
+        self.indexer_cancel = Some(Arc::clone(&cancel));
+        self.indexer_handle = Some(handle);
+        if let Some(active_id) = self.active_tab_id {
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
+                tab.line_index = Arc::clone(&line_index);
+                tab.indexer_cancel = cancel;
+            }
+        }
+
+        // Restore active edit and scroll positions seamlessly
+        self.active_edit_line = saved_active_edit;
+        self.edit_line_buffer = saved_buffer.clone();
+        if let Some(line_no) = saved_active_edit {
+            self.line_edit_initial_texts.insert(line_no, saved_buffer);
+        }
+        self.current_line = saved_scroll_line;
+
+        self.scroll_to_line(saved_scroll_line);
+        self.sync_active_tab_state();
+
+        if self.xml_validation_result.is_some() && self.file_type == Some(FileType::Xml) {
+            self.validate_xml_document();
+        } else if self.json_validation_result.is_some() && self.file_type == Some(FileType::Json) {
+            self.validate_json_document();
+        }
+    }
+
+    pub fn poll_in_place_formatting_finalization(&mut self) -> bool {
+        let Some(ref active) = self.active_formatting else {
+            return false;
+        };
+        if !active.is_in_place {
+            return false;
+        }
+        let progress = active.progress.read().unwrap().clone();
+        if progress.error.is_some() {
+            return false;
+        }
+
+        if progress.is_finalizing && !active.handles_released_sent {
+            self.release_active_file_handles();
+            if let Some(ref mut active_mut) = self.active_formatting {
+                active_mut.handles_released_sent = true;
+                active_mut.handles_released.store(true, Ordering::Release);
+            }
+            return false;
+        }
+
+        if progress.is_finished {
+            let active_owned = self.active_formatting.take().unwrap();
+            self.show_format_modal = false;
+            let preopened = active_owned.reloaded_engine.lock().unwrap().take();
+            match preopened {
+                Some(Ok((new_engine, preopened_file))) => {
+                    self.apply_reloaded_engine(new_engine, preopened_file);
+                    return true;
+                }
+                Some(Err(e)) => {
+                    self.error_message = Some(format!("Failed to finalize formatting: {}", e));
+                    return false;
+                }
+                None => {
+                    return self.reload_active_tab_from_saved_file(
+                        &active_owned.src_path,
+                        &active_owned.dst_path,
+                    );
+                }
+            }
+        }
+
+        false
+    }
+
+    pub fn reload_active_tab_from_saved_file(&mut self, orig_path: &Path, tmp_path: &Path) -> bool {
+        self.release_active_file_handles();
+
+        if let Err(e) = Self::replace_file_atomic(tmp_path, orig_path) {
+            self.error_message = Some(e);
+            return false;
+        }
+
+        match FileEngine::open(orig_path) {
+            Ok(new_raw_engine) => {
+                self.apply_reloaded_engine(new_raw_engine, None);
+                true
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to re-read saved file: {}", e));
+                false
+            }
+        }
     }
 
     pub fn start_save_as(&mut self) {
@@ -5396,7 +5978,9 @@ impl UltraViewerApp {
         if let Some(pos) = self.viewport.lines.iter().position(|l| l.line_number == target_line) {
             let safe_top = headroom.min(screen_lines / 4);
             let safe_bottom = screen_lines.saturating_sub(3);
-            if pos >= safe_top && pos <= safe_bottom {
+            let fits_wrapped = self.cached_visible_end_line == 0
+                || target_line <= self.cached_visible_end_line.saturating_sub(1);
+            if pos >= safe_top && pos <= safe_bottom && fits_wrapped {
                 return;
             }
         }
@@ -5562,10 +6146,18 @@ impl UltraViewerApp {
         }
         let has_multiline_selection = self.selection_range().map_or(false, |(s, e)| s != e);
         let has_whole_line_gutter_selection = self.active_edit_line.is_none() && self.selection_range().is_some();
-        if ctrl_c && (has_multiline_selection || has_whole_line_gutter_selection) {
+        let copy_event = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+        let cut_event = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Cut)));
+        let editor_or_no_focus = ctx.memory(|m| {
+            match m.focused() {
+                None => true,
+                Some(focused_id) => self.active_edit_line.map_or(false, |l| focused_id == egui::Id::new("line_editor").with(l)),
+            }
+        });
+        if (ctrl_c || copy_event) && (has_multiline_selection || has_whole_line_gutter_selection || (editor_or_no_focus && (self.selection_range().is_some() || self.last_inline_selection.is_some() || self.active_edit_line.is_some()))) {
             self.copy_selection(ctx);
         }
-        if ctrl_x && (has_multiline_selection || has_whole_line_gutter_selection) {
+        if (ctrl_x || cut_event) && (has_multiline_selection || has_whole_line_gutter_selection) {
             self.cut_selection(ctx);
         }
         if del_or_backspace && (has_multiline_selection || has_whole_line_gutter_selection) {
@@ -6072,6 +6664,13 @@ impl eframe::App for UltraViewerApp {
         let is_indexing = self.line_index.as_ref().map_or(false, |i| !i.is_complete());
 
         let is_auto_saving = self.auto_save && self.auto_save_timer.is_some();
+        if self.active_opening.is_some() {
+            if self.poll_active_opening() {
+                ctx.request_repaint();
+            } else if self.active_opening.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+        }
         if is_indexing || is_searching || self.is_query_running || self.field_extract_state.is_running || self.url_modal_state.is_downloading || self.xml_tree_building || self.is_validating_xml || self.json_tree_building || self.is_validating_json || self.active_analysis.is_some() || self.active_saving.is_some() || self.decompress_status.is_some() || is_auto_saving || self.python_runner.is_running() {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
@@ -7350,6 +7949,17 @@ impl eframe::App for UltraViewerApp {
                                 self.active_slice.is_some(),
                             ) {
                                 match action {
+                                    SearchBarAction::QueryChanged => {
+                                        if self.search_query.is_empty() {
+                                            self.cancel_search();
+                                            self.search_matches.write().unwrap().clear();
+                                            *self.search_status.write().unwrap() = SearchStatus::Idle;
+                                            self.active_match_idx = None;
+                                            self.last_executed_query = None;
+                                        } else {
+                                            self.start_search();
+                                        }
+                                    }
                                     SearchBarAction::FindAll => {
                                         self.show_search_results = true;
                                         self.start_search();
@@ -7371,6 +7981,46 @@ impl eframe::App for UltraViewerApp {
                             }
                         });
                 });
+        }
+
+        // Non-blocking background large-file open modal
+        if let Some((display_name, file_size, elapsed_secs)) = self.active_opening.as_ref().map(|o| {
+            (o.display_name.clone(), o.file_size, o.started_at.elapsed().as_secs_f32())
+        }) {
+            let mut cancel_open = false;
+            egui::Window::new("Opening Large File")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        let size_label = if file_size >= 1024 * 1024 * 1024 {
+                            format!("{:.2} GB", file_size as f64 / (1024.0 * 1024.0 * 1024.0))
+                        } else {
+                            format!("{:.1} MB", file_size as f64 / (1024.0 * 1024.0))
+                        };
+                        ui.label(format!("Opening {} ({})...", display_name, size_label));
+                    });
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Waiting for OS / antivirus handle grant... ({:.1}s)",
+                            elapsed_secs
+                        ))
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                    ui.add_space(6.0);
+                    if ui.button("Cancel").clicked() {
+                        cancel_open = true;
+                    }
+                });
+            if cancel_open {
+                if let Some(opening) = self.active_opening.take() {
+                    opening.cancel.store(true, Ordering::SeqCst);
+                }
+                self.pending_open_queue.clear();
+            }
         }
 
         // Central Viewport Panel
@@ -7504,8 +8154,13 @@ impl eframe::App for UltraViewerApp {
 
         // Streaming Formatter Progress & Completion Modal
         if self.show_format_modal {
+            let mut keep_polling = false;
+            let mut is_in_place_active = false;
             if let Some(ref active) = self.active_formatting {
                 let progress = active.progress.read().unwrap().clone();
+                is_in_place_active = active.is_in_place;
+                keep_polling = !progress.is_finished && progress.error.is_none();
+
                 let modal_action = render_format_modal(
                     ctx,
                     &active.title,
@@ -7520,24 +8175,29 @@ impl eframe::App for UltraViewerApp {
                             self.cancel_formatting();
                             self.show_format_modal = false;
                             self.active_formatting = None;
+                            keep_polling = false;
                         }
                         FormatModalAction::Dismiss => {
                             self.show_format_modal = false;
                             self.active_formatting = None;
+                            keep_polling = false;
                         }
                         FormatModalAction::OpenTarget(path) => {
                             self.show_format_modal = false;
                             self.active_formatting = None;
+                            keep_polling = false;
                             self.open_file(path);
                         }
                     }
-                } else if active.is_in_place && progress.is_finished {
-                    // Automatically reload in-place once finished!
-                    let src = active.src_path.clone();
-                    let dst = active.dst_path.clone();
-                    self.show_format_modal = false;
-                    self.active_formatting = None;
-                    self.reload_active_tab_from_saved_file(&src, &dst);
+                }
+            }
+
+            if keep_polling {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+            if is_in_place_active && self.active_formatting.is_some() {
+                if self.poll_in_place_formatting_finalization() {
+                    ctx.request_repaint();
                 }
             }
         }
@@ -8371,6 +9031,7 @@ fn find_folding_end_extended(
         let mut trigger_slice_view = false;
         let mut trigger_goto_line = false;
         let mut trigger_copy_selection = false;
+        let mut trigger_copy_text: Option<String> = None;
         let mut trigger_delete_selection = false;
         let mut trigger_transform_upper = false;
         let mut trigger_transform_lower = false;
@@ -8410,12 +9071,15 @@ fn find_folding_end_extended(
         }
 
         let sel_range = self.selection_range();
+        let any_popup_open = ui.ctx().memory(|m| m.any_popup_open())
+            || egui::menu::BarState::load(ui.ctx(), egui::Id::new("__egui::context_menu")).is_some();
 
         let primary_down = ui.input(|i| i.pointer.primary_down());
         let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
-        if !primary_down {
+        if !primary_down && !any_popup_open {
             if let (Some(a), Some(h)) = (self.selection_anchor, self.selection_head) {
-                if a == h && !self.gutter_drag_active {
+                let is_empty_same_line = a == h && self.selection_anchor_col == self.selection_head_col;
+                if is_empty_same_line && !self.gutter_drag_active {
                     self.selection_anchor = None;
                     self.selection_head = None;
                     self.selection_anchor_col = None;
@@ -8489,9 +9153,19 @@ fn find_folding_end_extended(
                         let shift_down = ui.input(|i| i.modifiers.shift);
                         let pointer_pos = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
 
+                        let galley_cache = &self.galley_cache;
+                        let max_visible_y = viewport_rect.max.y + 32.0;
+                        let mut last_visible_line = 0usize;
+
                         ui.vertical(|ui| {
                             for line in &mut self.viewport.lines {
+                                if ui.cursor().min.y > max_visible_y {
+                                    break;
+                                }
                                 let line_no = line.line_number;
+                                if ui.cursor().min.y <= viewport_rect.max.y {
+                                    last_visible_line = line_no;
+                                }
                                 if hidden_lines.contains(&line_no) {
                                     continue;
                                 }
@@ -8614,6 +9288,21 @@ fn find_folding_end_extended(
                                         search_pattern.as_deref()
                                     };
                                     let mut layouter = |ui: &Ui, text: &str, _w: f32| {
+                                        let key = compute_galley_cache_key(
+                                            text,
+                                            file_type,
+                                            enable_highlighting,
+                                            line_pattern,
+                                            search_case,
+                                            is_active_search,
+                                            &text_font,
+                                            dark_mode,
+                                            target_wrap_w,
+                                            line_sel,
+                                        );
+                                        if let Some(cached) = galley_cache.borrow().get(&key) {
+                                            return Arc::clone(cached);
+                                        }
                                         let job = build_line_layout_job(
                                             text,
                                             file_type,
@@ -8626,7 +9315,13 @@ fn find_folding_end_extended(
                                             target_wrap_w,
                                             line_sel,
                                         );
-                                        ui.fonts(|f| f.layout_job(job))
+                                        let galley = ui.fonts(|f| f.layout_job(job));
+                                        let mut cache = galley_cache.borrow_mut();
+                                        if cache.len() >= 512 {
+                                            cache.clear();
+                                        }
+                                        cache.insert(key, Arc::clone(&galley));
+                                        galley
                                     };
 
                                     let te = egui::TextEdit::multiline(&mut line_text)
@@ -8644,17 +9339,6 @@ fn find_folding_end_extended(
                                         toggle_fold_for = Some(line_no);
                                     }
                                     if is_active_search {
-                                        ui.painter().rect_filled(
-                                            resp.rect,
-                                            2.0,
-                                            Color32::from_rgba_unmultiplied(97, 175, 239, 25),
-                                        );
-                                        ui.painter().rect_stroke(
-                                            resp.rect,
-                                            2.0,
-                                            egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(97, 175, 239, 90)),
-                                            egui::StrokeKind::Inside,
-                                        );
                                         let accent_rect = Rect::from_min_size(resp.rect.min, Vec2::new(3.0, resp.rect.height()));
                                         ui.painter().rect_filled(accent_rect, 1.0, Color32::from_rgb(97, 175, 239));
                                     }
@@ -8663,17 +9347,19 @@ fn find_folding_end_extended(
                                     let row_bot = num_rect.max.y.max(resp.rect.max.y);
 
                                     let pointer_in_row = pointer_pos.map_or(false, |p| p.y >= row_top && p.y <= row_bot);
-                                    let char_w = ui.fonts(|f| f.glyph_width(&text_font, ' '));
+                                    let char_w = ui.fonts(|f| f.glyph_width(&text_font, ' ')).max(1.0);
                                     let line_char_count = line.text.chars().count();
+                                    let chars_per_row = (target_wrap_w / char_w).floor().max(1.0) as usize;
                                     let cur_col = pointer_pos.map_or(0, |p| {
-                                        let col = ((p.x - resp.rect.min.x).max(0.0) / char_w).round() as usize;
-                                        col.min(line_char_count)
+                                        let wrap_row = ((p.y - resp.rect.min.y).max(0.0) / line_h.max(1.0)).floor() as usize;
+                                        let col_x = ((p.x - resp.rect.min.x).max(0.0) / char_w).round() as usize;
+                                        (wrap_row * chars_per_row + col_x.min(chars_per_row)).min(line_char_count)
                                     });
 
-                                    let pointer_in_text = pointer_pos.map_or(false, |p| resp.rect.contains(p));
+                                    let pointer_in_text = !any_popup_open && ui.rect_contains_pointer(resp.rect);
 
                                     // 1. Mouse press inside text row
-                                    if primary_pressed && pointer_in_text && !num_resp.hovered() && !self.gutter_drag_active {
+                                    if !any_popup_open && primary_pressed && pointer_in_text && !num_resp.hovered() && !self.gutter_drag_active {
                                         self.mouse_drag_start_line = Some(line_no);
                                         self.mouse_drag_start_col = Some(cur_col);
                                         if !shift_down {
@@ -8686,7 +9372,7 @@ fn find_folding_end_extended(
                                     }
 
                                     // 2. Mouse drag across lines
-                                    if primary_down && pointer_in_row && self.mouse_drag_start_line.is_some() && !self.gutter_drag_active {
+                                    if !any_popup_open && primary_down && pointer_in_row && self.mouse_drag_start_line.is_some() && !self.gutter_drag_active {
                                         if let (Some(start_l), Some(start_c)) = (self.mouse_drag_start_line, self.mouse_drag_start_col) {
                                             if start_l != line_no {
                                                 self.selection_anchor = Some(start_l);
@@ -8707,17 +9393,17 @@ fn find_folding_end_extended(
                                     }
 
                                     // 3. Gutter interaction: click & drag down the line numbers column selects lines
-                                    if num_resp.drag_started() || (num_resp.hovered() && primary_down && !self.gutter_drag_active && self.mouse_drag_start_line.is_none()) {
+                                    if !any_popup_open && (num_resp.drag_started() || (num_resp.hovered() && primary_down && !self.gutter_drag_active && self.mouse_drag_start_line.is_none())) {
                                         drag_start_detected = Some(line_no);
                                         new_gutter_selection = Some((line_no, line_no));
                                         clear_gutter_selection = false;
                                     }
 
-                                    if num_resp.clicked() && shift_down {
+                                    if !any_popup_open && num_resp.clicked() && shift_down {
                                         let anchor = self.selection_anchor.unwrap_or(self.current_line);
                                         new_gutter_selection = Some((anchor, line_no));
                                         clear_gutter_selection = false;
-                                    } else if num_resp.clicked() && !shift_down {
+                                    } else if !any_popup_open && num_resp.clicked() && !shift_down {
                                         let just_finished_drag = self.selection_anchor != self.selection_head && self.selection_anchor.is_some();
                                         if !just_finished_drag {
                                             new_gutter_selection = Some((line_no, line_no));
@@ -8726,7 +9412,7 @@ fn find_folding_end_extended(
                                     }
 
                                     // Multi-line cursor selection: when dragging along gutter (line numbers column)
-                                    if self.gutter_drag_active && primary_down && pointer_pos.map_or(false, |p| p.y >= num_rect.min.y && p.y <= num_rect.max.y) {
+                                    if !any_popup_open && self.gutter_drag_active && primary_down && pointer_pos.map_or(false, |p| p.y >= num_rect.min.y && p.y <= num_rect.max.y) {
                                         if let Some(start_line) = self.mouse_drag_start_line {
                                             new_gutter_selection = Some((start_line, line_no));
                                             clear_gutter_selection = false;
@@ -8737,7 +9423,8 @@ fn find_folding_end_extended(
                                         && self.selection_head.is_some()
                                         && self.selection_anchor != self.selection_head;
 
-                                    if !self.gutter_drag_active && !is_multiline {
+                                    let secondary_down = ui.input(|i| i.pointer.secondary_down() || i.pointer.secondary_pressed());
+                                    if !any_popup_open && !self.gutter_drag_active && !is_multiline && !secondary_down {
                                         // Text editor interaction: pure in-line text editing, word selection, and typing
                                         if (resp.gained_focus() || resp.clicked()) && !shift_down {
                                             self.selection_anchor = None;
@@ -8763,10 +9450,26 @@ fn find_folding_end_extended(
                                     }
                                     let backspace_pressed = ui.input(|i| i.key_pressed(Key::Backspace));
                                     let delete_pressed = ui.input(|i| i.key_pressed(Key::Delete));
-                                    let (current_col, has_char_selection) = egui::text_edit::TextEditState::load(ui.ctx(), edit_id)
+                                    let (current_col, has_char_selection, inline_sel_range) = egui::text_edit::TextEditState::load(ui.ctx(), edit_id)
                                         .and_then(|state| state.cursor.char_range())
-                                        .map(|r| (r.primary.index, r.primary.index != r.secondary.index))
-                                        .unwrap_or((line_text.chars().count(), false));
+                                        .map(|r| {
+                                            let s = r.primary.index.min(r.secondary.index);
+                                            let e = r.primary.index.max(r.secondary.index);
+                                            (r.primary.index, s < e, if s < e { Some((s, e)) } else { None })
+                                        })
+                                        .unwrap_or((line_text.chars().count(), false, None));
+                                    if !any_popup_open {
+                                        if let Some((s, e)) = inline_sel_range {
+                                            let chars: Vec<char> = line.text.chars().collect();
+                                            if e <= chars.len() {
+                                                self.last_inline_selection = Some((line_no, chars[s..e].iter().collect()));
+                                            }
+                                        } else if self.active_edit_line == Some(line_no) && !secondary_down {
+                                            self.last_inline_selection = None;
+                                        }
+                                    }
+                                    let context_inline_copy = self.last_inline_selection.as_ref()
+                                        .map(|(_, s)| s.clone());
                                     if self.active_edit_line == Some(line_no) {
                                         self.active_cursor_col = current_col;
                                     }
@@ -8795,17 +9498,23 @@ fn find_folding_end_extended(
 
                                     resp.context_menu(|ui| {
                                         ui.set_min_width(200.0);
-                                        if sel_range.is_some() {
-                                            if ui.add(egui::Button::new("Copy Selected Lines").shortcut_text("Ctrl+C")).clicked() {
+                                        let has_any_sel = sel_range.is_some() || context_inline_copy.is_some();
+                                        let copy_label = if sel_range.is_some() { "Copy Selected Lines" } else { "Copy" };
+                                        if ui.add_enabled(has_any_sel, egui::Button::new(copy_label).shortcut_text("Ctrl+C")).clicked() {
+                                            if sel_range.is_some() {
                                                 trigger_copy_selection = true;
-                                                ui.close_menu();
+                                            } else if let Some(ref inline_txt) = context_inline_copy {
+                                                trigger_copy_text = Some(inline_txt.clone());
                                             }
+                                            ui.close_menu();
+                                        }
+                                        if sel_range.is_some() {
                                             if ui.add(egui::Button::new("Delete Selected Lines").shortcut_text("Del")).clicked() {
                                                 trigger_delete_selection = true;
                                                 ui.close_menu();
                                             }
-                                            ui.separator();
                                         }
+                                        ui.separator();
                                         if ui.add(egui::Button::new("Format Document").shortcut_text("Shift+Alt+F")).clicked() {
                                             trigger_format_modal = true;
                                             ui.close_menu();
@@ -8870,6 +9579,9 @@ fn find_folding_end_extended(
                                 });
                             }
                         });
+                        if last_visible_line > 0 {
+                            self.cached_visible_end_line = last_visible_line;
+                        }
 
                         // Draw clean vertical separator line between gutter and text
                         let gutter_divider_x = top_left.x + gutter_w;
@@ -8881,8 +9593,11 @@ fn find_folding_end_extended(
                         );
                     } else {
                         // Word Wrap OFF: Horizontal scrolling with pinned line numbers column
+                        self.cached_visible_end_line = 0;
                         let shift_down = ui.input(|i| i.modifiers.shift);
                         let pointer_pos = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
+                        let galley_cache = &self.galley_cache;
+                        let max_visible_rows = screen_lines + 4;
 
                         ui.style_mut().always_scroll_the_only_direction = false;
                         ui.horizontal(|ui| {
@@ -8890,12 +9605,17 @@ fn find_folding_end_extended(
                             ui.vertical(|ui| {
                                 ui.set_width(gutter_w);
                                 let line_h = ui.fonts(|f| f.row_height(&text_font));
+                                let mut gutter_rows = 0usize;
 
                                 for line in &self.viewport.lines {
                                     let line_no = line.line_number;
                                     if hidden_lines.contains(&line_no) {
                                         continue;
                                     }
+                                    if gutter_rows >= max_visible_rows {
+                                        break;
+                                    }
+                                    gutter_rows += 1;
                                     let is_selected = if let Some((s, e)) = sel_range {
                                         line_no >= s && line_no <= e
                                     } else {
@@ -8950,17 +9670,17 @@ fn find_folding_end_extended(
                                             );
                                         }
 
-                                        if num_resp.drag_started() || (num_resp.hovered() && primary_down && !self.gutter_drag_active) {
+                                        if !any_popup_open && (num_resp.drag_started() || (num_resp.hovered() && primary_down && !self.gutter_drag_active && self.mouse_drag_start_line.is_none())) {
                                             drag_start_detected = Some(line_no);
                                             new_gutter_selection = Some((line_no, line_no));
                                             clear_gutter_selection = false;
                                         }
 
-                                        if num_resp.clicked() && shift_down {
+                                        if !any_popup_open && num_resp.clicked() && shift_down {
                                             let anchor = self.selection_anchor.unwrap_or(self.current_line);
                                             new_gutter_selection = Some((anchor, line_no));
                                             clear_gutter_selection = false;
-                                        } else if num_resp.clicked() && !shift_down {
+                                        } else if !any_popup_open && num_resp.clicked() && !shift_down {
                                             let just_finished_drag = self.selection_anchor != self.selection_head && self.selection_anchor.is_some();
                                             if !just_finished_drag {
                                                 new_gutter_selection = Some((line_no, line_no));
@@ -8968,7 +9688,7 @@ fn find_folding_end_extended(
                                             }
                                         }
 
-                                        if self.gutter_drag_active && primary_down && pointer_pos.map_or(false, |p| p.y >= num_rect.min.y && p.y <= num_rect.max.y) {
+                                        if !any_popup_open && self.gutter_drag_active && primary_down && pointer_pos.map_or(false, |p| p.y >= num_rect.min.y && p.y <= num_rect.max.y) {
                                             if let Some(start_line) = self.mouse_drag_start_line {
                                                 new_gutter_selection = Some((start_line, line_no));
                                                 clear_gutter_selection = false;
@@ -9014,11 +9734,16 @@ fn find_folding_end_extended(
                                         .auto_shrink([false, false])
                                         .show(ui, |ui| {
                                             ui.vertical(|ui| {
+                                        let mut content_rows = 0usize;
                                         for line in &mut self.viewport.lines {
                                             let line_no = line.line_number;
                                             if hidden_lines.contains(&line_no) {
                                                 continue;
                                             }
+                                            if content_rows >= max_visible_rows {
+                                                break;
+                                            }
+                                            content_rows += 1;
                                             let is_active_search = active_match_line == Some(line_no);
                                             let is_truncated = line.is_truncated;
                                             let line_byte_offset = line.byte_offset;
@@ -9052,6 +9777,21 @@ fn find_folding_end_extended(
                                                         search_pattern.as_deref()
                                                     };
                                                     let mut layouter = |ui: &Ui, text: &str, _wrap_width: f32| {
+                                                        let key = compute_galley_cache_key(
+                                                            text,
+                                                            file_type,
+                                                            enable_highlighting,
+                                                            line_pattern,
+                                                            search_case,
+                                                            is_active_search,
+                                                            &text_font,
+                                                            dark_mode,
+                                                            f32::INFINITY,
+                                                            line_sel,
+                                                        );
+                                                        if let Some(cached) = galley_cache.borrow().get(&key) {
+                                                            return Arc::clone(cached);
+                                                        }
                                                         let job = build_line_layout_job(
                                                             text,
                                                             file_type,
@@ -9064,7 +9804,13 @@ fn find_folding_end_extended(
                                                             f32::INFINITY,
                                                             line_sel,
                                                         );
-                                                        ui.fonts(|f| f.layout_job(job))
+                                                        let galley = ui.fonts(|f| f.layout_job(job));
+                                                        let mut cache = galley_cache.borrow_mut();
+                                                        if cache.len() >= 512 {
+                                                            cache.clear();
+                                                        }
+                                                        cache.insert(key, Arc::clone(&galley));
+                                                        galley
                                                     };
 
                                                 let char_w = ui.fonts(|f| f.glyph_width(&text_font, ' '));
@@ -9087,17 +9833,6 @@ fn find_folding_end_extended(
                                                     toggle_fold_for = Some(line_no);
                                                 }
                                                 if is_active_search {
-                                                    ui.painter().rect_filled(
-                                                        resp.rect,
-                                                        2.0,
-                                                        Color32::from_rgba_unmultiplied(97, 175, 239, 25),
-                                                    );
-                                                    ui.painter().rect_stroke(
-                                                        resp.rect,
-                                                        2.0,
-                                                        egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(97, 175, 239, 90)),
-                                                        egui::StrokeKind::Inside,
-                                                    );
                                                     let accent_rect = Rect::from_min_size(resp.rect.min, Vec2::new(3.0, resp.rect.height()));
                                                     ui.painter().rect_filled(accent_rect, 1.0, Color32::from_rgb(97, 175, 239));
                                                 }
@@ -9109,10 +9844,10 @@ fn find_folding_end_extended(
                                                     col.min(line_char_count)
                                                 });
 
-                                                let pointer_in_text = pointer_pos.map_or(false, |p| resp.rect.contains(p));
+                                                let pointer_in_text = !any_popup_open && ui.rect_contains_pointer(resp.rect);
 
                                                 // 1. Mouse press inside text row
-                                                if primary_pressed && pointer_in_text && !self.gutter_drag_active {
+                                                if !any_popup_open && primary_pressed && pointer_in_text && !self.gutter_drag_active {
                                                     self.mouse_drag_start_line = Some(line_no);
                                                     self.mouse_drag_start_col = Some(cur_col);
                                                     if !shift_down {
@@ -9125,7 +9860,7 @@ fn find_folding_end_extended(
                                                 }
 
                                                 // 2. Mouse drag across lines
-                                                if primary_down && pointer_in_row && self.mouse_drag_start_line.is_some() && !self.gutter_drag_active {
+                                                if !any_popup_open && primary_down && pointer_in_row && self.mouse_drag_start_line.is_some() && !self.gutter_drag_active {
                                                     if let (Some(start_l), Some(start_c)) = (self.mouse_drag_start_line, self.mouse_drag_start_col) {
                                                         if start_l != line_no {
                                                             self.selection_anchor = Some(start_l);
@@ -9149,7 +9884,8 @@ fn find_folding_end_extended(
                                                     && self.selection_head.is_some()
                                                     && self.selection_anchor != self.selection_head;
 
-                                                if !self.gutter_drag_active && !is_multiline {
+                                                let secondary_down = ui.input(|i| i.pointer.secondary_down() || i.pointer.secondary_pressed());
+                                                if !any_popup_open && !self.gutter_drag_active && !is_multiline && !secondary_down {
                                                     // Text editor interaction: pure in-line text editing, word selection, and typing
                                                     if (resp.gained_focus() || resp.clicked()) && !shift_down {
                                                         self.selection_anchor = None;
@@ -9172,10 +9908,26 @@ fn find_folding_end_extended(
                                                 let enter_pressed = ui.input(|i| i.key_pressed(Key::Enter)) || has_newline;
                                                 let backspace_pressed = ui.input(|i| i.key_pressed(Key::Backspace));
                                                 let delete_pressed = ui.input(|i| i.key_pressed(Key::Delete));
-                                                let (current_col, has_char_selection) = egui::text_edit::TextEditState::load(ui.ctx(), edit_id)
+                                                let (current_col, has_char_selection, inline_sel_range) = egui::text_edit::TextEditState::load(ui.ctx(), edit_id)
                                                     .and_then(|state| state.cursor.char_range())
-                                                    .map(|r| (r.primary.index, r.primary.index != r.secondary.index))
-                                                    .unwrap_or((line_text.chars().count(), false));
+                                                    .map(|r| {
+                                                        let s = r.primary.index.min(r.secondary.index);
+                                                        let e = r.primary.index.max(r.secondary.index);
+                                                        (r.primary.index, s < e, if s < e { Some((s, e)) } else { None })
+                                                    })
+                                                    .unwrap_or((line_text.chars().count(), false, None));
+                                                if !any_popup_open {
+                                                    if let Some((s, e)) = inline_sel_range {
+                                                        let chars: Vec<char> = line.text.chars().collect();
+                                                        if e <= chars.len() {
+                                                            self.last_inline_selection = Some((line_no, chars[s..e].iter().collect()));
+                                                        }
+                                                    } else if self.active_edit_line == Some(line_no) && !secondary_down {
+                                                        self.last_inline_selection = None;
+                                                    }
+                                                }
+                                                let context_inline_copy = self.last_inline_selection.as_ref()
+                                                    .map(|(_, s)| s.clone());
                                                 if self.active_edit_line == Some(line_no) {
                                                     self.active_cursor_col = current_col;
                                                 }
@@ -9208,17 +9960,23 @@ fn find_folding_end_extended(
 
                                                 resp.context_menu(|ui| {
                                                     ui.set_min_width(200.0);
-                                                    if sel_range.is_some() {
-                                                        if ui.add(egui::Button::new("Copy Selected Lines").shortcut_text("Ctrl+C")).clicked() {
+                                                    let has_any_sel = sel_range.is_some() || context_inline_copy.is_some();
+                                                    let copy_label = if sel_range.is_some() { "Copy Selected Lines" } else { "Copy" };
+                                                    if ui.add_enabled(has_any_sel, egui::Button::new(copy_label).shortcut_text("Ctrl+C")).clicked() {
+                                                        if sel_range.is_some() {
                                                             trigger_copy_selection = true;
-                                                            ui.close_menu();
+                                                        } else if let Some(ref inline_txt) = context_inline_copy {
+                                                            trigger_copy_text = Some(inline_txt.clone());
                                                         }
+                                                        ui.close_menu();
+                                                    }
+                                                    if sel_range.is_some() {
                                                         if ui.add(egui::Button::new("Delete Selected Lines").shortcut_text("Del")).clicked() {
                                                             trigger_delete_selection = true;
                                                             ui.close_menu();
                                                         }
-                                                        ui.separator();
                                                     }
+                                                    ui.separator();
                                                     if ui.add(egui::Button::new("Format Document").shortcut_text("Shift+Alt+F")).clicked() {
                                                         trigger_format_modal = true;
                                                         ui.close_menu();
@@ -9361,16 +10119,18 @@ fn find_folding_end_extended(
             focused_line = None;
             ui.ctx().memory_mut(|m| m.stop_text_input());
         }
-        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-            let is_in_gutter = pos.x < content_origin.x + gutter_w;
-            if primary_pressed && viewport_rect.contains(pos) && !is_in_gutter && toggle_fold_for.is_none() && focused_line.is_none() && !self.gutter_drag_active && self.active_edit_line.is_none() {
-                let target_line = self.viewport.lines.last().map(|l| l.line_number).unwrap_or(1);
-                let text = self.viewport.lines.iter().find(|l| l.line_number == target_line)
-                    .map(|l| l.text.clone())
-                    .unwrap_or_default();
-                let col = text.chars().count();
-                focused_line = Some((target_line, text, Some(col)));
-                self.pending_focus_line = Some((target_line, col));
+        if !any_popup_open {
+            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                let is_in_gutter = pos.x < content_origin.x + gutter_w;
+                if primary_pressed && viewport_rect.contains(pos) && !is_in_gutter && toggle_fold_for.is_none() && focused_line.is_none() && !self.gutter_drag_active && self.active_edit_line.is_none() {
+                    let target_line = self.viewport.lines.last().map(|l| l.line_number).unwrap_or(1);
+                    let text = self.viewport.lines.iter().find(|l| l.line_number == target_line)
+                        .map(|l| l.text.clone())
+                        .unwrap_or_default();
+                    let col = text.chars().count();
+                    focused_line = Some((target_line, text, Some(col)));
+                    self.pending_focus_line = Some((target_line, col));
+                }
             }
         }
         if let Some((line_no, text, col)) = focused_line {
@@ -9524,6 +10284,9 @@ fn find_folding_end_extended(
         if trigger_copy_selection {
             self.copy_selection(ui.ctx());
         }
+        if let Some(txt) = trigger_copy_text {
+            ui.ctx().copy_text(txt);
+        }
         if trigger_delete_selection {
             self.delete_selection();
         }
@@ -9578,6 +10341,33 @@ fn compute_line_selection(
     } else {
         Some((0, line_text.len()))
     }
+}
+
+fn compute_galley_cache_key(
+    text: &str,
+    file_type: Option<FileType>,
+    enable_highlighting: bool,
+    search_pattern: Option<&str>,
+    case_sensitive: bool,
+    is_active_line: bool,
+    font: &FontId,
+    dark_mode: bool,
+    wrap_width: f32,
+    selection: Option<(usize, usize)>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    file_type.map(|t| t as u8).hash(&mut hasher);
+    enable_highlighting.hash(&mut hasher);
+    search_pattern.hash(&mut hasher);
+    case_sensitive.hash(&mut hasher);
+    is_active_line.hash(&mut hasher);
+    font.size.to_bits().hash(&mut hasher);
+    dark_mode.hash(&mut hasher);
+    wrap_width.to_bits().hash(&mut hasher);
+    selection.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn build_line_layout_job(
@@ -11505,23 +12295,27 @@ mod tests {
         );
 
         assert!(app.active_formatting.is_some());
-        let active = app.active_formatting.as_ref().unwrap();
-        let src = active.src_path.clone();
-        let dst = active.dst_path.clone();
-        let progress = Arc::clone(&active.progress);
+        let progress = Arc::clone(&app.active_formatting.as_ref().unwrap().progress);
 
-        // Wait for formatting to complete
+        // Drive non-blocking finalization polling just like the UI loop
         let start = Instant::now();
-        while !progress.read().unwrap().is_finished && start.elapsed() < Duration::from_secs(5) {
-            std::thread::sleep(Duration::from_millis(50));
+        let mut saw_finalizing = false;
+        let mut reloaded = false;
+        while start.elapsed() < Duration::from_secs(5) {
+            if progress.read().unwrap().is_finalizing {
+                saw_finalizing = true;
+            }
+            if app.poll_in_place_formatting_finalization() {
+                reloaded = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
 
+        assert!(saw_finalizing, "In-place formatting must enter is_finalizing before UI release");
+        assert!(reloaded, "Expected poll_in_place_formatting_finalization to complete reload");
         assert!(progress.read().unwrap().is_finished, "Expected formatting to finish");
         assert!(progress.read().unwrap().error.is_none());
-
-        // Perform in-place reload as done in the app loop
-        let reloaded = app.reload_active_tab_from_saved_file(&src, &dst);
-        assert!(reloaded, "Expected reload_active_tab_from_saved_file to succeed");
         assert!(!app.show_unsaved_dialog, "In-place formatting must NOT trigger unsaved changes confirmation");
 
         // Verify the viewport lines now contain the formatted XML
@@ -11691,6 +12485,292 @@ print("CRAWLER_SCRIPT_LOADED")
         assert_eq!(app.tabs.len(), prev_tabs_count + 1);
         assert_eq!(app.file_type, Some(FileType::Python));
         assert!(app.viewport.lines.iter().any(|l| l.text.contains("UltraViewer JSON / JSONL Streaming Key Extractor")));
+    }
+
+    #[test]
+    fn test_ctrl_c_copies_gutter_multiline_and_inline_selections() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("test_ctrl_c_deep.xml");
+        let lines = vec![
+            "<root>",
+            "  <title>Senior Hybrid Engineer</title>",
+            "  <company>Acme Corp</company>",
+            "  <description><![CDATA[Work hybrid or remote with great benefits.]]></description>",
+            "</root>",
+        ];
+        std::fs::write(&file_path, lines.join("\n")).unwrap();
+
+        let mut app = UltraViewerApp::default();
+        app.do_open_file(&file_path);
+        if let Some(ref idx) = app.line_index {
+            while !idx.is_complete() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        app.scroll_to_line(1);
+
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 600.0));
+
+        // 1. Single-line gutter selection must persist across idle frames and copy via Event::Copy (Ctrl+C)
+        app.selection_anchor = Some(2);
+        app.selection_anchor_col = Some(0);
+        app.selection_head = Some(2);
+        app.selection_head_col = Some(usize::MAX);
+
+        let mut raw_idle = egui::RawInput::default();
+        raw_idle.screen_rect = Some(screen_rect);
+        let _ = ctx.run(raw_idle, |ctx| {
+            app.handle_shortcuts(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| app.render_editor_viewport(ui));
+        });
+        assert_eq!(
+            app.selection_range(),
+            Some((2, 2)),
+            "Single-line gutter selection must NOT be wiped on idle frame"
+        );
+
+        let mut raw_copy = egui::RawInput::default();
+        raw_copy.screen_rect = Some(screen_rect);
+        raw_copy.events.push(egui::Event::Copy);
+        let out_gutter = ctx.run(raw_copy, |ctx| {
+            app.handle_shortcuts(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| app.render_editor_viewport(ui));
+        });
+        let copied_gutter = out_gutter.platform_output.commands.iter().find_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        });
+        assert_eq!(copied_gutter.as_deref(), Some("  <title>Senior Hybrid Engineer</title>"));
+
+        // 2. Multi-line drag selection + Event::Copy (Ctrl+C)
+        app.selection_anchor = Some(2);
+        app.selection_anchor_col = Some(9);
+        app.selection_head = Some(3);
+        app.selection_head_col = Some(16);
+        let mut raw_multi_copy = egui::RawInput::default();
+        raw_multi_copy.screen_rect = Some(screen_rect);
+        raw_multi_copy.events.push(egui::Event::Copy);
+        let out_multi = ctx.run(raw_multi_copy, |ctx| {
+            app.handle_shortcuts(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| app.render_editor_viewport(ui));
+        });
+        let copied_multi = out_multi.platform_output.commands.iter().find_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        });
+        assert_eq!(copied_multi.as_deref(), Some("Senior Hybrid Engineer</title>\n  <company>Acme "));
+
+        // 3. Single-line inline selection + Event::Copy (Ctrl+C)
+        app.selection_anchor = None;
+        app.selection_head = None;
+        app.selection_anchor_col = None;
+        app.selection_head_col = None;
+        app.active_edit_line = Some(4);
+        app.last_inline_selection = Some((4, "hybrid".to_string()));
+        let mut raw_inline_copy = egui::RawInput::default();
+        raw_inline_copy.screen_rect = Some(screen_rect);
+        raw_inline_copy.events.push(egui::Event::Copy);
+        let out_inline = ctx.run(raw_inline_copy, |ctx| {
+            app.handle_shortcuts(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| app.render_editor_viewport(ui));
+        });
+        let copied_inline = out_inline.platform_output.commands.iter().find_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        });
+        assert_eq!(copied_inline.as_deref(), Some("hybrid"));
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_right_click_context_menu_copy_never_opens_formatter() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("test_ctx_menu_copy.xml");
+        let lines = vec![
+            "<root>",
+            "  <title>Remote Cloud Architect</title>",
+            "  <company>Example Labs</company>",
+            "  <description><![CDATA[Hybrid role supporting global teams and distributed services.]]></description>",
+            "</root>",
+        ];
+        std::fs::write(&file_path, lines.join("\n")).unwrap();
+
+        for wrap_mode in [true, false] {
+            let mut app = UltraViewerApp::default();
+            app.word_wrap = wrap_mode;
+            app.do_open_file(&file_path);
+            if let Some(ref idx) = app.line_index {
+                while !idx.is_complete() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            app.scroll_to_line(1);
+
+            let ctx = egui::Context::default();
+            let screen_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 600.0));
+
+            // Multi-line selection across lines 2..=3
+            app.selection_anchor = Some(2);
+            app.selection_anchor_col = Some(0);
+            app.selection_head = Some(3);
+            app.selection_head_col = Some(usize::MAX);
+
+            let run_frame = |app: &mut UltraViewerApp, events: Vec<egui::Event>| {
+                let mut raw = egui::RawInput::default();
+                raw.screen_rect = Some(screen_rect);
+                raw.events = events;
+                ctx.run(raw, |ctx| {
+                    app.handle_shortcuts(ctx);
+                    egui::CentralPanel::default().show(ctx, |ui| app.render_editor_viewport(ui));
+                })
+            };
+
+            // Locate the exact painted bounds of text inside the shapes tree
+            fn find_text_rect(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Rect> {
+                for clipped in shapes {
+                    match &clipped.shape {
+                        egui::Shape::Text(t) => {
+                            if t.galley.text().contains(needle) {
+                                return Some(t.visual_bounding_rect());
+                            }
+                        }
+                        egui::Shape::Vec(v) => {
+                            for s in v {
+                                if let egui::Shape::Text(t) = s {
+                                    if t.galley.text().contains(needle) {
+                                        return Some(t.visual_bounding_rect());
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            }
+
+            // Initial layout frame
+            let init_out = run_frame(&mut app, vec![]);
+            let target_line_rect = find_text_rect(&init_out.shapes, "Remote Cloud Architect")
+                .expect("Line 2 text must be rendered in initial frame");
+
+            // Right-click directly on line 2's text widget to open context menu
+            let rclick_pos = target_line_rect.center();
+            let _ = run_frame(&mut app, vec![
+                egui::Event::PointerMoved(rclick_pos),
+            ]);
+            let _ = run_frame(&mut app, vec![
+                egui::Event::PointerButton {
+                    pos: rclick_pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            let _ = run_frame(&mut app, vec![
+                egui::Event::PointerButton {
+                    pos: rclick_pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            // Run a sizing/paint frame so the newly opened context menu Area emits its shapes
+            let menu_open_out = run_frame(&mut app, vec![]);
+            assert!(
+                egui::menu::BarState::load(&ctx, egui::Id::new("__egui::context_menu")).is_some(),
+                "Context menu must open on right-click (wrap={})",
+                wrap_mode
+            );
+
+            let copy_rect = find_text_rect(&menu_open_out.shapes, "Copy Selected Lines")
+                .expect("Context menu must render 'Copy Selected Lines'");
+            let copy_click_pos = copy_rect.center();
+
+            // Simulate left-mouse PRESS on "Copy Selected Lines" (frame where popup overlaps editor text!)
+            let _ = run_frame(&mut app, vec![
+                egui::Event::PointerMoved(copy_click_pos),
+                egui::Event::PointerButton {
+                    pos: copy_click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            // Simulate left-mouse RELEASE on "Copy Selected Lines"
+            let click_out = run_frame(&mut app, vec![
+                egui::Event::PointerButton {
+                    pos: copy_click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+
+            assert!(
+                !app.format_options_state.is_open && !app.show_format_modal,
+                "Clicking Copy in context menu must NEVER open the formatter window! (wrap={})",
+                wrap_mode
+            );
+            let copied_text = click_out.platform_output.commands.iter().find_map(|c| match c {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            });
+            assert_eq!(
+                copied_text.as_deref(),
+                Some("  <title>Remote Cloud Architect</title>\n  <company>Example Labs</company>"),
+                "Clicking Copy Selected Lines must copy the exact selected lines (wrap={})",
+                wrap_mode
+            );
+        }
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_poll_active_opening_completes_without_blocking_ui() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!(
+            "uv_async_open_{}.xml",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root>\n  <item>Hello</item>\n</root>\n";
+        std::fs::write(&file_path, xml).unwrap();
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+
+        let mut app = UltraViewerApp::default();
+        app.start_async_open_file(&file_path, file_size);
+        assert!(app.active_opening.is_some());
+
+        let start = Instant::now();
+        let mut opened = false;
+        while start.elapsed() < Duration::from_secs(5) {
+            if app.poll_active_opening() {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(opened, "Expected background opener to finish cleanly");
+        assert!(app.active_opening.is_none());
+        assert!(app.engine.is_some());
+        assert_eq!(app.file_type, Some(FileType::Xml));
+        assert!(app.viewport.lines.iter().any(|l| l.text.contains("<item>Hello</item>")));
+
+        if let Some(ref idx) = app.line_index {
+            while !idx.is_complete() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(idx.total_lines(), 4);
+        }
+
+        app.cancel_active_indexer();
+        app.engine = None;
+        app.tabs.clear();
+        let _ = std::fs::remove_file(&file_path);
     }
 }
 

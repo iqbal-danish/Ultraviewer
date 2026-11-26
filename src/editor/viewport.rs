@@ -305,8 +305,9 @@ impl Viewport {
 
         for line in decoded.lines() {
             let (text, is_truncated) = if line.len() > self.max_display_line_len {
+                let boundary = line.floor_char_boundary(self.max_display_line_len);
                 (
-                    format!("{}... [truncated]", &line[..self.max_display_line_len]),
+                    format!("{}... [truncated]", &line[..boundary]),
                     true,
                 )
             } else {
@@ -329,7 +330,8 @@ impl Viewport {
     fn decode_and_sanitize(&self, bytes: &[u8]) -> (String, bool) {
         let raw_str = String::from_utf8_lossy(bytes);
         if raw_str.len() > self.max_display_line_len {
-            let mut truncated = raw_str[..self.max_display_line_len].to_string();
+            let boundary = raw_str.floor_char_boundary(self.max_display_line_len);
+            let mut truncated = raw_str[..boundary].to_string();
             truncated.push_str("... [truncated]");
             (truncated, true)
         } else {

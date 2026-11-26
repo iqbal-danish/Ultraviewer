@@ -4,6 +4,7 @@ use super::icons::{paint_icon, Icon};
 use super::status_bar::format_number;
 
 pub enum SearchBarAction {
+    QueryChanged,
     FindAll,
     FindNext,
     FindPrev,
@@ -89,6 +90,8 @@ pub fn render_search_bar(
                                 } else {
                                     action = Some(SearchBarAction::FindNext);
                                 }
+                            } else if input_resp.changed() {
+                                action = Some(SearchBarAction::QueryChanged);
                             }
 
                             // Aa Toggle (Match Case)
@@ -104,6 +107,9 @@ pub fn render_search_bar(
                             ui.painter().text(aa_rect.center(), egui::Align2::CENTER_CENTER, "Aa", egui::FontId::proportional(11.0), aa_color);
                             if aa_resp.on_hover_text("Match Case (Alt+C)").clicked() {
                                 query.case_sensitive = !query.case_sensitive;
+                                if action.is_none() {
+                                    action = Some(SearchBarAction::QueryChanged);
+                                }
                             }
 
                             // ab Toggle (Match Whole Word with Underline)
@@ -123,6 +129,9 @@ pub fn render_search_bar(
                             );
                             if ab_resp.on_hover_text("Match Whole Word (Alt+W)").clicked() {
                                 query.whole_word = !query.whole_word;
+                                if action.is_none() {
+                                    action = Some(SearchBarAction::QueryChanged);
+                                }
                             }
 
                             // .* Toggle (Use Regular Expression)
@@ -138,6 +147,9 @@ pub fn render_search_bar(
                             ui.painter().text(rx_rect.center(), egui::Align2::CENTER_CENTER, ".*", egui::FontId::proportional(11.0), rx_color);
                             if rx_resp.on_hover_text("Use Regular Expression (Alt+R)").clicked() {
                                 query.is_regex = !query.is_regex;
+                                if action.is_none() {
+                                    action = Some(SearchBarAction::QueryChanged);
+                                }
                             }
                         });
                     });

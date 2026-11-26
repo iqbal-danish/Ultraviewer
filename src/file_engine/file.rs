@@ -15,12 +15,26 @@ impl FileEngine {
     /// Opens a file from disk using memory mapping.
     /// Does not load the entire file into memory.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        Self::open_with_handle(path).map(|(engine, _)| engine)
+    }
+
+    /// Opens a file from disk, maps it into memory, and also returns the open
+    /// `File` handle so callers (such as `LineIndexer::spawn_with_file`) can
+    /// stream from the same handle without a second `File::open` syscall.
+    pub fn open_with_handle<P: AsRef<Path>>(path: P) -> io::Result<(Self, File)> {
+        let file = File::open(path.as_ref())?;
+        let engine = Self::from_open_file(path, &file)?;
+        Ok((engine, file))
+    }
+
+    /// Creates a `FileEngine` directly from an already-open `File` handle,
+    /// avoiding a close + re-open cycle on freshly written multi-GB files.
+    pub fn from_open_file<P: AsRef<Path>>(path: P, file: &File) -> io::Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
-        let file = File::open(&path_buf)?;
         let metadata = file.metadata()?;
         let size = metadata.len();
 
-        let mmap = MmapHandle::open(&file, size)?;
+        let mmap = MmapHandle::open(file, size)?;
 
         // Inspect header bytes (up to 64KB) for fast encoding detection
         let header_len = (size.min(65536)) as usize;

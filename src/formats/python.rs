@@ -261,11 +261,18 @@ impl PythonStreamingFormatter {
         }
 
         writer.flush().map_err(|e| format!("Flush error: {}", e))?;
+        drop(writer);
 
         if let Some(ref p) = progress {
             if let Ok(mut p_guard) = p.write() {
                 p_guard.update(total_bytes, start);
-                p_guard.is_finished = true;
+                p_guard.progress_pct = 100.0;
+                p_guard.eta_secs = Some(0.0);
+                if p_guard.defer_finish {
+                    p_guard.is_finalizing = true;
+                } else {
+                    p_guard.is_finished = true;
+                }
             }
         }
 
@@ -285,7 +292,10 @@ impl PythonStreamingFormatter {
         let total_bytes = metadata.len();
 
         if let Some(ref prog) = progress {
-            *prog.write().unwrap() = FormattingProgress::new(total_bytes);
+            let defer_finish = prog.read().unwrap().defer_finish;
+            let mut new_prog = FormattingProgress::new(total_bytes);
+            new_prog.defer_finish = defer_finish;
+            *prog.write().unwrap() = new_prog;
         }
 
         let dst_file = File::create(dst_path.as_ref()).map_err(|e| format!("Failed to create destination file: {}", e))?;

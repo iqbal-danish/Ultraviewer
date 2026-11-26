@@ -22,6 +22,8 @@ pub struct FormattingProgress {
     pub elapsed_secs: f64,
     pub eta_secs: Option<f64>,
     pub is_finished: bool,
+    pub is_finalizing: bool,
+    pub defer_finish: bool,
     pub error: Option<String>,
 }
 
@@ -35,6 +37,8 @@ impl FormattingProgress {
             elapsed_secs: 0.0,
             eta_secs: None,
             is_finished: false,
+            is_finalizing: false,
+            defer_finish: false,
             error: None,
         }
     }
@@ -70,7 +74,7 @@ impl FormattingProgress {
 pub struct JsonStreamingFormatter;
 
 impl JsonStreamingFormatter {
-    const BUFFER_CAPACITY: usize = 256 * 1024;
+    const BUFFER_CAPACITY: usize = 2 * 1024 * 1024;
 
     /// Formats a JSON stream from reader to writer without building a DOM.
     pub fn format<R: Read, W: Write>(
@@ -254,12 +258,19 @@ impl JsonStreamingFormatter {
         }
 
         writer.flush().map_err(|e| e.to_string())?;
+        drop(writer);
+        drop(reader);
 
         if let Some(ref prog) = progress {
             let mut p = prog.write().unwrap();
             p.update(total_processed, start_time);
-            p.is_finished = true;
             p.progress_pct = 100.0;
+            p.eta_secs = Some(0.0);
+            if p.defer_finish {
+                p.is_finalizing = true;
+            } else {
+                p.is_finished = true;
+            }
         }
 
         Ok(total_processed)
@@ -278,7 +289,10 @@ impl JsonStreamingFormatter {
         let total_bytes = metadata.len();
 
         if let Some(ref prog) = progress {
-            *prog.write().unwrap() = FormattingProgress::new(total_bytes);
+            let defer_finish = prog.read().unwrap().defer_finish;
+            let mut new_prog = FormattingProgress::new(total_bytes);
+            new_prog.defer_finish = defer_finish;
+            *prog.write().unwrap() = new_prog;
         }
 
         let dst_file = File::create(dst_path.as_ref()).map_err(|e| format!("Failed to create destination file: {}", e))?;
@@ -331,7 +345,7 @@ pub fn clean_xml_decl(raw: &[u8]) -> Vec<u8> {
 pub struct XmlStreamingFormatter;
 
 impl XmlStreamingFormatter {
-    const BUFFER_CAPACITY: usize = 256 * 1024;
+    const BUFFER_CAPACITY: usize = 2 * 1024 * 1024;
 
     /// Formats an XML stream from reader to writer without building a DOM.
     pub fn format<R: Read, W: Write>(
@@ -593,12 +607,19 @@ impl XmlStreamingFormatter {
         writer.flush().map_err(|e| e.to_string())?;
         let final_pos = xml_reader.buffer_position() as u64;
         let processed = if final_pos > 0 { final_pos } else { last_pos };
+        drop(writer);
+        drop(xml_reader);
 
         if let Some(ref prog) = progress {
             let mut p = prog.write().unwrap();
             p.update(processed, start_time);
-            p.is_finished = true;
             p.progress_pct = 100.0;
+            p.eta_secs = Some(0.0);
+            if p.defer_finish {
+                p.is_finalizing = true;
+            } else {
+                p.is_finished = true;
+            }
         }
 
         Ok(processed)
@@ -617,7 +638,10 @@ impl XmlStreamingFormatter {
         let total_bytes = metadata.len();
 
         if let Some(ref prog) = progress {
-            *prog.write().unwrap() = FormattingProgress::new(total_bytes);
+            let defer_finish = prog.read().unwrap().defer_finish;
+            let mut new_prog = FormattingProgress::new(total_bytes);
+            new_prog.defer_finish = defer_finish;
+            *prog.write().unwrap() = new_prog;
         }
 
         let dst_file = File::create(dst_path.as_ref()).map_err(|e| format!("Failed to create destination file: {}", e))?;

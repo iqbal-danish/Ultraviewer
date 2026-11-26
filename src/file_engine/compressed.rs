@@ -52,6 +52,23 @@ impl CompressedEngine {
     /// Detects whether a file is a Gzip (.gz) stream or a ZIP (.zip) archive
     /// using both magic bytes and file extension fallbacks.
     pub fn detect_compression(path: &Path) -> CompressionType {
+        // 0. Fast-path known uncompressed text extensions to avoid a redundant File::open
+        // (and extra kernel/antivirus scan hook on newly created multi-GB files) right before FileEngine::open.
+        let ext_lower = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if let Some(ref ext) = ext_lower {
+            if matches!(
+                ext.as_str(),
+                "xml" | "json" | "jsonl" | "ndjson" | "csv" | "tsv" | "py" | "pyw" | "pyi"
+                    | "txt" | "log" | "md" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "conf"
+                    | "html" | "htm" | "css" | "js" | "ts" | "rs" | "sql"
+            ) {
+                return CompressionType::None;
+            }
+        }
+
         // 1. Try reading the first 4 bytes for magic headers
         if let Ok(mut file) = File::open(path) {
             let mut magic = [0u8; 4];
@@ -72,7 +89,7 @@ impl CompressedEngine {
         }
 
         // 2. Fallback to extension check
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) {
+        if let Some(ext) = ext_lower {
             if ext == "gz" || ext == "gzip" {
                 return CompressionType::Gzip;
             }

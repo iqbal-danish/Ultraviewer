@@ -58,6 +58,22 @@ pub fn render_format_modal(
                         result = Some(FormatModalAction::Dismiss);
                     }
                 });
+            } else if progress.is_finalizing {
+                // Formatting stream finished; finalizing atomic file swap & reopening on background thread
+                ui.add(ProgressBar::new(1.0).show_percentage().animate(true));
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Finalizing & reloading document...");
+                });
+
+                let total_mb = (progress.total_bytes as f64) / (1024.0 * 1024.0);
+                ui.label(
+                    egui::RichText::new(format!("{:.1} MB formatted — waiting for file system & indexing", total_mb))
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
             } else {
                 // Formatting in progress
                 let pct = (progress.progress_pct / 100.0).clamp(0.0, 1.0);

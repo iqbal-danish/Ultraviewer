@@ -63,6 +63,20 @@ fn main() -> eframe::Result<()> {
                     family.insert(0, "SegoeUI".to_owned());
                 }
             }
+            if let Ok(symbol_bytes) = std::fs::read(r"C:\Windows\Fonts\seguisym.ttf") {
+                fonts.font_data.insert(
+                    "SegoeUISymbol".to_owned(),
+                    std::sync::Arc::new(egui::FontData::from_owned(symbol_bytes)),
+                );
+                if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                    let insert_pos = if family.is_empty() { 0 } else { 1.min(family.len()) };
+                    family.insert(insert_pos, "SegoeUISymbol".to_owned());
+                }
+                if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                    let insert_pos = if family.is_empty() { 0 } else { 1.min(family.len()) };
+                    family.insert(insert_pos, "SegoeUISymbol".to_owned());
+                }
+            }
             cc.egui_ctx.set_fonts(fonts);
 
             // Configure comfortable text styles matching modern editors
